@@ -389,13 +389,13 @@ export class QMPClient extends EventEmitter {
   private processMessage (message: Record<string, unknown>): void {
     // Check if it's a greeting
     if ('QMP' in message) {
-      this.handleGreeting(message as QMPGreeting)
+      this.handleGreeting(message as unknown as QMPGreeting)
       return
     }
 
     // Check if it's an event
     if ('event' in message) {
-      this.handleEvent(message as QMPEvent)
+      this.handleEvent(message as unknown as QMPEvent)
       return
     }
 

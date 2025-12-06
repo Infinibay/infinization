@@ -1,6 +1,6 @@
-import { CommandExecutor } from '@utils/commandExecutor'
-import { Debugger } from '@utils/debug'
-import { TAP_NAME_PREFIX, MAX_TAP_NAME_LENGTH, NetworkErrorCode } from '@types/network.types'
+import { CommandExecutor } from '../utils/commandExecutor'
+import { Debugger } from '../utils/debug'
+import { TAP_NAME_PREFIX, MAX_TAP_NAME_LENGTH, NetworkErrorCode } from '../types/network.types'
 
 /**
  * TapDeviceManager manages TAP network devices for VMs.

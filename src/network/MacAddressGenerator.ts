@@ -1,5 +1,5 @@
 import { createHash } from 'crypto'
-import { QEMU_MAC_PREFIX, MacAddress } from '@types/network.types'
+import { QEMU_MAC_PREFIX, MacAddress } from '../types/network.types'
 
 /**
  * MacAddressGenerator generates QEMU-compatible MAC addresses.
