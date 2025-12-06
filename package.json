@@ -1,0 +1,34 @@
+{
+  "name": "@infinibay/infinivirt",
+  "version": "0.1.0",
+  "description": "Custom virtualization solution for managing QEMU VMs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "ts-node -r tsconfig-paths/register src/index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "qemu",
+    "virtualization",
+    "vm"
+  ],
+  "author": "andres@infinibay.net",
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "debug": "^4.3.4"
+  },
+  "peerDependencies": {
+    "@prisma/client": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/debug": "^4.1.12",
+    "@types/node": "^18.18.0",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}
