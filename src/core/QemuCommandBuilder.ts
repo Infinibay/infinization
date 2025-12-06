@@ -556,10 +556,33 @@ export class QemuCommandBuilder {
     // Add OVMF code (read-only firmware)
     this.args.push('-drive', `if=pflash,format=raw,readonly=on,file=${firmwarePath}`)
 
-    // Note: OVMF vars file (per-VM UEFI variables) should be created per-VM
-    // and passed as a second -drive argument. This is handled in VMLifecycle
+    // Note: OVMF vars file (per-VM UEFI variables) should be passed via setUefiVars
     // to ensure each VM has its own vars file.
 
+    return this
+  }
+
+  /**
+   * Set UEFI variables file for per-VM UEFI settings persistence.
+   *
+   * This file stores UEFI variables (boot entries, secure boot state, etc.)
+   * and should be unique to each VM. The file should be created by copying
+   * a template file (e.g., /usr/share/OVMF/OVMF_VARS.fd) to the VM's directory.
+   *
+   * @param varsPath - Path to the VM-specific UEFI vars file
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * // Create UEFI boot with per-VM vars
+   * builder
+   *   .setFirmware('/usr/share/OVMF/OVMF_CODE.fd')
+   *   .setUefiVars('/var/lib/infinivirt/vms/myvm/uefi-vars.fd')
+   * ```
+   */
+  setUefiVars (varsPath: string): this {
+    // Add OVMF vars (read-write per-VM variables)
+    this.args.push('-drive', `if=pflash,format=raw,file=${varsPath}`)
     return this
   }
 

@@ -7,6 +7,7 @@
 
 import { EventEmitter } from 'events'
 import * as fs from 'fs'
+import * as path from 'path'
 import {
   DatabaseAdapter,
   MachineConfigurationRecord,
@@ -27,6 +28,7 @@ import {
 import { TapDeviceManager } from '../network/TapDeviceManager'
 import { NftablesService } from '../network/NftablesService'
 import { Debugger } from '../utils/debug'
+import { DEFAULT_PIDFILE_DIR } from '../types/lifecycle.types'
 
 /**
  * Default configuration for HealthMonitor
@@ -244,6 +246,7 @@ export class HealthMonitor extends EventEmitter {
   private tapManager: TapDeviceManager
   private nftables: NftablesService
   private debug: Debugger
+  private readonly pidfileDir: string
 
   /**
    * Creates a new HealthMonitor instance
@@ -257,6 +260,7 @@ export class HealthMonitor extends EventEmitter {
     this.tapManager = new TapDeviceManager()
     this.nftables = new NftablesService()
     this.debug = new Debugger('health-monitor')
+    this.pidfileDir = config?.pidfileDir ?? DEFAULT_PIDFILE_DIR
   }
 
   /**
@@ -394,16 +398,44 @@ export class HealthMonitor extends EventEmitter {
   }
 
   /**
-   * Checks if a process is alive using kill -0
+   * Checks if a process is alive using kill -0 and /proc/{pid}/stat
+   *
+   * This method checks both process existence and zombie status.
+   * A process in zombie state (Z) is not truly alive - it has exited
+   * but its parent hasn't collected its exit status yet.
    *
    * @param pid The process ID to check
-   * @returns True if the process exists
+   * @returns True if the process exists and is not a zombie
    */
   private isProcessAlive (pid: number): boolean {
     try {
-      // process.kill with signal 0 checks if process exists
+      // First check: process.kill with signal 0 checks if process exists
       // without actually sending a signal
       process.kill(pid, 0)
+
+      // Second check: verify process is not a zombie by reading /proc/{pid}/stat
+      // The third field in /proc/{pid}/stat is the process state:
+      // R = running, S = sleeping, D = disk sleep, Z = zombie, T = stopped
+      const statPath = `/proc/${pid}/stat`
+      if (fs.existsSync(statPath)) {
+        try {
+          const stat = fs.readFileSync(statPath, 'utf8')
+          // Parse the stat file - format: "pid (comm) state ..."
+          // We need to handle cases where comm contains spaces or parentheses
+          const closeParen = stat.lastIndexOf(')')
+          if (closeParen > 0 && stat.length > closeParen + 2) {
+            const state = stat.charAt(closeParen + 2)
+            if (state === 'Z') {
+              this.debug.log('warn', `PID ${pid} is a zombie process - treating as dead`)
+              return false
+            }
+          }
+        } catch {
+          // If we can't read /proc/{pid}/stat, fall through to assume alive
+          this.debug.log('warn', `Could not read /proc/${pid}/stat for zombie check`)
+        }
+      }
+
       return true
     } catch (err) {
       const error = err as NodeJS.ErrnoException
@@ -513,6 +545,43 @@ export class HealthMonitor extends EventEmitter {
         async () => {
           if (fs.existsSync(config.qmpSocketPath!)) {
             fs.unlinkSync(config.qmpSocketPath!)
+          }
+        }
+      )
+    }
+
+    // Pidfile cleanup - derive path from qmpSocketPath
+    // qmpSocketPath: /path/to/sockets/{internalName}.sock
+    // pidfilePath: {pidfileDir}/{internalName}.pid
+    if (config.qmpSocketPath) {
+      const socketBasename = path.basename(config.qmpSocketPath, '.sock')
+      const pidfilePath = path.join(this.pidfileDir, `${socketBasename}.pid`)
+      await orchestrator.executeCleanup(
+        CleanupResourceType.PIDFILE,
+        pidfilePath,
+        async () => {
+          if (fs.existsSync(pidfilePath)) {
+            // Verify the pidfile points to a dead process before deleting
+            // This prevents accidentally deleting pidfiles for processes that are still running
+            try {
+              const pidContent = fs.readFileSync(pidfilePath, 'utf8').trim()
+              const pid = parseInt(pidContent, 10)
+              if (!isNaN(pid)) {
+                // Check if process is still alive
+                try {
+                  process.kill(pid, 0)
+                  // Process is still alive - this shouldn't happen but log warning
+                  this.debug.log('warn', `Pidfile ${pidfilePath} points to alive process ${pid} - skipping cleanup`)
+                  return
+                } catch {
+                  // Process is dead, safe to delete pidfile
+                }
+              }
+            } catch {
+              // Error reading pidfile - safe to delete
+            }
+            fs.unlinkSync(pidfilePath)
+            this.debug.log(`Deleted orphan pidfile: ${pidfilePath}`)
           }
         }
       )

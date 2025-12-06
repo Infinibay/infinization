@@ -397,7 +397,9 @@ export class VMLifecycle {
       this.debug.log(`Connecting to QMP socket: ${paths.qmpSocketPath}`)
       await this.waitForSocket(paths.qmpSocketPath)
       const qmpClient = new QMPClient(paths.qmpSocketPath, {
-        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
+        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT,
+        reconnect: true,
+        maxReconnectAttempts: 3
       })
       resources.qmpClient = qmpClient
       await qmpClient.connect()
@@ -740,7 +742,9 @@ export class VMLifecycle {
       this.debug.log(`Connecting to QMP socket: ${qmpSocketPath}`)
       await this.waitForSocket(qmpSocketPath)
       const qmpClient = new QMPClient(qmpSocketPath, {
-        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
+        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT,
+        reconnect: true,
+        maxReconnectAttempts: 3
       })
       resources.qmpClient = qmpClient
       await qmpClient.connect()
@@ -1602,6 +1606,67 @@ export class VMLifecycle {
   }
 
   /**
+   * Sets up per-VM UEFI variables file
+   *
+   * Creates a copy of the OVMF_VARS template file for each VM to store
+   * persistent UEFI settings (boot entries, secure boot state, etc.).
+   *
+   * @param vmId - The VM identifier used for naming the vars file
+   * @param firmwarePath - Path to OVMF_CODE firmware (used to find matching OVMF_VARS)
+   * @returns Path to the VM-specific vars file, or null if setup failed
+   *
+   * @remarks
+   * Common OVMF_VARS locations:
+   * - /usr/share/OVMF/OVMF_VARS.fd (Debian/Ubuntu)
+   * - /usr/share/edk2/ovmf/OVMF_VARS.fd (Fedora/RHEL)
+   * - /usr/share/OVMF/OVMF_VARS.ms.fd (Microsoft-signed for Secure Boot)
+   */
+  private setupUefiVars (vmId: string, firmwarePath: string): string | null {
+    try {
+      // Determine the OVMF_VARS template path based on the OVMF_CODE path
+      // E.g., /usr/share/OVMF/OVMF_CODE.fd -> /usr/share/OVMF/OVMF_VARS.fd
+      const firmwareDir = path.dirname(firmwarePath)
+      const templatePaths = [
+        path.join(firmwareDir, 'OVMF_VARS.fd'),
+        path.join(firmwareDir, 'OVMF_VARS.ms.fd'),
+        '/usr/share/OVMF/OVMF_VARS.fd',
+        '/usr/share/edk2/ovmf/OVMF_VARS.fd'
+      ]
+
+      // Find the first existing template
+      let templatePath: string | null = null
+      for (const candidate of templatePaths) {
+        if (fs.existsSync(candidate)) {
+          templatePath = candidate
+          break
+        }
+      }
+
+      if (!templatePath) {
+        this.debug.log('warn', 'UEFI vars template not found. UEFI settings will not persist between reboots.')
+        return null
+      }
+
+      // Create the per-VM vars file path
+      const varsFilename = `uefi-vars-${vmId}.fd`
+      const varsPath = path.join(this.diskDir, varsFilename)
+
+      // Copy template if vars file doesn't exist
+      if (!fs.existsSync(varsPath)) {
+        this.debug.log('info', `Creating UEFI vars file from template: ${templatePath}`)
+        fs.copyFileSync(templatePath, varsPath)
+        // Ensure the vars file is writable
+        fs.chmodSync(varsPath, 0o644)
+      }
+
+      return varsPath
+    } catch (error) {
+      this.debug.log('warn', `Failed to setup UEFI vars file: ${error}. UEFI settings will not persist.`)
+      return null
+    }
+  }
+
+  /**
    * Builds QEMU command line
    *
    * @param config - VM creation configuration
@@ -1689,6 +1754,13 @@ export class VMLifecycle {
     if (validatedFirmware) {
       builder.setFirmware(validatedFirmware)
       this.debug.log('info', `UEFI firmware enabled: ${validatedFirmware}`)
+
+      // Create per-VM UEFI vars file for persistent UEFI settings
+      const uefiVarsPath = this.setupUefiVars(config.vmId, validatedFirmware)
+      if (uefiVarsPath) {
+        builder.setUefiVars(uefiVarsPath)
+        this.debug.log('info', `UEFI vars file: ${uefiVarsPath}`)
+      }
     }
     // If no firmware specified or validation failed, QEMU defaults to BIOS boot
 

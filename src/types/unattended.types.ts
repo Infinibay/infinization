@@ -288,6 +288,29 @@ export class UnattendedError extends Error {
 /** Default timeout for installation monitoring (60 minutes) */
 export const DEFAULT_INSTALLATION_TIMEOUT = 60 * 60 * 1000
 
+/**
+ * OS-specific installation timeouts (in milliseconds)
+ * - Ubuntu: 45 minutes (typically faster installation)
+ * - Fedora: 60 minutes (similar to Ubuntu)
+ * - Windows 10: 90 minutes (longer due to updates)
+ * - Windows 11: 120 minutes (can take significantly longer)
+ */
+export const OS_INSTALLATION_TIMEOUTS: Record<OSType, number> = {
+  ubuntu: 45 * 60 * 1000, // 45 minutes
+  fedora: 60 * 60 * 1000, // 60 minutes
+  windows10: 90 * 60 * 1000, // 90 minutes
+  windows11: 120 * 60 * 1000 // 120 minutes
+}
+
+/**
+ * Gets the recommended installation timeout for a specific OS
+ * @param os - The target operating system
+ * @returns Timeout in milliseconds
+ */
+export function getInstallationTimeout (os: OSType): number {
+  return OS_INSTALLATION_TIMEOUTS[os] ?? DEFAULT_INSTALLATION_TIMEOUT
+}
+
 /** Standard QEMU CD-ROM device name */
 export const CDROM_DEVICE_NAME = 'ide1-cd0'
 

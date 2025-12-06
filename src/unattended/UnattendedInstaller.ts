@@ -43,9 +43,9 @@ import {
   UnattendedErrorCode,
   CDROM_DEVICE_NAME,
   ISO_BOOT_ORDER,
-  DEFAULT_INSTALLATION_TIMEOUT,
   DEFAULT_MAX_RESETS,
   DEFAULT_CHECK_INTERVAL,
+  getInstallationTimeout,
   isUnattendedError
 } from '../types/unattended.types'
 
@@ -116,11 +116,14 @@ export class UnattendedInstaller {
       process.env.INFINIBAY_BACKEND_SERVICES_PATH ??
       DEFAULT_BACKEND_SERVICES_PATH
 
+    // Use OS-specific timeout if not explicitly provided
+    const osTimeout = getInstallationTimeout(config.os)
     this.monitorConfig = {
-      timeout: options?.monitorConfig?.timeout ?? DEFAULT_INSTALLATION_TIMEOUT,
+      timeout: options?.monitorConfig?.timeout ?? osTimeout,
       maxResets: options?.monitorConfig?.maxResets ?? DEFAULT_MAX_RESETS,
       checkInterval: options?.monitorConfig?.checkInterval ?? DEFAULT_CHECK_INTERVAL
     }
+    this.debug.log(`Using installation timeout: ${this.monitorConfig.timeout}ms (${Math.round(this.monitorConfig.timeout / 60000)} minutes) for ${config.os}`)
 
     this.debug.log(`Backend services path: ${this.backendServicesPath}`)
     this.validateConfig()

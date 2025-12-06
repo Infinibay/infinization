@@ -146,6 +146,8 @@ export interface HealthMonitorConfig {
   checkIntervalMs: number
   /** Whether to cleanup resources for crashed VMs (default: true) */
   enableCleanup: boolean
+  /** Directory where pidfiles are stored (default: /var/run/infinivirt/pids) */
+  pidfileDir?: string
   /** Optional callback when a crash is detected */
   onCrashDetected?: (vmId: string) => Promise<void>
   /** Optional callback when cleanup fails after retries */
@@ -198,6 +200,7 @@ export enum CleanupResourceType {
   TAP_DEVICE = 'TAP_DEVICE',
   FIREWALL_CHAIN = 'FIREWALL_CHAIN',
   QMP_SOCKET = 'QMP_SOCKET',
+  PIDFILE = 'PIDFILE',
   DB_CONFIGURATION = 'DB_CONFIGURATION'
 }
 
