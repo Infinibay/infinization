@@ -55,7 +55,21 @@ export class QemuProcess {
     const isDaemonized = this.commandBuilder.isDaemonizeEnabled()
     const pidfilePath = this.pidFilePath || this.commandBuilder.getPidfilePath()
 
-    this.debug.log(`Starting VM ${this.vmId}: ${command} ${args.join(' ')}`)
+    // Log command in a readable format
+    this.debug.log(`Starting VM ${this.vmId}`)
+    this.debug.log(`Command: ${command}`)
+    this.debug.log(`Arguments (${args.length}):`)
+    for (let i = 0; i < args.length; i += 2) {
+      const arg = args[i]
+      const value = args[i + 1]
+      if (value && !value.startsWith('-')) {
+        this.debug.log(`  ${arg} ${value}`)
+      } else {
+        this.debug.log(`  ${arg}`)
+        if (value) i-- // Reprocess value as next arg
+      }
+    }
+    this.debug.log(`Full command: ${command} ${args.join(' ')}`)
 
     return new Promise((resolve, reject) => {
       let stderrBuffer = ''
@@ -66,6 +80,13 @@ export class QemuProcess {
 
       const handleEarlyExit = () => {
         if (!startCompleted && processExited) {
+          // For daemonized processes, exit code 0 is expected (parent forks and exits)
+          // We should NOT treat this as an error - the startup wait (pidfile/QMP) will handle success/failure
+          if (isDaemonized && exitCode === 0) {
+            this.debug.log(`VM ${this.vmId} parent process exited normally (daemonize fork), waiting for daemon startup...`)
+            return
+          }
+
           const errorMsg = stderrBuffer
             ? `VM ${this.vmId} exited during startup with code ${exitCode}, signal ${exitSignal}: ${stderrBuffer}`
             : `VM ${this.vmId} exited during startup with code ${exitCode}, signal ${exitSignal}`
@@ -109,6 +130,12 @@ export class QemuProcess {
         exitCode = code
         exitSignal = signal
         this.debug.log(`VM ${this.vmId} exited with code ${code}, signal ${signal}`)
+        if (stderrBuffer) {
+          this.debug.log('error', `VM ${this.vmId} stderr output:\n${stderrBuffer}`)
+        }
+        if (code === 0 && isDaemonized) {
+          this.debug.log(`VM ${this.vmId} daemonize fork completed (parent exited with code 0)`)
+        }
 
         // For non-daemonized processes, clear state on exit
         if (!isDaemonized) {

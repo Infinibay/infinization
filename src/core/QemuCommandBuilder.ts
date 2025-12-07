@@ -738,8 +738,13 @@ export class QemuCommandBuilder {
    */
   addSecondCdrom (isoPath: string): this {
     this.cdromCount++
-    // Use ide for compatibility, with auto-incrementing index
-    this.args.push('-drive', `file=${isoPath},media=cdrom,readonly=on,index=${this.cdromCount + 1}`)
+    // Use SATA/AHCI for q35 machines which is more reliable than IDE index
+    // This avoids conflicts with -cdrom which uses a fixed index
+    const driveId = `cdrom${this.cdromCount}`
+    this.args.push(
+      '-drive', `file=${isoPath},if=none,media=cdrom,readonly=on,id=${driveId}`,
+      '-device', `ide-cd,drive=${driveId}`
+    )
     return this
   }
 
@@ -757,8 +762,8 @@ export class QemuCommandBuilder {
   addAudioDevice (): this {
     // Intel HDA audio controller
     this.args.push('-device', 'intel-hda')
-    // HDA output to SPICE
-    this.args.push('-device', 'hda-duplex')
+    // HDA output linked to SPICE audiodev
+    this.args.push('-device', 'hda-duplex,audiodev=audio0')
     // Audio backend to SPICE
     this.args.push('-audiodev', 'spice,id=audio0')
     return this

@@ -47,6 +47,7 @@
  */
 
 import { VMLifecycle } from './VMLifecycle'
+import { QMPClient } from './QMPClient'
 import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { HealthMonitor } from '../sync/HealthMonitor'
@@ -408,6 +409,50 @@ export class Infinivirt {
   getEventHandler (): EventHandler {
     this.ensureInitialized()
     return this.eventHandler
+  }
+
+  /**
+   * Attaches to an already-running VM's QMP socket for event monitoring.
+   *
+   * Use this to re-attach to VMs that were running before the backend was restarted.
+   * This connects to the QMP socket and subscribes to state change events.
+   *
+   * @param vmId - The VM identifier in the database
+   * @param qmpSocketPath - Path to the VM's QMP Unix socket
+   * @throws Error if connection fails or VM is not actually running
+   */
+  async attachToRunningVM (vmId: string, qmpSocketPath: string): Promise<void> {
+    this.ensureInitialized()
+
+    // Check if already attached
+    if (this.eventHandler.isAttached(vmId)) {
+      this.debug.log(`VM ${vmId} already attached, skipping`)
+      return
+    }
+
+    this.debug.log(`Attaching to running VM ${vmId} via ${qmpSocketPath}`)
+
+    try {
+      const qmpClient = new QMPClient(qmpSocketPath)
+      await qmpClient.connect()
+
+      // Attach event listeners
+      await this.eventHandler.attachToVM(vmId, qmpClient)
+
+      // Track this VM (minimal resources - QMP client is managed by EventHandler)
+      // We need internalName for proper tracking, but we only have vmId here
+      // The EventHandler already tracks the QMP client
+      this.activeVMs.set(vmId, {
+        createdAt: new Date(),
+        internalName: vmId // Use vmId as placeholder; actual internalName is in DB
+      })
+
+      this.debug.log(`Successfully attached to running VM ${vmId}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.debug.log('error', `Failed to attach to VM ${vmId}: ${message}`)
+      throw error
+    }
   }
 
   /**

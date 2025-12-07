@@ -1390,7 +1390,14 @@ export class VMLifecycle {
    * Ensures required directories exist
    */
   private async ensureDirectories (): Promise<void> {
-    const dirs = [this.diskDir, this.qmpSocketDir, this.pidfileDir]
+    const dirs = [
+      this.diskDir,
+      this.qmpSocketDir,
+      this.pidfileDir,
+      path.join(this.qmpSocketDir, 'ga'),
+      path.join(this.qmpSocketDir, 'tpm'),
+      path.join(this.qmpSocketDir, 'infini')
+    ]
     for (const dir of dirs) {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true })
@@ -1638,11 +1645,21 @@ export class VMLifecycle {
   private setupUefiVars (vmId: string, firmwarePath: string): string | null {
     try {
       // Determine the OVMF_VARS template path based on the OVMF_CODE path
-      // E.g., /usr/share/OVMF/OVMF_CODE.fd -> /usr/share/OVMF/OVMF_VARS.fd
+      // E.g., /usr/share/OVMF/OVMF_CODE_4M.fd -> /usr/share/OVMF/OVMF_VARS_4M.fd
       const firmwareDir = path.dirname(firmwarePath)
+      const firmwareBasename = path.basename(firmwarePath)
+
+      // Build template paths based on firmware variant (4M or legacy)
+      const is4M = firmwareBasename.includes('_4M')
+      const varsSuffix = is4M ? '_4M' : ''
+
       const templatePaths = [
+        path.join(firmwareDir, `OVMF_VARS${varsSuffix}.fd`),
+        path.join(firmwareDir, `OVMF_VARS${varsSuffix}.ms.fd`),
+        `/usr/share/OVMF/OVMF_VARS${varsSuffix}.fd`,
+        `/usr/share/edk2/ovmf/OVMF_VARS${varsSuffix}.fd`,
+        // Fallback to legacy paths if 4M variant not found
         path.join(firmwareDir, 'OVMF_VARS.fd'),
-        path.join(firmwareDir, 'OVMF_VARS.ms.fd'),
         '/usr/share/OVMF/OVMF_VARS.fd',
         '/usr/share/edk2/ovmf/OVMF_VARS.fd'
       ]
