@@ -595,6 +595,216 @@ export class QemuCommandBuilder {
     return this
   }
 
+  // ===========================================================================
+  // TPM Support
+  // ===========================================================================
+
+  /**
+   * Add TPM 2.0 emulator device.
+   *
+   * Requires swtpm to be running. The socket path should point to the
+   * swtpm control socket.
+   *
+   * @param socketPath - Path to swtpm socket (e.g., /var/lib/swtpm/vmid/swtpm-sock)
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * // Add TPM 2.0 with swtpm
+   * builder.addTPM('/var/lib/swtpm/my-vm/swtpm-sock')
+   * ```
+   */
+  addTPM (socketPath: string): this {
+    // chardev for swtpm socket
+    this.args.push('-chardev', `socket,id=chrtpm,path=${socketPath}`)
+    // TPM device backend
+    this.args.push('-tpmdev', 'emulator,id=tpm0,chardev=chrtpm')
+    // TPM TIS device
+    this.args.push('-device', 'tpm-tis,tpmdev=tpm0')
+    return this
+  }
+
+  // ===========================================================================
+  // VirtIO Serial Channels
+  // ===========================================================================
+
+  private virtioSerialAdded: boolean = false
+  private virtioSerialPortCount: number = 0
+
+  /**
+   * Ensures virtio-serial-pci controller is added (only once).
+   * Called automatically by addVirtioChannel methods.
+   */
+  private ensureVirtioSerial (): void {
+    if (!this.virtioSerialAdded) {
+      this.args.push('-device', 'virtio-serial-pci,id=virtio-serial0')
+      this.virtioSerialAdded = true
+    }
+  }
+
+  /**
+   * Add a VirtIO serial channel with Unix socket backend.
+   *
+   * This is the base method for adding virtio-serial channels like
+   * QEMU Guest Agent, InfiniService, etc.
+   *
+   * @param channelName - The virtio channel name (e.g., 'org.qemu.guest_agent.0')
+   * @param socketPath - Path to Unix socket for host communication
+   * @param chardevId - Unique chardev identifier
+   * @returns this for method chaining
+   */
+  addVirtioChannel (channelName: string, socketPath: string, chardevId: string): this {
+    this.ensureVirtioSerial()
+
+    // Add chardev for socket communication
+    this.args.push('-chardev', `socket,path=${socketPath},server=on,wait=off,id=${chardevId}`)
+
+    // Add virtio serial port
+    this.args.push('-device', `virtserialport,chardev=${chardevId},name=${channelName}`)
+
+    this.virtioSerialPortCount++
+    return this
+  }
+
+  /**
+   * Add QEMU Guest Agent channel.
+   *
+   * Enables communication with qemu-guest-agent inside the VM for:
+   * - File operations (read/write files)
+   * - Network configuration
+   * - Process execution
+   * - System commands (shutdown, suspend)
+   *
+   * @param socketPath - Path to guest agent socket
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * builder.addGuestAgentChannel('/var/run/qemu/vm1-ga.sock')
+   * ```
+   */
+  addGuestAgentChannel (socketPath: string): this {
+    return this.addVirtioChannel(
+      'org.qemu.guest_agent.0',
+      socketPath,
+      'chagent0'
+    )
+  }
+
+  /**
+   * Add InfiniService channel for custom host-VM communication.
+   *
+   * Used for metrics collection, health monitoring, and management
+   * operations specific to Infinibay.
+   *
+   * @param socketPath - Path to InfiniService socket
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * builder.addInfiniServiceChannel('/opt/infinibay/sockets/vm-123.socket')
+   * ```
+   */
+  addInfiniServiceChannel (socketPath: string): this {
+    return this.addVirtioChannel(
+      'com.infinibay.infiniservice.0',
+      socketPath,
+      'chinfini0'
+    )
+  }
+
+  // ===========================================================================
+  // Additional CD-ROM Support
+  // ===========================================================================
+
+  private cdromCount: number = 0
+
+  /**
+   * Add an additional CD-ROM drive.
+   *
+   * Useful for attaching VirtIO drivers ISO alongside the installation ISO.
+   *
+   * @param isoPath - Path to ISO file
+   * @param index - Optional drive index (auto-incremented if not specified)
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * // Add installation ISO
+   * builder.addCdrom('/path/to/install.iso')
+   * // Add VirtIO drivers ISO
+   * builder.addSecondCdrom('/path/to/virtio-win.iso')
+   * ```
+   */
+  addSecondCdrom (isoPath: string): this {
+    this.cdromCount++
+    // Use ide for compatibility, with auto-incrementing index
+    this.args.push('-drive', `file=${isoPath},media=cdrom,readonly=on,index=${this.cdromCount + 1}`)
+    return this
+  }
+
+  // ===========================================================================
+  // Audio Device Support
+  // ===========================================================================
+
+  /**
+   * Add audio device for VM sound support.
+   *
+   * Uses Intel HDA with output to SPICE for remote audio.
+   *
+   * @returns this for method chaining
+   */
+  addAudioDevice (): this {
+    // Intel HDA audio controller
+    this.args.push('-device', 'intel-hda')
+    // HDA output to SPICE
+    this.args.push('-device', 'hda-duplex')
+    // Audio backend to SPICE
+    this.args.push('-audiodev', 'spice,id=audio0')
+    return this
+  }
+
+  // ===========================================================================
+  // USB Support
+  // ===========================================================================
+
+  private usbControllerAdded: boolean = false
+
+  /**
+   * Ensures USB controller is added (only once).
+   */
+  private ensureUsbController (): void {
+    if (!this.usbControllerAdded) {
+      this.args.push('-device', 'qemu-xhci,id=usb')
+      this.usbControllerAdded = true
+    }
+  }
+
+  /**
+   * Add USB tablet input device for better mouse synchronization.
+   *
+   * Provides absolute positioning which works better with SPICE/VNC
+   * than relative mouse movement.
+   *
+   * @returns this for method chaining
+   */
+  addUsbTablet (): this {
+    this.ensureUsbController()
+    this.args.push('-device', 'usb-tablet')
+    return this
+  }
+
+  /**
+   * Add USB keyboard device.
+   *
+   * @returns this for method chaining
+   */
+  addUsbKeyboard (): this {
+    this.ensureUsbController()
+    this.args.push('-device', 'usb-kbd')
+    return this
+  }
+
   /**
    * Set process options (name, uuid, daemonize, pidfile)
    * @param options - Process configuration options

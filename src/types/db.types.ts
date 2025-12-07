@@ -135,6 +135,19 @@ export interface MachineConfigUpdate {
   hugepages?: boolean | null
   /** CPU affinity configuration (format: {"cores": [0, 1, 2]}) */
   cpuPinning?: { cores: number[] } | null
+  // Advanced device configuration
+  /** Path to TPM 2.0 socket (swtpm) */
+  tpmSocketPath?: string | null
+  /** Path to QEMU Guest Agent socket */
+  guestAgentSocketPath?: string | null
+  /** Path to InfiniService channel socket */
+  infiniServiceSocketPath?: string | null
+  /** Path to VirtIO drivers ISO */
+  virtioDriversIso?: string | null
+  /** Enable Intel HDA audio device */
+  enableAudio?: boolean | null
+  /** Enable USB tablet for absolute mouse positioning */
+  enableUsbTablet?: boolean | null
 }
 
 // =============================================================================
@@ -251,6 +264,19 @@ export interface ExtendedMachineConfigurationRecord extends MachineConfiguration
   hugepages: boolean | null
   /** CPU affinity configuration */
   cpuPinning: { cores: number[] } | null
+  // Advanced device configuration
+  /** Path to TPM 2.0 socket (swtpm) */
+  tpmSocketPath: string | null
+  /** Path to QEMU Guest Agent socket */
+  guestAgentSocketPath: string | null
+  /** Path to InfiniService channel socket */
+  infiniServiceSocketPath: string | null
+  /** Path to VirtIO drivers ISO */
+  virtioDriversIso: string | null
+  /** Enable Intel HDA audio device */
+  enableAudio: boolean | null
+  /** Enable USB tablet for absolute mouse positioning */
+  enableUsbTablet: boolean | null
 }
 
 /**

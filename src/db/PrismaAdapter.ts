@@ -827,7 +827,14 @@ export class PrismaAdapter implements DatabaseAdapter {
       // Hugepages configuration
       hugepages: config.hugepages ?? null,
       // CPU pinning configuration
-      cpuPinning: this.parseCpuPinning(config.cpuPinning)
+      cpuPinning: this.parseCpuPinning(config.cpuPinning),
+      // Advanced device configuration (cast through unknown for forward compatibility)
+      tpmSocketPath: ((config as unknown as Record<string, unknown>).tpmSocketPath as string) ?? null,
+      guestAgentSocketPath: ((config as unknown as Record<string, unknown>).guestAgentSocketPath as string) ?? null,
+      infiniServiceSocketPath: ((config as unknown as Record<string, unknown>).infiniServiceSocketPath as string) ?? null,
+      virtioDriversIso: ((config as unknown as Record<string, unknown>).virtioDriversIso as string) ?? null,
+      enableAudio: ((config as unknown as Record<string, unknown>).enableAudio as boolean) ?? null,
+      enableUsbTablet: ((config as unknown as Record<string, unknown>).enableUsbTablet as boolean) ?? null
     }
   }
 

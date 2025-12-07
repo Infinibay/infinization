@@ -233,6 +233,97 @@ export interface VMCreateConfig {
    * @example [4, 5, 6, 7] // Pin to cores 4-7 (useful for NUMA nodes)
    */
   cpuPinning?: number[]
+
+  // ===========================================================================
+  // Advanced Device Configuration
+  // ===========================================================================
+
+  /**
+   * Path to TPM 2.0 socket for Trusted Platform Module emulation.
+   *
+   * Requires swtpm to be running and listening on this socket path.
+   * TPM is required for Windows 11 and provides hardware security features.
+   *
+   * **Host Requirements:**
+   * - swtpm package installed
+   * - swtpm_setup for initializing TPM state
+   * - Socket created before VM start
+   *
+   * @example '/var/run/infinivirt/tpm/vm-abc123.sock'
+   */
+  tpmSocketPath?: string
+
+  /**
+   * Path to QEMU Guest Agent socket for host-guest communication.
+   *
+   * The Guest Agent enables host-initiated commands like:
+   * - File operations (read/write guest files)
+   * - Process management
+   * - Network configuration queries
+   * - Graceful shutdown coordination
+   *
+   * **Guest Requirements:**
+   * - qemu-guest-agent package installed in the VM
+   * - Guest agent service running
+   *
+   * @example '/var/run/infinivirt/ga/vm-abc123.sock'
+   */
+  guestAgentSocketPath?: string
+
+  /**
+   * Path to InfiniService channel socket for custom host-guest communication.
+   *
+   * This virtio-serial channel is used by the InfiniService agent for:
+   * - Application installation status
+   * - Custom provisioning commands
+   * - Health check coordination
+   * - User session management
+   *
+   * **Guest Requirements:**
+   * - InfiniService agent installed in the VM
+   *
+   * @example '/var/run/infinivirt/infini/vm-abc123.sock'
+   */
+  infiniServiceSocketPath?: string
+
+  /**
+   * Path to VirtIO drivers ISO for Windows VMs.
+   *
+   * Mounted as a secondary CD-ROM drive to provide VirtIO drivers
+   * during Windows installation (disk, network, balloon, etc.).
+   *
+   * Common sources:
+   * - https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
+   * - /usr/share/virtio-win/virtio-win.iso (packaged)
+   *
+   * @example '/var/lib/infinivirt/isos/virtio-win.iso'
+   */
+  virtioDriversIso?: string
+
+  /**
+   * Enable Intel HDA audio device for sound output.
+   *
+   * Adds an Intel High Definition Audio controller with a duplex codec.
+   * Audio is routed through SPICE for remote desktop scenarios.
+   *
+   * **Requirements:**
+   * - SPICE display type for remote audio
+   * - Audio drivers in guest OS
+   *
+   * @default false
+   */
+  enableAudio?: boolean
+
+  /**
+   * Enable USB tablet device for absolute mouse positioning.
+   *
+   * USB tablet provides absolute cursor positioning, eliminating the need
+   * to capture/release mouse in remote desktop scenarios. Recommended
+   * for all VMs, especially Windows.
+   *
+   * @default true for Windows, false for others
+   */
+  enableUsbTablet?: boolean
 }
 
 /**

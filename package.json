@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Custom virtualization solution for managing QEMU VMs",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
     "dev": "ts-node -r tsconfig-paths/register src/index.ts",
@@ -19,7 +20,7 @@
     "debug": "^4.3.4"
   },
   "peerDependencies": {
-    "@prisma/client": "^5.0.0"
+    "@prisma/client": "^5.0.0 || ^6.0.0"
   },
   "devDependencies": {
     "@types/debug": "^4.1.12",

@@ -435,7 +435,14 @@ export class VMLifecycle {
         // Store CPU pinning configuration
         cpuPinning: config.cpuPinning && config.cpuPinning.length > 0
           ? { cores: config.cpuPinning }
-          : null
+          : null,
+        // Store advanced device configuration
+        tpmSocketPath: config.tpmSocketPath ?? null,
+        guestAgentSocketPath: config.guestAgentSocketPath ?? null,
+        infiniServiceSocketPath: config.infiniServiceSocketPath ?? null,
+        virtioDriversIso: config.virtioDriversIso ?? null,
+        enableAudio: config.enableAudio ?? false,
+        enableUsbTablet: config.enableUsbTablet ?? config.os.toLowerCase().includes('windows')
       })
 
       // 11. Update database status
@@ -710,7 +717,14 @@ export class VMLifecycle {
           networkQueues: vmConfig.configuration?.networkQueues,
           memoryBalloon: effectiveMemoryBalloon,
           uefiFirmware: vmConfig.configuration?.uefiFirmware,
-          hugepages: vmConfig.configuration?.hugepages
+          hugepages: vmConfig.configuration?.hugepages,
+          // Advanced device configuration from database
+          tpmSocketPath: vmConfig.configuration?.tpmSocketPath,
+          guestAgentSocketPath: vmConfig.configuration?.guestAgentSocketPath,
+          infiniServiceSocketPath: vmConfig.configuration?.infiniServiceSocketPath,
+          virtioDriversIso: vmConfig.configuration?.virtioDriversIso,
+          enableAudio: vmConfig.configuration?.enableAudio,
+          enableUsbTablet: vmConfig.configuration?.enableUsbTablet
         }
       )
 
@@ -1694,6 +1708,12 @@ export class VMLifecycle {
       memoryBalloon?: boolean | null
       uefiFirmware?: string | null
       hugepages?: boolean | null
+      tpmSocketPath?: string | null
+      guestAgentSocketPath?: string | null
+      infiniServiceSocketPath?: string | null
+      virtioDriversIso?: string | null
+      enableAudio?: boolean | null
+      enableUsbTablet?: boolean | null
     }
   ): QemuCommandBuilder {
     const builder = new QemuCommandBuilder()
@@ -1819,6 +1839,62 @@ export class VMLifecycle {
       builder.addGpuPassthrough(config.gpuPciAddress, config.gpuRomfile)
     }
 
+    // ===========================================================================
+    // Advanced Device Configuration
+    // ===========================================================================
+
+    // TPM 2.0 device (required for Windows 11)
+    const tpmSocketPath = config.tpmSocketPath ?? qemuConfig?.tpmSocketPath
+    if (tpmSocketPath) {
+      if (fs.existsSync(tpmSocketPath) || this.isSocketListening(tpmSocketPath)) {
+        builder.addTPM(tpmSocketPath)
+        this.debug.log('info', `TPM 2.0 enabled via socket: ${tpmSocketPath}`)
+      } else {
+        this.debug.log('warn', `TPM socket not found: ${tpmSocketPath}. TPM will not be available.`)
+      }
+    }
+
+    // QEMU Guest Agent channel
+    const guestAgentSocketPath = config.guestAgentSocketPath ?? qemuConfig?.guestAgentSocketPath
+    if (guestAgentSocketPath) {
+      builder.addGuestAgentChannel(guestAgentSocketPath)
+      this.debug.log('info', `Guest Agent channel enabled: ${guestAgentSocketPath}`)
+    }
+
+    // InfiniService custom channel
+    const infiniServiceSocketPath = config.infiniServiceSocketPath ?? qemuConfig?.infiniServiceSocketPath
+    if (infiniServiceSocketPath) {
+      builder.addInfiniServiceChannel(infiniServiceSocketPath)
+      this.debug.log('info', `InfiniService channel enabled: ${infiniServiceSocketPath}`)
+    }
+
+    // VirtIO drivers ISO (secondary CD-ROM for Windows)
+    const virtioDriversIso = config.virtioDriversIso ?? qemuConfig?.virtioDriversIso
+    if (virtioDriversIso) {
+      if (fs.existsSync(virtioDriversIso)) {
+        builder.addSecondCdrom(virtioDriversIso)
+        this.debug.log('info', `VirtIO drivers ISO mounted: ${virtioDriversIso}`)
+      } else {
+        this.debug.log('warn', `VirtIO drivers ISO not found: ${virtioDriversIso}`)
+      }
+    }
+
+    // Audio device (Intel HDA)
+    const enableAudio = config.enableAudio ?? qemuConfig?.enableAudio ?? false
+    if (enableAudio) {
+      builder.addAudioDevice()
+      this.debug.log('info', 'Intel HDA audio device enabled')
+    }
+
+    // USB tablet for absolute mouse positioning
+    // Default to true for Windows VMs
+    const isWindowsOS = config.os.toLowerCase().includes('windows')
+    const enableUsbTablet = config.enableUsbTablet ?? qemuConfig?.enableUsbTablet ?? isWindowsOS
+    if (enableUsbTablet) {
+      builder.addUsbTablet()
+      this.debug.log('info', 'USB tablet device enabled for absolute mouse positioning')
+    }
+
     // Process options
     builder.setProcessOptions({
       vmId: config.internalName,
@@ -1874,6 +1950,19 @@ export class VMLifecycle {
     try {
       process.kill(pid, 0)
       return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Checks if a socket file exists and is likely a valid socket
+   * (useful for checking if swtpm has created a TPM socket)
+   */
+  private isSocketListening (socketPath: string): boolean {
+    try {
+      const stats = fs.statSync(socketPath)
+      return stats.isSocket()
     } catch {
       return false
     }
