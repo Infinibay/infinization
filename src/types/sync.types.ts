@@ -26,6 +26,8 @@ export interface MachineConfigurationRecord {
   qemuPid: number | null
   tapDeviceName: string | null
   qmpSocketPath: string | null
+  guestAgentSocketPath: string | null
+  infiniServiceSocketPath: string | null
 }
 
 /**

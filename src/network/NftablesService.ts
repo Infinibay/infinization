@@ -27,6 +27,7 @@
 
 import { CommandExecutor } from '@utils/commandExecutor'
 import { Debugger } from '@utils/debug'
+import { retryOnBusy, sleep } from '@utils/retry'
 import { FirewallRuleTranslator } from './FirewallRuleTranslator'
 import {
   FirewallRuleInput,
@@ -40,6 +41,11 @@ import {
   VM_CHAIN_PREFIX,
   MAX_CHAIN_NAME_LENGTH
 } from '../types/firewall.types'
+
+/** Delay after removing jump rules before flushing chain (ms) */
+const POST_JUMP_REMOVAL_DELAY_MS = 200
+/** Delay after flushing chain before deletion (ms) */
+const POST_FLUSH_DELAY_MS = 200
 
 /** Base chain name for forwarding VM traffic */
 const BASE_FORWARD_CHAIN = 'forward'
@@ -213,6 +219,13 @@ export class NftablesService {
    * Removes a VM's firewall chain and all its rules.
    * Also removes jump rules from the base forward chain.
    *
+   * The removal sequence is carefully ordered with delays to handle busy resources:
+   * 1. Remove jump rules from forward chain (stops new traffic from reaching VM chain)
+   * 2. Wait for kernel to process rule removal
+   * 3. Flush all rules in VM chain
+   * 4. Wait for kernel to release chain resources
+   * 5. Delete the chain with retries on busy errors
+   *
    * @param vmId - The VM identifier
    */
   async removeVMChain (vmId: string): Promise<void> {
@@ -220,29 +233,46 @@ export class NftablesService {
     this.debug.log(`Removing VM chain: ${chainName}`)
 
     try {
-      // First, remove jump rules referencing this chain from the base forward chain
+      // Step 1: Remove jump rules referencing this chain from the base forward chain
+      // This stops new packets from being directed to the VM chain
       await this.removeJumpRules(chainName)
 
-      // Check if chain exists before trying to delete
+      // Step 2: Wait for kernel to process jump rule removal
+      // This ensures no new packets are being processed by the chain
+      await sleep(POST_JUMP_REMOVAL_DELAY_MS)
+
+      // Step 3: Check if chain exists before trying to delete
       const exists = await this.chainExists(chainName)
       if (!exists) {
         this.debug.log(`Chain ${chainName} does not exist, nothing to remove`)
         return
       }
 
-      // Flush all rules in the chain first (required before deletion)
+      // Step 4: Flush all rules in the chain first (required before deletion)
       await this.exec([
         'flush', 'chain',
         INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
         chainName
       ])
 
-      // Delete the chain
-      await this.exec([
-        'delete', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
-        chainName
-      ])
+      // Step 5: Wait for kernel to release chain resources after flush
+      await sleep(POST_FLUSH_DELAY_MS)
+
+      // Step 6: Delete the chain with retries on busy errors
+      await retryOnBusy(
+        async () => {
+          await this.exec([
+            'delete', 'chain',
+            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            chainName
+          ])
+        },
+        {
+          maxRetries: 3,
+          initialDelayMs: 300,
+          debugNamespace: 'nftables'
+        }
+      )
 
       this.debug.log(`VM chain removed: ${chainName}`)
     } catch (error) {

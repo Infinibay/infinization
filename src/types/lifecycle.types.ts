@@ -467,7 +467,9 @@ export enum LifecycleErrorCode {
   /** VM is in an unexpected state */
   INVALID_STATE = 'INVALID_STATE',
   /** Concurrent modification detected (optimistic locking failure) */
-  CONCURRENT_MODIFICATION = 'CONCURRENT_MODIFICATION'
+  CONCURRENT_MODIFICATION = 'CONCURRENT_MODIFICATION',
+  /** Required resource (port, socket, etc.) is unavailable */
+  RESOURCE_UNAVAILABLE = 'RESOURCE_UNAVAILABLE'
 }
 
 /**

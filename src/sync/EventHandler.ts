@@ -191,6 +191,17 @@ export class EventHandler extends EventEmitter {
   }
 
   /**
+   * Gets the QMP client for an attached VM.
+   * Returns undefined if the VM is not attached.
+   *
+   * @param vmId The VM identifier
+   * @returns The QMPClient instance or undefined
+   */
+  public getQMPClient (vmId: string): QMPClient | undefined {
+    return this.attachedVMs.get(vmId)?.qmpClient
+  }
+
+  /**
    * Handles a QMP event
    */
   private async handleEvent (

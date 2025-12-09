@@ -70,6 +70,7 @@ import {
   DEFAULT_PIDFILE_DIR
 } from '../types/lifecycle.types'
 import { DEFAULT_HEALTH_CHECK_INTERVAL } from '../types/sync.types'
+import { QMPBlockInfo } from '../types/qmp.types'
 
 /**
  * Minimal Prisma client interface for initialization.
@@ -469,6 +470,55 @@ export class Infinivirt {
   getNftablesService (): NftablesService {
     this.ensureInitialized()
     return this.nftables
+  }
+
+  // ===========================================================================
+  // Device Operations
+  // ===========================================================================
+
+  /**
+   * Ejects a CD-ROM device from a running VM.
+   *
+   * @param vmId - The VM identifier
+   * @param device - Device name (e.g., 'ide0-cd0', 'ide0-cd1', 'cdrom', 'cdrom2')
+   * @param force - Whether to force ejection even if locked (default: true)
+   * @throws LifecycleError if VM is not found or not running
+   */
+  async ejectCdrom (vmId: string, device: string, force = true): Promise<void> {
+    this.ensureInitialized()
+
+    const qmpClient = this.eventHandler.getQMPClient(vmId)
+    if (!qmpClient) {
+      throw new LifecycleError(
+        LifecycleErrorCode.VM_NOT_FOUND,
+        `VM ${vmId} not found or not running`
+      )
+    }
+
+    this.debug.log(`Ejecting CD-ROM device ${device} from VM ${vmId}`)
+    await qmpClient.eject(device, force)
+    this.debug.log(`CD-ROM device ${device} ejected from VM ${vmId}`)
+  }
+
+  /**
+   * Queries block devices from a running VM.
+   *
+   * @param vmId - The VM identifier
+   * @returns Array of block device information
+   * @throws LifecycleError if VM is not found or not running
+   */
+  async queryBlockDevices (vmId: string): Promise<QMPBlockInfo[]> {
+    this.ensureInitialized()
+
+    const qmpClient = this.eventHandler.getQMPClient(vmId)
+    if (!qmpClient) {
+      throw new LifecycleError(
+        LifecycleErrorCode.VM_NOT_FOUND,
+        `VM ${vmId} not found or not running`
+      )
+    }
+
+    return qmpClient.queryBlock()
   }
 
   // ===========================================================================

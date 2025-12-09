@@ -178,7 +178,15 @@ export class QemuProcess {
 
       // Wait for QMP socket if configured
       if (this.qmpSocketPath) {
-        this.waitForQmpSocketWithEarlyExit(() => processExited, stderrBuffer)
+        // For daemonized processes, don't treat parent exit (code 0) as an error
+        // The daemon child is still starting up
+        const shouldCheckEarlyExit = () => {
+          if (!processExited) return false
+          // For daemonized processes, exit code 0 means successful fork, not failure
+          if (isDaemonized && exitCode === 0) return false
+          return true
+        }
+        this.waitForQmpSocketWithEarlyExit(shouldCheckEarlyExit, stderrBuffer)
           .then(completeStart)
           .catch(handleStartupError)
       } else if (isDaemonized && pidfilePath) {

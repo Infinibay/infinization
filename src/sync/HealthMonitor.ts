@@ -550,6 +550,32 @@ export class HealthMonitor extends EventEmitter {
       )
     }
 
+    // Guest agent socket cleanup
+    if (config.guestAgentSocketPath) {
+      await orchestrator.executeCleanup(
+        CleanupResourceType.QMP_SOCKET,
+        config.guestAgentSocketPath,
+        async () => {
+          if (fs.existsSync(config.guestAgentSocketPath!)) {
+            fs.unlinkSync(config.guestAgentSocketPath!)
+          }
+        }
+      )
+    }
+
+    // InfiniService socket cleanup
+    if (config.infiniServiceSocketPath) {
+      await orchestrator.executeCleanup(
+        CleanupResourceType.QMP_SOCKET,
+        config.infiniServiceSocketPath,
+        async () => {
+          if (fs.existsSync(config.infiniServiceSocketPath!)) {
+            fs.unlinkSync(config.infiniServiceSocketPath!)
+          }
+        }
+      )
+    }
+
     // Pidfile cleanup - derive path from qmpSocketPath
     // qmpSocketPath: /path/to/sockets/{internalName}.sock
     // pidfilePath: {pidfileDir}/{internalName}.pid

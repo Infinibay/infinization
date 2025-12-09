@@ -92,6 +92,9 @@ interface PrismaMachineConfigurationRecord {
   hugepages?: boolean | null
   // CPU pinning configuration
   cpuPinning?: unknown | null // JSON field from Prisma
+  // Socket paths for guest agent and infini service
+  guestAgentSocketPath?: string | null
+  infiniServiceSocketPath?: string | null
 }
 
 /**
@@ -286,7 +289,9 @@ export class PrismaAdapter implements DatabaseAdapter {
             select: {
               qemuPid: true,
               tapDeviceName: true,
-              qmpSocketPath: true
+              qmpSocketPath: true,
+              guestAgentSocketPath: true,
+              infiniServiceSocketPath: true
             }
           }
         }
@@ -301,7 +306,9 @@ export class PrismaAdapter implements DatabaseAdapter {
           ? {
               qemuPid: machine.configuration.qemuPid,
               tapDeviceName: machine.configuration.tapDeviceName,
-              qmpSocketPath: machine.configuration.qmpSocketPath
+              qmpSocketPath: machine.configuration.qmpSocketPath,
+              guestAgentSocketPath: machine.configuration.guestAgentSocketPath ?? null,
+              infiniServiceSocketPath: machine.configuration.infiniServiceSocketPath ?? null
             }
           : null
       }))

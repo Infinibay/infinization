@@ -123,15 +123,9 @@ export class SpiceConfig {
     // QXL VGA driver for SPICE
     args.push('-vga', 'qxl')
 
-    // Guest agent for copy/paste via virtio-serial
-    if (this.enableAgent) {
-      args.push('-device', 'virtio-serial-pci')
-      args.push(
-        '-device',
-        'virtserialport,chardev=spicechannel0,name=com.redhat.spice.0'
-      )
-      args.push('-chardev', 'spicevmc,id=spicechannel0,name=vdagent')
-    }
+    // Note: Guest agent devices (virtio-serial-pci, virtserialport, chardev) are NOT added here.
+    // They are managed by QemuCommandBuilder.addSpice() using ensureVirtioSerial() to prevent
+    // duplicate virtio-serial-pci controllers when multiple channels are configured.
 
     this.debug.log(`Generated args: ${args.join(' ')}`)
 

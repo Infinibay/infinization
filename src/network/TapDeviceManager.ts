@@ -1,6 +1,14 @@
 import { CommandExecutor } from '../utils/commandExecutor'
 import { Debugger } from '../utils/debug'
+import { retryOnBusy, sleep } from '../utils/retry'
 import { TAP_NAME_PREFIX, MAX_TAP_NAME_LENGTH, NetworkErrorCode } from '../types/network.types'
+
+/** Delay after bringing down TAP device before deletion (ms) */
+const POST_BRINGDOWN_DELAY_MS = 200
+/** Maximum retries for device creation when busy */
+const CREATE_MAX_RETRIES = 3
+/** Delay between creation retries (ms) */
+const CREATE_RETRY_DELAY_MS = 500
 
 /**
  * TapDeviceManager manages TAP network devices for VMs.
@@ -27,24 +35,54 @@ export class TapDeviceManager {
 
   /**
    * Creates a new TAP device for a VM.
+   * Handles cleanup of orphaned devices and retries on busy resources.
+   *
    * @param vmId - The VM identifier used to generate TAP device name
    * @param bridge - Optional bridge name (not used during creation, only for naming context)
    * @returns The created TAP device name
-   * @throws Error if device creation fails
+   * @throws Error if device creation fails after all retries
    */
   async create (vmId: string, bridge?: string): Promise<string> {
     const tapName = this.generateTapName(vmId)
     this.debug.log(`Creating TAP device: ${tapName} for VM: ${vmId}${bridge ? ` (bridge: ${bridge})` : ''}`)
 
-    try {
-      await this.executor.execute('ip', ['tuntap', 'add', 'dev', tapName, 'mode', 'tap'])
-      this.debug.log(`TAP device created successfully: ${tapName}`)
-      return tapName
-    } catch (error) {
-      const message = `Failed to create TAP device ${tapName}: ${error instanceof Error ? error.message : String(error)}`
-      this.debug.log('error', message)
-      throw new Error(message)
+    // Check if device already exists (orphaned from previous run) and clean it up
+    if (await this.exists(tapName)) {
+      this.debug.log(`TAP device ${tapName} already exists (orphaned), cleaning up first`)
+      await this.destroy(tapName)
+      // Wait after cleanup for kernel to fully release resources
+      await sleep(POST_BRINGDOWN_DELAY_MS)
     }
+
+    // Retry creation with backoff in case resource is briefly busy after cleanup
+    let lastError: Error | undefined
+    for (let attempt = 1; attempt <= CREATE_MAX_RETRIES; attempt++) {
+      try {
+        await this.executor.execute('ip', ['tuntap', 'add', 'dev', tapName, 'mode', 'tap'])
+        this.debug.log(`TAP device created successfully: ${tapName}${attempt > 1 ? ` (attempt ${attempt})` : ''}`)
+        return tapName
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        const errorMessage = lastError.message.toLowerCase()
+
+        // Check if this is a busy/unavailable error that might resolve with a retry
+        const isBusyError = errorMessage.includes('device or resource busy') ||
+                           errorMessage.includes('resource temporarily unavailable') ||
+                           errorMessage.includes('file exists')
+
+        if (isBusyError && attempt < CREATE_MAX_RETRIES) {
+          this.debug.log(`TAP creation attempt ${attempt}/${CREATE_MAX_RETRIES} failed (resource busy), retrying in ${CREATE_RETRY_DELAY_MS}ms...`)
+          await sleep(CREATE_RETRY_DELAY_MS)
+          continue
+        }
+
+        break
+      }
+    }
+
+    const message = `Failed to create TAP device ${tapName}: ${lastError?.message ?? 'Unknown error'}`
+    this.debug.log('error', message)
+    throw new Error(message)
   }
 
   /**
@@ -75,18 +113,43 @@ export class TapDeviceManager {
 
   /**
    * Destroys a TAP device.
+   * First brings the device down, waits for kernel to release resources,
+   * then deletes the device with retries on busy errors.
+   *
    * @param tapName - The TAP device name to destroy
    * @throws Error if destruction fails (but handles non-existent devices gracefully)
    */
   async destroy (tapName: string): Promise<void> {
     this.debug.log(`Destroying TAP device: ${tapName}`)
 
+    // First check if device exists
+    if (!await this.exists(tapName)) {
+      this.debug.log(`TAP device ${tapName} does not exist, nothing to destroy`)
+      return
+    }
+
+    // Bring device down first to release kernel resources
+    await this.bringDown(tapName)
+
+    // Wait for kernel to release resources after bringing down
+    await sleep(POST_BRINGDOWN_DELAY_MS)
+
+    // Delete the device with retries on busy errors
     try {
-      await this.executor.execute('ip', ['link', 'del', tapName])
+      await retryOnBusy(
+        async () => {
+          await this.executor.execute('ip', ['link', 'del', tapName])
+        },
+        {
+          maxRetries: 3,
+          initialDelayMs: 300,
+          debugNamespace: 'tap-device'
+        }
+      )
       this.debug.log(`TAP device destroyed successfully: ${tapName}`)
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      // Handle gracefully if device doesn't exist
+      // Handle gracefully if device doesn't exist (might have been removed during retry delays)
       if (errorMessage.includes('Cannot find device') || errorMessage.includes('No such device')) {
         this.debug.log(`TAP device ${tapName} does not exist, nothing to destroy`)
         return
@@ -94,6 +157,32 @@ export class TapDeviceManager {
       const message = `Failed to destroy TAP device ${tapName}: ${errorMessage}`
       this.debug.log('error', message)
       throw new Error(message)
+    }
+  }
+
+  /**
+   * Brings a TAP device down (deactivates it).
+   * This must be done before deletion to allow kernel to release resources.
+   *
+   * @param tapName - The TAP device name to bring down
+   */
+  async bringDown (tapName: string): Promise<void> {
+    this.debug.log(`Bringing down TAP device: ${tapName}`)
+
+    try {
+      await this.executor.execute('ip', ['link', 'set', tapName, 'down'])
+      this.debug.log(`TAP device ${tapName} is now down`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Handle gracefully if device doesn't exist or is already down
+      if (errorMessage.includes('Cannot find device') ||
+          errorMessage.includes('No such device') ||
+          errorMessage.includes('not found')) {
+        this.debug.log(`TAP device ${tapName} does not exist or is already down`)
+        return
+      }
+      // Log warning but don't throw - bringDown is best-effort before deletion
+      this.debug.log('warn', `Failed to bring down TAP device ${tapName}: ${errorMessage}`)
     }
   }
 

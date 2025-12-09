@@ -41,9 +41,11 @@ import { MacAddressGenerator } from '../network/MacAddressGenerator'
 import { QemuImgService } from '../storage/QemuImgService'
 import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
+import { SPICE_MIN_PORT, SPICE_MAX_PORT } from '../types/display.types'
 import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { Debugger } from '../utils/debug'
+import { sleep } from '../utils/retry'
 import {
   VMCreateConfig,
   VMCreateResult,
@@ -87,6 +89,10 @@ interface CleanupResources {
   qmpClient?: QMPClient
   /** Path to installation ISO for cleanup */
   installationIsoPath?: string
+  /** Path to guest agent socket for cleanup */
+  guestAgentSocketPath?: string
+  /** Path to infini service socket for cleanup */
+  infiniServiceSocketPath?: string
 }
 
 /**
@@ -214,7 +220,9 @@ export class VMLifecycle {
       vmId,
       diskPaths: paths.diskPaths,
       qmpSocketPath: paths.qmpSocketPath,
-      pidFilePath: paths.pidFilePath
+      pidFilePath: paths.pidFilePath,
+      guestAgentSocketPath: config.guestAgentSocketPath,
+      infiniServiceSocketPath: config.infiniServiceSocketPath
     }
 
     try {
@@ -341,6 +349,10 @@ export class VMLifecycle {
       // Validate hugepages at creation time - check availability and coerce to false if unavailable
       const effectiveHugepages = this.validateHugepages(config.hugepages)
 
+      // Validate display port at creation time - ensure it's within valid range and available
+      const validatedDisplayPort = this.validateDisplayPort(config.displayPort)
+      const effectiveDisplayPort = await this.findAvailableDisplayPort(validatedDisplayPort)
+
       const qemuConfig = {
         machineType: effectiveMachineType,
         cpuModel: effectiveCpuModel,
@@ -350,7 +362,8 @@ export class VMLifecycle {
         networkQueues: effectiveNetworkQueues,
         memoryBalloon: effectiveMemoryBalloon,
         uefiFirmware: effectiveUefiFirmware,
-        hugepages: effectiveHugepages
+        hugepages: effectiveHugepages,
+        displayPort: effectiveDisplayPort
       }
 
       const commandBuilder = this.buildQemuCommand(
@@ -414,7 +427,7 @@ export class VMLifecycle {
         qemuPid: pid,
         tapDeviceName: tapDevice,
         graphicProtocol: config.displayType,
-        graphicPort: config.displayPort,
+        graphicPort: effectiveDisplayPort,
         graphicPassword: config.displayPassword ?? null,
         graphicHost: config.displayAddr ?? '0.0.0.0',
         // Store effective QEMU driver configuration (validated values, matching runtime behavior)
@@ -488,7 +501,7 @@ export class VMLifecycle {
         vmId,
         tapDevice,
         qmpSocketPath: paths.qmpSocketPath,
-        displayPort: config.displayPort,
+        displayPort: effectiveDisplayPort,
         pid,
         diskPaths: paths.diskPaths,
         pidFilePath: paths.pidFilePath,
@@ -616,6 +629,8 @@ export class VMLifecycle {
       resources.diskPaths = diskPaths
       resources.qmpSocketPath = qmpSocketPath
       resources.pidFilePath = pidFilePath
+      resources.guestAgentSocketPath = vmConfig.configuration?.guestAgentSocketPath ?? undefined
+      resources.infiniServiceSocketPath = vmConfig.configuration?.infiniServiceSocketPath ?? undefined
 
       // 6. Ensure directories exist
       await this.ensureDirectories()
@@ -632,11 +647,17 @@ export class VMLifecycle {
         }
       }
 
-      // 8. Get display configuration (use stored or defaults)
+      // 8. Get display configuration
       const displayProtocol = (vmConfig.configuration?.graphicProtocol as 'spice' | 'vnc') ?? 'spice'
-      const displayPort = vmConfig.configuration?.graphicPort ?? 5900
       const displayPassword = vmConfig.configuration?.graphicPassword ?? undefined
       const displayAddr = vmConfig.configuration?.graphicHost ?? '0.0.0.0'
+
+      // 8a. Find an available display port (always start from SPICE_MIN_PORT)
+      const displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
+
+      // 8b. Update database with allocated port (for UI display)
+      this.debug.log('info', `Allocated display port: ${displayPort}`)
+      await this.prisma.updateMachineConfiguration(vmId, { graphicPort: displayPort })
 
       // 9. Generate MAC address deterministically from vmId
       const macAddress = MacAddressGenerator.generateFromVmId(vmId)
@@ -718,6 +739,7 @@ export class VMLifecycle {
           memoryBalloon: effectiveMemoryBalloon,
           uefiFirmware: vmConfig.configuration?.uefiFirmware,
           hugepages: vmConfig.configuration?.hugepages,
+          displayPort, // Already validated above
           // Advanced device configuration from database
           tpmSocketPath: vmConfig.configuration?.tpmSocketPath,
           guestAgentSocketPath: vmConfig.configuration?.guestAgentSocketPath,
@@ -1501,6 +1523,110 @@ export class VMLifecycle {
     return defaultValue
   }
 
+  /**
+   * Validates display port and returns a valid value, logging a warning if invalid.
+   *
+   * @param port - The port to validate (from database or config)
+   * @returns A valid port number within SPICE_MIN_PORT-SPICE_MAX_PORT range, or SPICE_MIN_PORT as default
+   *
+   * @remarks
+   * This method provides defensive validation against corrupt database values.
+   * If the stored port is NULL, undefined, not an integer, or outside the valid
+   * range (5900-65535), it returns the default port (5900) and logs a warning.
+   */
+  private validateDisplayPort (port: number | null | undefined): number {
+    const defaultPort = SPICE_MIN_PORT
+
+    // Handle NULL or undefined
+    if (port === null || port === undefined) {
+      return defaultPort
+    }
+
+    // Check if it's a valid integer
+    if (!Number.isInteger(port)) {
+      this.debug.log('warn', `Invalid displayPort '${port}' (not an integer), using default '${defaultPort}'`)
+      return defaultPort
+    }
+
+    // Check if it's within valid range
+    if (port < SPICE_MIN_PORT || port > SPICE_MAX_PORT) {
+      this.debug.log('warn', `Invalid displayPort '${port}' (out of range ${SPICE_MIN_PORT}-${SPICE_MAX_PORT}), using default '${defaultPort}'`)
+      return defaultPort
+    }
+
+    return port
+  }
+
+  /**
+   * Checks if a TCP port is available for binding.
+   *
+   * @param port - The port number to check
+   * @returns Promise resolving to true if port is available, false if in use
+   *
+   * @remarks
+   * Creates a temporary TCP server to test port availability.
+   * This is more reliable than checking /proc/net/tcp as it accounts
+   * for ports in TIME_WAIT state and handles race conditions better.
+   */
+  private isPortAvailable (port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const net = require('net')
+      const server = net.createServer()
+
+      server.once('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+          resolve(false)
+        } else {
+          // Other errors (e.g., network issues) - assume port is unavailable
+          this.debug.log('warn', `Port availability check failed for ${port}: ${err.message}`)
+          resolve(false)
+        }
+      })
+
+      server.once('listening', () => {
+        server.close(() => {
+          resolve(true)
+        })
+      })
+
+      // Try to bind to all interfaces (0.0.0.0) to match SPICE/VNC behavior
+      server.listen(port, '0.0.0.0')
+    })
+  }
+
+  /**
+   * Finds an available display port starting from the given port.
+   *
+   * @param startPort - The port to start searching from (default: SPICE_MIN_PORT)
+   * @param maxAttempts - Maximum number of ports to try (default: 100)
+   * @returns Promise resolving to an available port number
+   * @throws LifecycleError if no available port is found within the range
+   *
+   * @remarks
+   * Searches sequentially from startPort up to startPort + maxAttempts.
+   * This is used during VM creation and start to find a free display port
+   * when the preferred port is already in use by another VM or process.
+   */
+  private async findAvailableDisplayPort (startPort: number = SPICE_MIN_PORT, maxAttempts: number = 100): Promise<number> {
+    const endPort = Math.min(startPort + maxAttempts, SPICE_MAX_PORT)
+
+    for (let port = startPort; port <= endPort; port++) {
+      if (await this.isPortAvailable(port)) {
+        if (port !== startPort) {
+          this.debug.log('info', `Display port ${startPort} was in use, allocated port ${port} instead`)
+        }
+        return port
+      }
+    }
+
+    throw new LifecycleError(
+      LifecycleErrorCode.RESOURCE_UNAVAILABLE,
+      `No available display ports in range ${startPort}-${endPort}. All ports are in use.`,
+      undefined,
+      { startPort, endPort, attemptsChecked: maxAttempts }
+    )
+  }
+
   /** Maximum supported network queues */
   private static readonly MAX_NETWORK_QUEUES = 4
 
@@ -1725,6 +1851,7 @@ export class VMLifecycle {
       memoryBalloon?: boolean | null
       uefiFirmware?: string | null
       hugepages?: boolean | null
+      displayPort?: number | null
       tpmSocketPath?: string | null
       guestAgentSocketPath?: string | null
       infiniServiceSocketPath?: string | null
@@ -1810,18 +1937,23 @@ export class VMLifecycle {
     // If hugepages not enabled or validation failed, QEMU uses standard memory allocation
 
     // Display
+    // Disable SPICE agent (vdagent) if Guest Agent is configured, as Guest Agent provides
+    // superior functionality and both share the virtio-serial controller
+    const hasGuestAgent = !!(config.guestAgentSocketPath ?? qemuConfig?.guestAgentSocketPath)
+    // Use validated display port from qemuConfig if available, otherwise validate from config
+    const effectiveDisplayPort = this.validateDisplayPort(qemuConfig?.displayPort ?? config.displayPort)
     if (config.displayType === 'spice') {
       const spiceConfig = new SpiceConfig({
-        port: config.displayPort,
+        port: effectiveDisplayPort,
         addr: config.displayAddr ?? '0.0.0.0',
         password: config.displayPassword,
         disableTicketing: !config.displayPassword,
-        enableAgent: true
+        enableAgent: !hasGuestAgent
       })
       builder.addSpice(spiceConfig)
     } else {
       const vncConfig = new VncConfig({
-        display: config.displayPort,
+        display: effectiveDisplayPort,
         addr: config.displayAddr ?? '0.0.0.0',
         password: !!config.displayPassword
       })
@@ -2000,61 +2132,140 @@ export class VMLifecycle {
   }
 
   /**
-   * Cleans up resources on failure
+   * Cleans up resources on failure.
+   *
+   * The cleanup sequence is carefully ordered to handle "Device or resource busy" errors:
+   *
+   * 1. Disconnect QMP client (stops VM control communication)
+   * 2. Force kill QEMU process (releases VM resources)
+   * 3. Wait 500ms for QEMU to fully release network/device resources
+   * 4. Bring down TAP device (deactivates network interface)
+   * 5. Wait 200ms for kernel to process interface state change
+   * 6. Remove firewall chain (must happen BEFORE TAP deletion to avoid busy errors)
+   * 7. Wait 200ms for nftables to release TAP device references
+   * 8. Destroy TAP device (can now be deleted safely)
+   * 9. Clear DB configuration and update status
+   * 10. Remove socket files and temporary files
+   *
+   * Key insight: nftables chains reference TAP devices by name (iifname/oifname).
+   * If we try to delete the TAP device while nftables still has active rules
+   * referencing it, the kernel returns "Device or resource busy".
    */
   private async cleanup (resources: CleanupResources): Promise<void> {
     this.debug.log('Cleaning up resources after failure')
 
-    // Disconnect QMP client
+    // Step 1: Disconnect QMP client
     if (resources.qmpClient) {
       try {
+        this.debug.log('Disconnecting QMP client')
         await (resources.qmpClient as QMPClient).disconnect()
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log('QMP client disconnected')
+      } catch (error) {
+        this.debug.log('warn', `Failed to disconnect QMP client: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
-    // Force kill QEMU process
+    // Step 2: Force kill QEMU process
     if (resources.qemuProcess) {
       try {
+        this.debug.log('Force killing QEMU process')
         await (resources.qemuProcess as QemuProcess).forceKill()
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log('QEMU process killed')
+      } catch (error) {
+        this.debug.log('warn', `Failed to kill QEMU process: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
-    // Destroy TAP device
+    // Step 3: Wait for QEMU to fully release resources
+    // QEMU may still be cleaning up network devices, virtio queues, etc.
+    this.debug.log('Waiting 500ms for QEMU resource release')
+    await sleep(500)
+
+    // Step 4: Bring down TAP device (if exists)
+    // This deactivates the interface before we try to remove firewall rules
     if (resources.tapDevice) {
       try {
-        await this.tapManager.destroy(resources.tapDevice)
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log(`Bringing down TAP device: ${resources.tapDevice}`)
+        await this.tapManager.bringDown(resources.tapDevice)
+        this.debug.log(`TAP device ${resources.tapDevice} is down`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to bring down TAP device: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
-    // Remove firewall chain
+    // Step 5: Wait for kernel to process interface state change
+    this.debug.log('Waiting 200ms for interface state change')
+    await sleep(200)
+
+    // Step 6: Remove firewall chain BEFORE destroying TAP device
+    // This is critical: nftables rules reference the TAP device name.
+    // If we delete the TAP first, nftables may have stale references that
+    // cause "Device or resource busy" errors on the chain deletion.
+    // By removing the chain first, we ensure no firewall rules reference the TAP.
     if (resources.vmId) {
       try {
+        this.debug.log(`Removing firewall chain for VM: ${resources.vmId}`)
         await this.nftables.removeVMChain(resources.vmId)
-      } catch {
-        // Ignore cleanup errors
-      }
-
-      // Clear DB configuration
-      try {
-        await this.prisma.clearMachineConfiguration(resources.vmId)
-        await this.prisma.updateMachineStatus(resources.vmId, 'error')
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log(`Firewall chain removed for VM: ${resources.vmId}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove firewall chain: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
-    // Remove socket file
+    // Step 7: Wait for nftables to release TAP device references
+    this.debug.log('Waiting 200ms for nftables resource release')
+    await sleep(200)
+
+    // Step 8: Destroy TAP device (now safe to delete)
+    if (resources.tapDevice) {
+      try {
+        this.debug.log(`Destroying TAP device: ${resources.tapDevice}`)
+        await this.tapManager.destroy(resources.tapDevice)
+        this.debug.log(`TAP device ${resources.tapDevice} destroyed`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to destroy TAP device: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // Step 9: Clear DB configuration
+    if (resources.vmId) {
+      try {
+        this.debug.log(`Clearing DB configuration for VM: ${resources.vmId}`)
+        await this.prisma.clearMachineConfiguration(resources.vmId)
+        await this.prisma.updateMachineStatus(resources.vmId, 'error')
+        this.debug.log(`DB configuration cleared for VM: ${resources.vmId}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to clear DB configuration: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // Step 10: Remove socket files
     if (resources.qmpSocketPath && fs.existsSync(resources.qmpSocketPath)) {
       try {
         fs.unlinkSync(resources.qmpSocketPath)
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log(`Removed QMP socket: ${resources.qmpSocketPath}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove QMP socket: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // Remove guest agent socket
+    if (resources.guestAgentSocketPath && fs.existsSync(resources.guestAgentSocketPath)) {
+      try {
+        fs.unlinkSync(resources.guestAgentSocketPath)
+        this.debug.log(`Removed guest agent socket: ${resources.guestAgentSocketPath}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove guest agent socket: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // Remove infini service socket
+    if (resources.infiniServiceSocketPath && fs.existsSync(resources.infiniServiceSocketPath)) {
+      try {
+        fs.unlinkSync(resources.infiniServiceSocketPath)
+        this.debug.log(`Removed infini service socket: ${resources.infiniServiceSocketPath}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove infini service socket: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
@@ -2062,8 +2273,9 @@ export class VMLifecycle {
     if (resources.pidFilePath && fs.existsSync(resources.pidFilePath)) {
       try {
         fs.unlinkSync(resources.pidFilePath)
-      } catch {
-        // Ignore cleanup errors
+        this.debug.log(`Removed PID file: ${resources.pidFilePath}`)
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove PID file: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
@@ -2072,8 +2284,8 @@ export class VMLifecycle {
       try {
         fs.unlinkSync(resources.installationIsoPath)
         this.debug.log(`Cleaned up installation ISO: ${resources.installationIsoPath}`)
-      } catch {
-        // Ignore cleanup errors
+      } catch (error) {
+        this.debug.log('warn', `Failed to remove installation ISO: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 

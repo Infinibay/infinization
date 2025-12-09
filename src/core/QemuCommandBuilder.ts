@@ -219,6 +219,13 @@ export class QemuCommandBuilder {
     if (options instanceof SpiceConfig) {
       const { args } = options.generateArgs()
       this.args.push(...args)
+
+      // Add SPICE agent devices if enabled, using shared virtio-serial controller
+      if (options.isAgentEnabled()) {
+        this.ensureVirtioSerial()
+        this.args.push('-device', 'virtserialport,chardev=spicechannel0,name=com.redhat.spice.0')
+        this.args.push('-chardev', 'spicevmc,id=spicechannel0,name=vdagent')
+      }
       return this
     }
 
@@ -232,10 +239,10 @@ export class QemuCommandBuilder {
     this.args.push('-spice', spiceArg)
     this.args.push('-vga', 'qxl')
 
-    // Add virtio-serial for guest agent (enabled by default)
+    // Add virtio-serial for guest agent (enabled by default), using shared controller
     const enableAgent = options.enableAgent ?? true
     if (enableAgent) {
-      this.args.push('-device', 'virtio-serial-pci')
+      this.ensureVirtioSerial()
       this.args.push('-device', 'virtserialport,chardev=spicechannel0,name=com.redhat.spice.0')
       this.args.push('-chardev', 'spicevmc,id=spicechannel0,name=vdagent')
     }
