@@ -626,6 +626,18 @@ export class VMLifecycle {
       const qmpSocketPath = path.join(this.qmpSocketDir, `${vmConfig.internalName}.sock`)
       const pidFilePath = path.join(this.pidfileDir, `${vmConfig.internalName}.pid`)
 
+      // 5a. Clean up orphan QMP socket if exists (from crashed QEMU or unclean shutdown)
+      // This prevents QEMU from failing to start or connection issues
+      if (fs.existsSync(qmpSocketPath)) {
+        this.debug.log('warn', `Found existing QMP socket: ${qmpSocketPath}, removing orphan socket`)
+        try {
+          fs.unlinkSync(qmpSocketPath)
+          this.debug.log('info', `Removed orphan QMP socket: ${qmpSocketPath}`)
+        } catch (unlinkError) {
+          this.debug.log('error', `Failed to remove orphan QMP socket: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
+        }
+      }
+
       resources.diskPaths = diskPaths
       resources.qmpSocketPath = qmpSocketPath
       resources.pidFilePath = pidFilePath
@@ -878,6 +890,13 @@ export class VMLifecycle {
       const pid = vmConfig.configuration?.qemuPid
       const tapDevice = vmConfig.configuration?.tapDeviceName
 
+      // Log diagnostic info for debugging graceful shutdown issues
+      this.debug.log('info', `Stop attempt - graceful: ${stopConfig.graceful}, qmpSocketPath: ${qmpSocketPath ?? 'NULL'}, pid: ${pid ?? 'NULL'}`)
+
+      if (stopConfig.graceful && !qmpSocketPath) {
+        this.debug.log('warn', `VM ${vmId}: No QMP socket path in DB - graceful shutdown will not be attempted`)
+      }
+
       // Check if already stopped
       if (vmConfig.status === 'off') {
         if (!pid || !this.isProcessAlive(pid)) {
@@ -893,34 +912,88 @@ export class VMLifecycle {
 
       // Try graceful shutdown via QMP
       if (stopConfig.graceful && qmpSocketPath && pid) {
-        try {
-          const qmpClient = new QMPClient(qmpSocketPath, {
-            connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
-          })
+        // Verify socket exists before attempting connection
+        const socketExists = fs.existsSync(qmpSocketPath)
+        this.debug.log('info', `QMP socket ${qmpSocketPath} exists: ${socketExists}`)
 
-          try {
-            await qmpClient.connect()
-            await qmpClient.powerdown()
-            this.debug.log(`Sent powerdown command to VM: ${vmId}`)
-
-            // Wait for process to exit
-            const exited = await this.waitForProcessExit(pid, stopConfig.timeout)
-
-            if (!exited && stopConfig.force) {
-              this.debug.log(`Graceful shutdown timed out, force killing VM: ${vmId}`)
-              await this.forceKillProcess(pid)
-              forced = true
-            }
-          } finally {
-            await qmpClient.disconnect()
-          }
-        } catch (qmpError) {
-          // QMP failed, try force kill if enabled
-          this.debug.log('warn', `QMP connection failed: ${qmpError instanceof Error ? qmpError.message : String(qmpError)}`)
-          if (stopConfig.force && pid && this.isProcessAlive(pid)) {
-            this.debug.log(`Force killing VM: ${vmId}`)
+        if (!socketExists) {
+          this.debug.log('warn', `QMP socket ${qmpSocketPath} does not exist - cannot send ACPI powerdown`)
+          // Fall through to force kill if enabled
+          if (stopConfig.force && this.isProcessAlive(pid)) {
+            this.debug.log('warn', `Falling back to force kill for VM ${vmId} (socket missing)`)
             await this.forceKillProcess(pid)
             forced = true
+          } else {
+            throw new LifecycleError(
+              LifecycleErrorCode.STOP_FAILED,
+              `QMP socket ${qmpSocketPath} does not exist and force is disabled`,
+              vmId
+            )
+          }
+        } else {
+          // Socket exists, attempt graceful shutdown
+          // Try to use existing QMP connection from EventHandler first (QEMU only accepts one connection)
+          const existingQmpClient = this.eventHandler.getQMPClient(vmId)
+
+          if (existingQmpClient) {
+            // Use existing connection
+            this.debug.log('info', `Using existing QMP connection for VM ${vmId}`)
+            try {
+              await existingQmpClient.powerdown()
+              this.debug.log('info', `Sent system_powerdown (ACPI) to VM ${vmId} via existing connection`)
+
+              // Wait for process to exit
+              const exited = await this.waitForProcessExit(pid, stopConfig.timeout)
+
+              if (!exited && stopConfig.force) {
+                this.debug.log(`Graceful shutdown timed out, force killing VM: ${vmId}`)
+                await this.forceKillProcess(pid)
+                forced = true
+              }
+            } catch (qmpError) {
+              const errorMsg = qmpError instanceof Error ? qmpError.message : String(qmpError)
+              this.debug.log('error', `QMP powerdown failed for VM ${vmId}: ${errorMsg}`)
+              if (stopConfig.force && pid && this.isProcessAlive(pid)) {
+                this.debug.log('warn', `Falling back to force kill for VM ${vmId}`)
+                await this.forceKillProcess(pid)
+                forced = true
+              }
+            }
+          } else {
+            // No existing connection, create a new one
+            this.debug.log('info', `No existing QMP connection for VM ${vmId}, creating new connection`)
+            try {
+              const qmpClient = new QMPClient(qmpSocketPath, {
+                connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
+              })
+
+              try {
+                await qmpClient.connect()
+                this.debug.log('info', `QMP connected to ${qmpSocketPath}, sending system_powerdown (ACPI)`)
+                await qmpClient.powerdown()
+                this.debug.log(`Sent powerdown command to VM: ${vmId}`)
+
+                // Wait for process to exit
+                const exited = await this.waitForProcessExit(pid, stopConfig.timeout)
+
+                if (!exited && stopConfig.force) {
+                  this.debug.log(`Graceful shutdown timed out, force killing VM: ${vmId}`)
+                  await this.forceKillProcess(pid)
+                  forced = true
+                }
+              } finally {
+                await qmpClient.disconnect()
+              }
+            } catch (qmpError) {
+              // QMP failed, try force kill if enabled
+              const errorMsg = qmpError instanceof Error ? qmpError.message : String(qmpError)
+              this.debug.log('error', `QMP powerdown failed for VM ${vmId}: ${errorMsg}`)
+              if (stopConfig.force && pid && this.isProcessAlive(pid)) {
+                this.debug.log('warn', `Falling back to force kill for VM ${vmId}`)
+                await this.forceKillProcess(pid)
+                forced = true
+              }
+            }
           }
         }
       } else if (pid && this.isProcessAlive(pid)) {

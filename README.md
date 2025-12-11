@@ -6,6 +6,10 @@ Custom virtualization solution for managing QEMU VMs, replacing libvirt dependen
 
 Infinivirt provides TypeScript classes for building QEMU commands and managing VM process lifecycle. It offers a type-safe, fluent API that integrates with the Infinibay backend.
 
+## IMPORTANT NOTE
+
+This project is not mean to be used outside Infinibay proyect. It's too tied to many internals of the project. It requires several abstraction layers to decouple it.
+
 ## Features
 
 - **Fluent API for QEMU command building**: Type-safe builder pattern for constructing QEMU command arrays
