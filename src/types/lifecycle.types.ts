@@ -234,6 +234,45 @@ export interface VMCreateConfig {
    */
   cpuPinning?: number[]
 
+  /**
+   * Enable NUMA-aware CPU pinning using numactl as a process wrapper.
+   *
+   * When enabled, the QEMU process will be started with `numactl` to:
+   * - Pin CPU threads to specific physical cores (--physcpubind)
+   * - Bind memory allocation to specific NUMA nodes (--membind)
+   *
+   * This provides better performance than cgroups-only pinning because memory
+   * is allocated on the correct NUMA node from the start, reducing migration
+   * overhead and improving cache locality.
+   *
+   * **Host Requirements:**
+   * - numactl package installed (`apt install numactl`)
+   * - Multi-core system (pinning on single-core has no benefit)
+   *
+   * **Interaction with cpuPinning:**
+   * - If both `enableNumaCtlPinning` and `cpuPinning` are set, numactl pinning
+   *   is applied at process launch, and cgroups pinning is applied after launch.
+   * - For most use cases, use one or the other, not both.
+   *
+   * @default false
+   */
+  enableNumaCtlPinning?: boolean
+
+  /**
+   * Strategy for automatic CPU pinning when `enableNumaCtlPinning` is true.
+   *
+   * - **basic**: Sequential pinning across NUMA nodes with optimal distribution.
+   *   Keeps vCPUs within the same NUMA node when possible to maximize memory locality.
+   *   Best for most workloads.
+   *
+   * - **hybrid**: Randomized distribution across NUMA nodes.
+   *   Provides better load balancing for mixed workloads that benefit from
+   *   spreading across different NUMA nodes.
+   *
+   * @default 'basic'
+   */
+  cpuPinningStrategy?: 'basic' | 'hybrid'
+
   // ===========================================================================
   // Advanced Device Configuration
   // ===========================================================================

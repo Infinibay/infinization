@@ -28,6 +28,7 @@ import {
   NftablesErrorCode,
   NftablesRuleTokens
 } from '../types/firewall.types'
+import { Debugger } from '@utils/debug'
 
 /** Type for rule direction from Prisma schema - only concrete directions, not INOUT */
 type RuleDirection = 'IN' | 'OUT'
@@ -39,6 +40,8 @@ type RuleAction = 'ACCEPT' | 'DROP' | 'REJECT'
 type SupportedProtocol = typeof SUPPORTED_PROTOCOLS[number]
 
 export class FirewallRuleTranslator {
+  /** Static logger for translator warnings and diagnostics */
+  private static debug = new Debugger('firewall-translator')
   /**
    * Translates a Prisma FirewallRule to nftables rule tokens.
    *
@@ -91,9 +94,11 @@ export class FirewallRuleTranslator {
     tokens.push(this.translateAction(rule.action as RuleAction))
 
     // Add comment if rule has a name
+    // nftables requires comments to be quoted strings when they contain special chars
     if (rule.name) {
-      const safeComment = rule.name.substring(0, 64)
-      tokens.push('comment', safeComment)
+      // Sanitize comment: remove/escape problematic characters and limit length
+      const safeComment = this.sanitizeComment(rule.name)
+      tokens.push('comment', `"${safeComment}"`)
     }
 
     return tokens
@@ -394,8 +399,9 @@ export class FirewallRuleTranslator {
     validatePort(rule.dstPortEnd, 'Destination end')
 
     // Validate ports are only used with tcp/udp
-    const hasPorts = rule.srcPortStart !== undefined || rule.srcPortEnd !== undefined ||
-                     rule.dstPortStart !== undefined || rule.dstPortEnd !== undefined
+    // Use != null (loose equality) to check for both null and undefined
+    const hasPorts = rule.srcPortStart != null || rule.srcPortEnd != null ||
+                     rule.dstPortStart != null || rule.dstPortEnd != null
     if (hasPorts && normalizedProtocol !== 'tcp' && normalizedProtocol !== 'udp') {
       throw this.createError(
         NftablesErrorCode.RULE_INVALID,
@@ -450,6 +456,21 @@ export class FirewallRuleTranslator {
             rule.id
           )
         }
+      }
+    }
+
+    // Warn if IN rule doesn't specify connectionState (may block NEW connections)
+    if (rule.direction === 'IN' && rule.action === 'ACCEPT') {
+      if (!rule.connectionState ||
+          (typeof rule.connectionState === 'object' && !rule.connectionState.new)) {
+        // Log warning but don't throw - this is a soft validation
+        this.debug.log(
+          'warn',
+          `Rule "${rule.name}" (${rule.id}): IN rule with ACCEPT action should specify ` +
+          `connectionState with new=true to accept NEW incoming connections. Without it, ` +
+          `only ESTABLISHED connections will be accepted. ` +
+          `Add: connectionState: { new: true, established: true, related: true }`
+        )
       }
     }
   }
@@ -595,6 +616,30 @@ export class FirewallRuleTranslator {
       num >>= 1
     }
     return count
+  }
+
+  /**
+   * Sanitizes a comment string for use in nftables rules.
+   * Removes or escapes characters that could cause parsing issues.
+   *
+   * @param comment - The raw comment string
+   * @returns Sanitized comment safe for nftables
+   */
+  private static sanitizeComment (comment: string): string {
+    // Limit length to 64 chars (nftables has a limit)
+    let sanitized = comment.substring(0, 64)
+
+    // Remove or replace problematic characters:
+    // - Double quotes (would break the quoting)
+    // - Backslashes (escape character)
+    // - Newlines/tabs
+    sanitized = sanitized
+      .replace(/"/g, "'")       // Replace double quotes with single quotes
+      .replace(/\\/g, '/')      // Replace backslashes with forward slashes
+      .replace(/[\n\r\t]/g, ' ') // Replace newlines/tabs with spaces
+      .trim()
+
+    return sanitized
   }
 
   /**

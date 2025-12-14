@@ -12,6 +12,7 @@ import {
 } from '../types/qemu.types'
 import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
+import { CpuPinningAdapter, PinningStrategy, CpuPinningResult } from '../cpu/CpuPinningAdapter'
 
 /**
  * Result of buildCommand() containing the binary and arguments separately
@@ -19,6 +20,22 @@ import { VncConfig } from '../display/VncConfig'
 export interface QemuCommand {
   command: string
   args: string[]
+}
+
+/**
+ * Extended result of buildCommand() with CPU pinning wrapper support
+ */
+export interface QemuCommandWithPinning extends QemuCommand {
+  /** Wrapper command (e.g., 'numactl') or null if no wrapper */
+  wrapperCommand: string | null
+  /** Arguments for the wrapper command */
+  wrapperArgs: string[]
+  /** Whether CPU pinning was applied */
+  pinningApplied: boolean
+  /** CPU cores used for pinning */
+  pinnedCores: number[]
+  /** NUMA nodes used for memory binding */
+  numaNodes: number[]
 }
 
 /**
@@ -32,6 +49,12 @@ export class QemuCommandBuilder {
   private args: string[] = []
   private daemonizeEnabled: boolean = false
   private pidfilePath: string | null = null
+
+  // CPU pinning configuration
+  private cpuPinningEnabled: boolean = false
+  private cpuPinningStrategy: PinningStrategy = 'none'
+  private cpuPinningVcpuCount: number = 0
+  private cpuPinningAdapter: CpuPinningAdapter | null = null
 
   /**
    * Set the QEMU binary to use
@@ -185,9 +208,10 @@ export class QemuCommandBuilder {
   }
 
   /**
-   * Add SPICE display
+   * Add SPICE display with optional QXL memory configuration.
    *
    * @param options - SPICE configuration options or SpiceConfig instance
+   * @param qxlMemoryMB - QXL video memory in MB (default: 16, use 64+ for 4K)
    *
    * @remarks
    * When using the legacy `SpiceOptions` object, the guest agent (virtio-serial for
@@ -195,6 +219,12 @@ export class QemuCommandBuilder {
    *
    * When using `SpiceConfig`, the guest agent behavior is controlled by the
    * `enableAgent` option passed to the SpiceConfig constructor (also defaults to true).
+   *
+   * **QXL Memory Sizing:**
+   * - 16 MB: Default, suitable for 1920x1080 and below
+   * - 32 MB: Recommended for 2560x1440
+   * - 64 MB: Recommended for 4K (3840x2160) and above
+   * - 128 MB: For multiple 4K displays or very high resolutions
    *
    * @example
    * ```typescript
@@ -206,6 +236,12 @@ export class QemuCommandBuilder {
    * })
    * builder.addSpice(spiceConfig)
    *
+   * // Standard resolution
+   * builder.addSpice(spiceConfig)
+   *
+   * // 4K resolution support
+   * builder.addSpice(spiceConfig, 64)
+   *
    * // Using legacy options
    * builder.addSpice({
    *   port: 5901,
@@ -214,11 +250,24 @@ export class QemuCommandBuilder {
    * })
    * ```
    */
-  addSpice (options: SpiceOptions | SpiceConfig): this {
+  addSpice (options: SpiceOptions | SpiceConfig, qxlMemoryMB: number = 16): this {
     // Check if options is a SpiceConfig instance
     if (options instanceof SpiceConfig) {
       const { args } = options.generateArgs()
       this.args.push(...args)
+
+      // Override -vga qxl with memory configuration if non-default
+      if (qxlMemoryMB !== 16) {
+        // Remove the -vga qxl that was added by generateArgs()
+        const vgaIndex = this.args.lastIndexOf('-vga')
+        if (vgaIndex !== -1) {
+          this.args.splice(vgaIndex, 2) // Remove -vga and qxl
+        }
+        // Explicitly disable QEMU's default VGA to prevent dual VGA devices
+        this.args.push('-vga', 'none')
+        // Add QXL device with custom memory
+        this.args.push('-device', `qxl-vga,vgamem_mb=${qxlMemoryMB}`)
+      }
 
       // Add SPICE agent devices if enabled, using shared virtio-serial controller
       if (options.isAgentEnabled()) {
@@ -237,7 +286,13 @@ export class QemuCommandBuilder {
       spiceArg += ',disable-ticketing=on'
     }
     this.args.push('-spice', spiceArg)
-    this.args.push('-vga', 'qxl')
+
+    // Handle QXL memory for legacy options
+    if (qxlMemoryMB !== 16) {
+      this.args.push('-device', `qxl-vga,vgamem_mb=${qxlMemoryMB}`)
+    } else {
+      this.args.push('-vga', 'qxl')
+    }
 
     // Add virtio-serial for guest agent (enabled by default), using shared controller
     const enableAgent = options.enableAgent ?? true
@@ -714,7 +769,7 @@ export class QemuCommandBuilder {
    */
   addInfiniServiceChannel (socketPath: string): this {
     return this.addVirtioChannel(
-      'com.infinibay.infiniservice.0',
+      'org.infinibay.agent',
       socketPath,
       'chinfini0'
     )
@@ -846,6 +901,61 @@ export class QemuCommandBuilder {
     return this
   }
 
+  // ===========================================================================
+  // CPU Pinning Support
+  // ===========================================================================
+
+  /**
+   * Enable CPU pinning with the specified strategy.
+   *
+   * When enabled, buildCommandWithPinning() will wrap the QEMU command with
+   * `numactl` to pin vCPUs to specific physical cores and bind memory to
+   * appropriate NUMA nodes.
+   *
+   * @param strategy - Pinning strategy: 'basic' (sequential) or 'hybrid' (randomized)
+   * @param vcpuCount - Number of virtual CPUs for the VM
+   * @returns this for method chaining
+   *
+   * @example
+   * ```typescript
+   * const builder = new QemuCommandBuilder()
+   *   .enableKvm()
+   *   .setMachine('q35')
+   *   .setCpu('host', 4)
+   *   .enableCpuPinning('basic', 4)
+   *   .addDisk(...)
+   *
+   * const { wrapperCommand, wrapperArgs, command, args } = await builder.buildCommandWithPinning()
+   * // wrapperCommand: 'numactl'
+   * // wrapperArgs: ['--physcpubind=0,1,2,3', '--membind=0']
+   * // command: 'qemu-system-x86_64'
+   * // args: [...QEMU args...]
+   * ```
+   */
+  enableCpuPinning (strategy: PinningStrategy, vcpuCount: number): this {
+    if (strategy !== 'none' && vcpuCount > 0) {
+      this.cpuPinningEnabled = true
+      this.cpuPinningStrategy = strategy
+      this.cpuPinningVcpuCount = vcpuCount
+      this.cpuPinningAdapter = new CpuPinningAdapter()
+    }
+    return this
+  }
+
+  /**
+   * Check if CPU pinning is enabled
+   */
+  isCpuPinningEnabled (): boolean {
+    return this.cpuPinningEnabled
+  }
+
+  /**
+   * Get the configured CPU pinning strategy
+   */
+  getCpuPinningStrategy (): PinningStrategy {
+    return this.cpuPinningStrategy
+  }
+
   /**
    * Build and return the command and arguments separately
    * @returns Object with command (binary) and args array
@@ -854,6 +964,60 @@ export class QemuCommandBuilder {
     return {
       command: this.binary,
       args: [...this.args]
+    }
+  }
+
+  /**
+   * Build and return the command with CPU pinning wrapper (if enabled).
+   *
+   * This is the preferred method when CPU pinning is configured. It returns
+   * both the QEMU command and the numactl wrapper configuration.
+   *
+   * @returns Promise resolving to QemuCommandWithPinning
+   *
+   * @example
+   * ```typescript
+   * const result = await builder.buildCommandWithPinning()
+   * if (result.wrapperCommand) {
+   *   // Execute: numactl --physcpubind=0,1,2,3 --membind=0 qemu-system-x86_64 [args...]
+   *   spawn(result.wrapperCommand, [...result.wrapperArgs, result.command, ...result.args])
+   * } else {
+   *   // Execute: qemu-system-x86_64 [args...]
+   *   spawn(result.command, result.args)
+   * }
+   * ```
+   */
+  async buildCommandWithPinning (): Promise<QemuCommandWithPinning> {
+    const baseCommand = this.buildCommand()
+
+    // If CPU pinning is not enabled, return without wrapper
+    if (!this.cpuPinningEnabled || !this.cpuPinningAdapter) {
+      return {
+        ...baseCommand,
+        wrapperCommand: null,
+        wrapperArgs: [],
+        pinningApplied: false,
+        pinnedCores: [],
+        numaNodes: []
+      }
+    }
+
+    // Generate CPU pinning command wrapper
+    const pinningResult = await this.cpuPinningAdapter.generatePinningCommand(
+      this.cpuPinningVcpuCount,
+      this.cpuPinningStrategy,
+      baseCommand.command,
+      baseCommand.args
+    )
+
+    return {
+      command: baseCommand.command,
+      args: baseCommand.args,
+      wrapperCommand: pinningResult.wrapperCommand,
+      wrapperArgs: pinningResult.wrapperArgs,
+      pinningApplied: pinningResult.pinningApplied,
+      pinnedCores: pinningResult.pinnedCores,
+      numaNodes: pinningResult.numaNodes
     }
   }
 

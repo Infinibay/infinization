@@ -1,9 +1,17 @@
 // Core classes
-export { QemuCommandBuilder, QemuCommand } from './core/QemuCommandBuilder'
+export { QemuCommandBuilder, QemuCommand, QemuCommandWithPinning } from './core/QemuCommandBuilder'
 export { QemuProcess } from './core/QemuProcess'
 export { QMPClient } from './core/QMPClient'
 export { VMLifecycle } from './core/VMLifecycle'
 export { Infinivirt } from './core/Infinivirt'
+
+// CPU classes
+export {
+  CpuPinningAdapter,
+  CpuPinningResult,
+  NumaTopology,
+  PinningStrategy
+} from './cpu/CpuPinningAdapter'
 
 // Network classes
 export { TapDeviceManager } from './network/TapDeviceManager'
@@ -11,6 +19,7 @@ export { BridgeManager } from './network/BridgeManager'
 export { MacAddressGenerator } from './network/MacAddressGenerator'
 export { NftablesService } from './network/NftablesService'
 export { FirewallRuleTranslator } from './network/FirewallRuleTranslator'
+export { DepartmentNatService } from './network/DepartmentNatService'
 
 // Storage classes
 export { QemuImgService } from './storage/QemuImgService'
@@ -117,7 +126,8 @@ export {
   SUPPORTED_PROTOCOLS,
   CONNECTION_STATES,
   MAX_CHAIN_NAME_LENGTH,
-  VM_CHAIN_PREFIX
+  VM_CHAIN_PREFIX,
+  generateVMChainName
 } from './types/firewall.types'
 
 // Types - Storage

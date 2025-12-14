@@ -325,7 +325,7 @@ export class PrismaAdapter implements DatabaseAdapter {
 
   /**
    * Clear machine configuration (qemuPid, tapDeviceName, qmpSocketPath).
-   * Used during crash cleanup.
+   * Used during crash cleanup or full VM deletion.
    *
    * @param machineId - Machine UUID
    */
@@ -347,6 +347,38 @@ export class PrismaAdapter implements DatabaseAdapter {
       this.debug.log('error', `clearMachineConfiguration failed: ${String(error)}`)
       throw new PrismaAdapterError(
         `Failed to clear machine configuration: ${String(error)}`,
+        PrismaAdapterErrorCode.UPDATE_FAILED,
+        machineId,
+        error
+      )
+    }
+  }
+
+  /**
+   * Clear only volatile machine configuration (qemuPid, qmpSocketPath).
+   * Preserves tapDeviceName for persistent TAP device reuse across stop/start cycles.
+   * Used during normal VM stop (not crash cleanup or deletion).
+   *
+   * @param machineId - Machine UUID
+   */
+  async clearVolatileMachineConfiguration (machineId: string): Promise<void> {
+    this.debug.log(`clearVolatileMachineConfiguration: ${machineId}`)
+
+    try {
+      await this.prisma.machineConfiguration.updateMany({
+        where: { machineId },
+        data: {
+          qemuPid: null,
+          qmpSocketPath: null
+          // Note: tapDeviceName is preserved for persistent TAP device reuse
+        }
+      })
+
+      this.debug.log('info', `Volatile configuration cleared (TAP preserved): ${machineId}`)
+    } catch (error) {
+      this.debug.log('error', `clearVolatileMachineConfiguration failed: ${String(error)}`)
+      throw new PrismaAdapterError(
+        `Failed to clear volatile machine configuration: ${String(error)}`,
         PrismaAdapterErrorCode.UPDATE_FAILED,
         machineId,
         error
@@ -833,8 +865,11 @@ export class PrismaAdapter implements DatabaseAdapter {
       uefiFirmware: config.uefiFirmware ?? null,
       // Hugepages configuration
       hugepages: config.hugepages ?? null,
-      // CPU pinning configuration
+      // CPU pinning configuration (cgroups-based)
       cpuPinning: this.parseCpuPinning(config.cpuPinning),
+      // NUMA-aware CPU pinning via numactl
+      enableNumaCtlPinning: ((config as unknown as Record<string, unknown>).enableNumaCtlPinning as boolean) ?? null,
+      cpuPinningStrategy: ((config as unknown as Record<string, unknown>).cpuPinningStrategy as string) ?? null,
       // Advanced device configuration (cast through unknown for forward compatibility)
       tpmSocketPath: ((config as unknown as Record<string, unknown>).tpmSocketPath as string) ?? null,
       guestAgentSocketPath: ((config as unknown as Record<string, unknown>).guestAgentSocketPath as string) ?? null,

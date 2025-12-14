@@ -110,6 +110,32 @@ export const MAX_CHAIN_NAME_LENGTH = 31
 /** Prefix for VM-specific chains */
 export const VM_CHAIN_PREFIX = 'vm_'
 
+/**
+ * Generates a chain name from a VM ID.
+ * This is the single source of truth for chain naming across the codebase.
+ * Format: vm_{first-8-chars-of-vmId-sanitized}
+ *
+ * @param vmId - The VM identifier (UUID or other ID format)
+ * @returns The nftables chain name for this VM
+ *
+ * @example
+ * generateVMChainName('abc-123-def-456') // Returns 'vm_abc123de'
+ * generateVMChainName('UPPER-case-ID') // Returns 'vm_uppercase'
+ */
+export function generateVMChainName (vmId: string): string {
+  // Remove non-alphanumeric characters and take first 8 chars
+  const sanitizedId = vmId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8).toLowerCase()
+
+  const chainName = `${VM_CHAIN_PREFIX}${sanitizedId}`
+
+  // Ensure name doesn't exceed max length
+  if (chainName.length > MAX_CHAIN_NAME_LENGTH) {
+    return chainName.substring(0, MAX_CHAIN_NAME_LENGTH)
+  }
+
+  return chainName
+}
+
 // ============================================================================
 // Interfaces
 // ============================================================================
@@ -256,6 +282,32 @@ export interface FirewallRuleInput {
   srcIpMask?: string | null
   dstIpAddr?: string | null
   dstIpMask?: string | null
+  /**
+   * Connection state configuration for stateful filtering.
+   *
+   * **IMPORTANT for IN (incoming) rules:**
+   * - To accept NEW incoming connections, you MUST specify `{ new: true, established: true, related: true }`
+   * - Without `new: true`, only established connections will be accepted
+   * - Example: SSH rule should use `{ new: true, established: true, related: true }`
+   *
+   * **For OUT (outgoing) rules:**
+   * - Usually not required, as outgoing connections are typically allowed by default
+   * - Can be used for stricter control if needed
+   *
+   * **Default behavior (if omitted):**
+   * - A system-wide rule allows established/related traffic automatically
+   * - But NEW incoming connections will be blocked unless explicitly allowed
+   *
+   * @example
+   * // Allow incoming SSH connections (port 22)
+   * {
+   *   direction: 'IN',
+   *   protocol: 'tcp',
+   *   dstPortStart: 22,
+   *   connectionState: { new: true, established: true, related: true },
+   *   action: 'ACCEPT'
+   * }
+   */
   connectionState?: ConnectionStateConfig | null
   overridesDept?: boolean
 }

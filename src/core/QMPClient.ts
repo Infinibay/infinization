@@ -271,10 +271,65 @@ export class QMPClient extends EventEmitter {
   }
 
   /**
-   * Terminates the QEMU process immediately
+   * Terminates the QEMU process immediately by sending the QMP `quit` command.
+   *
+   * ## Error Handling Contract
+   *
+   * **IMPORTANT FOR CALLERS AND MAINTAINERS:**
+   * This method intentionally swallows common socket errors that occur during shutdown.
+   * Callers should NOT rely on catching these errors for flow control:
+   *
+   * - `EAGAIN`: Socket not ready (QEMU may already be shutting down)
+   * - `ECONNREFUSED`: Connection refused (QEMU may have already closed)
+   * - `ENOENT`: Socket file doesn't exist (QEMU may have removed it)
+   * - `EPIPE`: Broken pipe (connection lost during shutdown)
+   * - `ENOTCONN`: Socket not connected
+   *
+   * These errors are silently logged at debug level and the method returns normally.
+   * This design prevents callers from needing to handle shutdown race conditions.
+   *
+   * Only unexpected errors (e.g., protocol errors, permission issues) will be thrown,
+   * unless `ignoreErrors: true` is passed.
+   *
+   * ## Usage
+   *
+   * ```typescript
+   * // Normal usage - errors are handled internally
+   * await qmpClient.quit()
+   *
+   * // Suppress ALL errors (including unexpected ones)
+   * await qmpClient.quit({ ignoreErrors: true })
+   * ```
+   *
+   * @param options Optional configuration
+   * @param options.ignoreErrors If true, suppresses ALL errors (default: false)
    */
-  public async quit (): Promise<void> {
-    await this.execute('quit')
+  public async quit (options?: { ignoreErrors?: boolean }): Promise<void> {
+    try {
+      await this.execute('quit')
+    } catch (err) {
+      const errCode = (err as NodeJS.ErrnoException).code
+      const message = err instanceof Error ? err.message : 'Unknown error'
+
+      // MAINTAINER NOTE: These errors are intentionally swallowed because they commonly
+      // occur during normal shutdown sequences (QEMU closes the socket before we can
+      // send quit, or the quit command races with QEMU's own termination).
+      // Do NOT re-introduce error propagation for these codes without updating all callers.
+      const expectedShutdownErrors = ['EAGAIN', 'ECONNREFUSED', 'ENOENT', 'EPIPE', 'ENOTCONN']
+
+      if (expectedShutdownErrors.includes(errCode ?? '')) {
+        this.debug.log('debug', `Expected socket error during quit: ${errCode} - ${message}`)
+        return
+      }
+
+      // For unexpected errors, respect the ignoreErrors option
+      if (options?.ignoreErrors) {
+        this.debug.log('warn', `Ignoring quit error: ${message}`)
+        return
+      }
+
+      throw err
+    }
   }
 
   /**
@@ -597,6 +652,12 @@ export class QMPClient extends EventEmitter {
         return `Permission denied: Cannot access ${this.socketPath}`
       case 'ETIMEDOUT':
         return `Connection timed out: ${this.socketPath}`
+      case 'EAGAIN':
+        return `Socket not ready: QMP socket at ${this.socketPath} is temporarily unavailable (QEMU may be shutting down)`
+      case 'EPIPE':
+        return `Broken pipe: Connection to QMP socket at ${this.socketPath} was lost`
+      case 'ENOTCONN':
+        return `Not connected: Socket at ${this.socketPath} is not connected`
       default:
         return `Socket error: ${err.message}`
     }

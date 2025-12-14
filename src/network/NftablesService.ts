@@ -25,10 +25,12 @@
  * await nftables.removeVMChain('vm-abc123')
  */
 
+import { createHash } from 'crypto'
 import { CommandExecutor } from '@utils/commandExecutor'
 import { Debugger } from '@utils/debug'
 import { retryOnBusy, sleep } from '@utils/retry'
 import { FirewallRuleTranslator } from './FirewallRuleTranslator'
+import { NftablesPersistence } from './NftablesPersistence'
 import {
   FirewallRuleInput,
   FirewallApplyResult,
@@ -38,25 +40,37 @@ import {
   INFINIVIRT_TABLE_NAME,
   INFINIVIRT_TABLE_FAMILY,
   DEFAULT_CHAIN_PRIORITY,
-  VM_CHAIN_PREFIX,
-  MAX_CHAIN_NAME_LENGTH
+  generateVMChainName
 } from '../types/firewall.types'
 
 /** Delay after removing jump rules before flushing chain (ms) */
-const POST_JUMP_REMOVAL_DELAY_MS = 200
+const POST_JUMP_REMOVAL_DELAY_MS = 500
 /** Delay after flushing chain before deletion (ms) */
-const POST_FLUSH_DELAY_MS = 200
+const POST_FLUSH_DELAY_MS = 500
 
 /** Base chain name for forwarding VM traffic */
 const BASE_FORWARD_CHAIN = 'forward'
 
+export interface NftablesServiceConfig {
+  /** Whether to persist rules to disk after changes (default: true) */
+  enablePersistence?: boolean
+}
+
 export class NftablesService {
   private executor: CommandExecutor
   private debug: Debugger
+  /** Cache of rule hashes per VM to detect changes */
+  private ruleHashCache: Map<string, string> = new Map()
+  /** Persistence handler for disk export/import */
+  private persistence: NftablesPersistence
+  /** Whether to persist rules to disk after changes */
+  private enablePersistence: boolean
 
-  constructor () {
+  constructor (config: NftablesServiceConfig = {}) {
     this.executor = new CommandExecutor()
     this.debug = new Debugger('nftables')
+    this.persistence = new NftablesPersistence()
+    this.enablePersistence = config.enablePersistence ?? true
   }
 
   // ============================================================================
@@ -91,7 +105,7 @@ export class NftablesService {
    * @throws Error if chain creation fails
    */
   async createVMChain (vmId: string, tapDeviceName: string): Promise<string> {
-    const chainName = this.generateChainName(vmId)
+    const chainName = generateVMChainName(vmId)
     this.debug.log(`Creating VM chain: ${chainName} for VM: ${vmId} (TAP: ${tapDeviceName})`)
 
     try {
@@ -140,7 +154,7 @@ export class NftablesService {
     departmentRules: FirewallRuleInput[],
     vmRules: FirewallRuleInput[]
   ): Promise<FirewallApplyResult> {
-    const chainName = this.generateChainName(vmId)
+    const chainName = generateVMChainName(vmId)
     this.debug.log(`Applying firewall rules to chain ${chainName} for VM ${vmId}`)
 
     const result: FirewallApplyResult = {
@@ -164,9 +178,18 @@ export class NftablesService {
 
       // Merge rules (VM rules can override department rules)
       const mergedRules = this.mergeRules(departmentRules, vmRules)
+
+      // Inject default rule for established/related traffic
+      // This ensures connections initiated by the VM (or accepted via explicit rules) continue to work
+      mergedRules.push(this.getDefaultEstablishedRule())
+      this.debug.log('Injected default established/related rule (priority 9999)')
+
+      // Sort by priority after adding default rule
+      mergedRules.sort((a, b) => a.priority - b.priority)
+
       result.totalRules = mergedRules.length
 
-      this.debug.log(`Processing ${mergedRules.length} merged rules`)
+      this.debug.log(`Processing ${mergedRules.length} merged rules (including default established/related)`)
 
       // Apply each rule
       // Note: Rules are applied in priority order (ascending). Since nftables evaluates
@@ -207,6 +230,10 @@ export class NftablesService {
       }
 
       this.debug.log(`Applied ${result.appliedRules}/${result.totalRules} rules to chain ${chainName}`)
+
+      // Persist rules to disk after successful apply
+      await this.persistToDiskIfEnabled()
+
       return result
     } catch (error) {
       const message = `Failed to apply rules to chain ${chainName}: ${error instanceof Error ? error.message : String(error)}`
@@ -229,13 +256,29 @@ export class NftablesService {
    * @param vmId - The VM identifier
    */
   async removeVMChain (vmId: string): Promise<void> {
-    const chainName = this.generateChainName(vmId)
+    const chainName = generateVMChainName(vmId)
     this.debug.log(`Removing VM chain: ${chainName}`)
 
     try {
       // Step 1: Remove jump rules referencing this chain from the base forward chain
       // This stops new packets from being directed to the VM chain
       await this.removeJumpRules(chainName)
+
+      // Step 1b: Verify jump rules were actually removed
+      const verifyOutput = await this.exec([
+        '-a', 'list', 'chain',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        BASE_FORWARD_CHAIN
+      ])
+
+      const verifyRegex = new RegExp(`jump\\s+${chainName}`, 'g')
+      const remainingJumps = verifyOutput.match(verifyRegex)
+
+      if (remainingJumps && remainingJumps.length > 0) {
+        this.debug.log('warn', `Found ${remainingJumps.length} remaining jump rules for ${chainName} after removal attempt`)
+        // Try one more time to remove them
+        await this.removeJumpRules(chainName)
+      }
 
       // Step 2: Wait for kernel to process jump rule removal
       // This ensures no new packets are being processed by the chain
@@ -268,13 +311,19 @@ export class NftablesService {
           ])
         },
         {
-          maxRetries: 3,
-          initialDelayMs: 300,
+          maxRetries: 5,
+          initialDelayMs: 500,
           debugNamespace: 'nftables'
         }
       )
 
+      // Clear rules hash cache for this VM
+      this.ruleHashCache.delete(vmId)
+
       this.debug.log(`VM chain removed: ${chainName}`)
+
+      // Persist changes to disk after successful removal
+      await this.persistToDiskIfEnabled()
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
 
@@ -283,7 +332,49 @@ export class NftablesService {
           errorMessage.includes('does not exist') ||
           errorMessage.includes('No such chain')) {
         this.debug.log(`Chain ${chainName} does not exist, nothing to remove`)
+        // Still clear cache even if chain didn't exist
+        this.ruleHashCache.delete(vmId)
         return
+      }
+
+      // Last resort: try to manually flush and delete without retries
+      if (errorMessage.includes('Device or resource busy')) {
+        this.debug.log('warn', `Attempting manual cleanup for busy chain ${chainName}`)
+        try {
+          // List all rules in forward chain and manually delete any remaining jumps
+          const output = await this.exec([
+            '-a', 'list', 'chain',
+            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            BASE_FORWARD_CHAIN
+          ])
+
+          const handleRegex = new RegExp(`jump\\s+${chainName}.*#\\s*handle\\s+(\\d+)`, 'g')
+          let match
+          while ((match = handleRegex.exec(output)) !== null) {
+            const handle = match[1]
+            this.debug.log(`Manually removing orphaned jump rule handle ${handle}`)
+            await this.exec([
+              'delete', 'rule',
+              INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+              BASE_FORWARD_CHAIN,
+              'handle', handle
+            ])
+          }
+
+          // Wait and try delete again
+          await sleep(1000)
+          await this.exec([
+            'delete', 'chain',
+            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            chainName
+          ])
+
+          this.debug.log(`Manual cleanup succeeded for chain ${chainName}`)
+          this.ruleHashCache.delete(vmId)
+          return // Success
+        } catch (manualError) {
+          this.debug.log('error', `Manual cleanup also failed: ${manualError instanceof Error ? manualError.message : String(manualError)}`)
+        }
       }
 
       this.debug.log('error', `Failed to remove chain ${chainName}: ${errorMessage}`)
@@ -298,7 +389,7 @@ export class NftablesService {
    * @param vmId - The VM identifier
    */
   async flushVMRules (vmId: string): Promise<void> {
-    const chainName = this.generateChainName(vmId)
+    const chainName = generateVMChainName(vmId)
     this.debug.log(`Flushing rules from chain: ${chainName}`)
 
     try {
@@ -389,8 +480,183 @@ export class NftablesService {
   }
 
   // ============================================================================
+  // Persistent Firewall Methods
+  // These methods support persistent firewall rules that survive VM stop/start cycles.
+  // The chain and rules persist; only jump rules are attached/detached with TAP lifecycle.
+  // ============================================================================
+
+  /**
+   * Ensures a VM chain exists without adding jump rules.
+   * This is idempotent - safe to call multiple times.
+   * Used for persistent firewall where chain outlives TAP device.
+   *
+   * @param vmId - The VM identifier
+   * @returns The chain name
+   */
+  async ensureVMChain (vmId: string): Promise<string> {
+    const chainName = generateVMChainName(vmId)
+    this.debug.log(`Ensuring VM chain exists: ${chainName} for VM: ${vmId}`)
+
+    try {
+      const exists = await this.chainExists(chainName)
+      if (exists) {
+        this.debug.log(`Chain ${chainName} already exists`)
+        return chainName
+      }
+
+      // Create the VM chain (regular chain, no hook)
+      await this.exec([
+        'add', 'chain',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        chainName
+      ])
+      this.debug.log(`VM chain created: ${chainName}`)
+      return chainName
+    } catch (error) {
+      const message = `Failed to ensure VM chain ${chainName}: ${error instanceof Error ? error.message : String(error)}`
+      this.debug.log('error', message)
+      throw this.wrapError(error, NftablesErrorCode.COMMAND_FAILED, {
+        command: 'add chain',
+        args: [chainName]
+      })
+    }
+  }
+
+  /**
+   * Attaches jump rules for a TAP device to route traffic to VM chain.
+   * Called when VM starts to connect the active TAP device to persistent rules.
+   *
+   * @param vmId - The VM identifier
+   * @param tapDeviceName - The TAP device name to route traffic from/to
+   */
+  async attachJumpRules (vmId: string, tapDeviceName: string): Promise<void> {
+    const chainName = generateVMChainName(vmId)
+    this.debug.log(`Attaching jump rules for VM ${vmId} (chain: ${chainName}, TAP: ${tapDeviceName})`)
+
+    try {
+      await this.addJumpRules(chainName, tapDeviceName)
+      this.debug.log(`Jump rules attached for VM ${vmId}`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // If rules already exist, that's fine
+      if (!errorMessage.includes('File exists')) {
+        throw this.wrapError(error, NftablesErrorCode.COMMAND_FAILED, {
+          command: 'attach jump rules',
+          args: [vmId, tapDeviceName]
+        })
+      }
+      this.debug.log(`Jump rules already exist for VM ${vmId}`)
+    }
+  }
+
+  /**
+   * Detaches jump rules when VM stops.
+   * The chain and firewall rules persist - only the routing from TAP is removed.
+   * This allows rules to survive stop/start cycles.
+   *
+   * @param vmId - The VM identifier
+   */
+  async detachJumpRules (vmId: string): Promise<void> {
+    const chainName = generateVMChainName(vmId)
+    this.debug.log(`Detaching jump rules for VM ${vmId} (chain: ${chainName})`)
+
+    try {
+      await this.removeJumpRules(chainName)
+      this.debug.log(`Jump rules detached for VM ${vmId} - chain and rules persist`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Log but don't throw - detach is best-effort on stop
+      this.debug.log('warn', `Failed to detach jump rules for VM ${vmId}: ${errorMessage}`)
+    }
+  }
+
+  /**
+   * Applies firewall rules only if they have changed since last application.
+   * Uses SHA-256 hashing to detect changes, avoiding unnecessary rule flushes.
+   * This optimization is important for persistent firewall chains that may be
+   * re-applied on VM restart without actual rule changes.
+   *
+   * @param vmId - The VM identifier
+   * @param tapDeviceName - The TAP device name for this VM
+   * @param departmentRules - Rules inherited from the department
+   * @param vmRules - Rules specific to this VM
+   * @returns Object with changed flag and apply result (if changed)
+   */
+  async applyRulesIfChanged (
+    vmId: string,
+    tapDeviceName: string,
+    departmentRules: FirewallRuleInput[],
+    vmRules: FirewallRuleInput[]
+  ): Promise<{ changed: boolean; result?: FirewallApplyResult }> {
+    // Compute hash of the merged rules (including default established/related rule)
+    // This ensures the hash matches the effective rule set applied by applyRules()
+    const mergedRules = this.mergeRules(departmentRules, vmRules)
+    mergedRules.push(this.getDefaultEstablishedRule())
+    const newHash = this.hashRules(mergedRules)
+    const cachedHash = this.ruleHashCache.get(vmId)
+
+    if (cachedHash === newHash) {
+      this.debug.log(`Rules unchanged for VM ${vmId} (hash: ${newHash.substring(0, 8)}...), skipping apply`)
+      return { changed: false }
+    }
+
+    this.debug.log(`Rules changed for VM ${vmId} (old: ${cachedHash?.substring(0, 8) ?? 'none'}..., new: ${newHash.substring(0, 8)}...), applying`)
+
+    // Apply the rules
+    const result = await this.applyRules(vmId, tapDeviceName, departmentRules, vmRules)
+
+    // Update cache only on successful apply
+    if (result.failedRules === 0) {
+      this.ruleHashCache.set(vmId, newHash)
+      this.debug.log(`Rules hash cached for VM ${vmId}`)
+    }
+
+    return { changed: true, result }
+  }
+
+  /**
+   * Clears the rules hash cache for a VM.
+   * Call this when removing a VM to free memory.
+   *
+   * @param vmId - The VM identifier
+   */
+  clearRulesCache (vmId: string): void {
+    this.ruleHashCache.delete(vmId)
+    this.debug.log(`Rules cache cleared for VM ${vmId}`)
+  }
+
+  // ============================================================================
   // Private Methods
   // ============================================================================
+
+  /**
+   * Returns the default established/related rule that is automatically injected.
+   * This rule ensures connections initiated by the VM (or accepted via explicit rules) continue to work.
+   * Priority 9999 means it's evaluated last, after all user-defined rules.
+   */
+  private getDefaultEstablishedRule (): FirewallRuleInput {
+    return {
+      id: '__default_established',
+      name: 'Allow Established/Related (Auto)',
+      action: 'ACCEPT',
+      direction: 'INOUT',
+      protocol: 'all',
+      priority: 9999,
+      connectionState: { established: true, related: true },
+      overridesDept: false
+    }
+  }
+
+  /**
+   * Computes a SHA-256 hash of the firewall rules.
+   * Rules are sorted by priority before hashing for consistent results.
+   */
+  private hashRules (rules: FirewallRuleInput[]): string {
+    // Sort by priority to ensure consistent hash regardless of input order
+    const sorted = [...rules].sort((a, b) => a.priority - b.priority)
+    const serialized = JSON.stringify(sorted)
+    return createHash('sha256').update(serialized).digest('hex')
+  }
 
   /**
    * Creates the infinivirt table if it doesn't already exist.
@@ -480,13 +746,18 @@ export class NftablesService {
         BASE_FORWARD_CHAIN
       ])
 
+      // Log forward chain output for debugging
+      this.debug.log(`Forward chain output:\n${output}`)
+
       // Find and delete rules that jump to this chain
-      // Format: rule bridge infinivirt forward handle N ...jump chainName
-      const handleRegex = new RegExp(`handle\\s+(\\d+)\\s+.*jump\\s+${chainName}`, 'g')
+      // Format: ... jump vm_abc123 # handle 42 (handle is at end of line in nft -a output)
+      const handleRegex = new RegExp(`jump\\s+${chainName}.*#\\s*handle\\s+(\\d+)`, 'g')
       let match
+      const matches: string[] = []
 
       while ((match = handleRegex.exec(output)) !== null) {
         const handle = match[1]
+        matches.push(`handle ${handle}`)
         this.debug.log(`Removing jump rule with handle ${handle}`)
 
         await this.exec([
@@ -495,6 +766,12 @@ export class NftablesService {
           BASE_FORWARD_CHAIN,
           'handle', handle
         ])
+      }
+
+      this.debug.log(`Found ${matches.length} jump rules to remove: ${matches.join(', ')}`)
+
+      if (matches.length === 0) {
+        this.debug.log('warn', `No jump rules found for chain ${chainName} - may already be removed or regex failed`)
       }
 
       this.debug.log(`Jump rules removed for chain ${chainName}`)
@@ -574,23 +851,6 @@ export class NftablesService {
     return merged
   }
 
-  /**
-   * Generates a chain name from a VM ID.
-   * Format: vm_{first-8-chars-of-vmId-sanitized}
-   */
-  private generateChainName (vmId: string): string {
-    // Remove non-alphanumeric characters and take first 8 chars
-    const sanitizedId = vmId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8).toLowerCase()
-
-    const chainName = `${VM_CHAIN_PREFIX}${sanitizedId}`
-
-    // Ensure name doesn't exceed max length
-    if (chainName.length > MAX_CHAIN_NAME_LENGTH) {
-      return chainName.substring(0, MAX_CHAIN_NAME_LENGTH)
-    }
-
-    return chainName
-  }
 
   /**
    * Executes an nftables command using CommandExecutor.
@@ -623,5 +883,59 @@ export class NftablesService {
     nftError.context = context
 
     return nftError
+  }
+
+  /**
+   * Persists the current nftables ruleset to disk if persistence is enabled.
+   * Called after rule changes to ensure rules survive reboots.
+   * Errors are logged but not thrown to avoid affecting rule application.
+   */
+  private async persistToDiskIfEnabled (): Promise<void> {
+    if (!this.enablePersistence) {
+      return
+    }
+
+    try {
+      const result = await this.persistence.exportToDisk()
+      if (result.success) {
+        this.debug.log(`Rules persisted to ${result.filePath}`)
+      } else {
+        this.debug.log('warn', `Failed to persist rules: ${result.error}`)
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      this.debug.log('warn', `Failed to persist rules to disk: ${errorMsg}`)
+      // Don't throw - persistence failure shouldn't affect rule application
+    }
+  }
+
+  // ============================================================================
+  // Persistence Public Methods
+  // ============================================================================
+
+  /**
+   * Gets the persistence handler for direct access to persistence operations.
+   * Useful for system startup/shutdown operations.
+   *
+   * @returns The NftablesPersistence instance
+   */
+  getPersistence (): NftablesPersistence {
+    return this.persistence
+  }
+
+  /**
+   * Manually triggers a persistence export.
+   * Useful when external operations modify rules outside of this service.
+   *
+   * @returns Result indicating success/failure
+   */
+  async forcePersist (): Promise<{ success: boolean; error?: string }> {
+    try {
+      const result = await this.persistence.exportToDisk()
+      return { success: result.success, error: result.error }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error)
+      return { success: false, error: errorMsg }
+    }
   }
 }

@@ -43,8 +43,45 @@ export enum DisplayErrorCode {
   INVALID_DISPLAY_NUMBER = 'INVALID_DISPLAY_NUMBER',
   PASSWORD_TOO_LONG = 'PASSWORD_TOO_LONG',
   PORT_OUT_OF_RANGE = 'PORT_OUT_OF_RANGE',
-  CONFLICTING_OPTIONS = 'CONFLICTING_OPTIONS'
+  CONFLICTING_OPTIONS = 'CONFLICTING_OPTIONS',
+  INVALID_COMPRESSION_MODE = 'INVALID_COMPRESSION_MODE',
+  INVALID_STREAMING_MODE = 'INVALID_STREAMING_MODE',
+  INVALID_GL_CONFIG = 'INVALID_GL_CONFIG',
+  RENDERNODE_NOT_FOUND = 'RENDERNODE_NOT_FOUND'
 }
+
+// ============================================================================
+// SPICE Optimization Types
+// ============================================================================
+
+/**
+ * Image compression algorithms for SPICE
+ */
+export type SpiceImageCompression =
+  | 'auto_glz'  // Auto GLZ (default, best for most cases)
+  | 'auto_lz'   // Auto LZ
+  | 'quic'      // SFALIC algorithm
+  | 'glz'       // LZ with global dictionary
+  | 'lz'        // Lempel-Ziv
+  | 'off'       // No compression
+
+/**
+ * WAN compression modes for JPEG and zlib-glz
+ */
+export type SpiceWanCompression = 'auto' | 'never' | 'always'
+
+/**
+ * Video streaming detection and compression modes
+ */
+export type SpiceStreamingMode =
+  | 'off'     // Disable video streaming detection
+  | 'all'     // Treat all video as stream
+  | 'filter'  // Smart detection (default)
+
+/**
+ * Playback compression toggle
+ */
+export type SpicePlaybackCompression = 'on' | 'off'
 
 // ============================================================================
 // Interfaces
@@ -64,6 +101,36 @@ export interface SpiceConfigOptions {
   disableTicketing?: boolean
   /** Enable SPICE guest agent for copy/paste via virtio-serial (default: true) */
   enableAgent?: boolean
+
+  // ===== Compression Options =====
+  /** Image compression algorithm (default: 'auto_glz') */
+  imageCompression?: SpiceImageCompression
+  /** JPEG compression for WAN (default: 'auto') */
+  jpegWanCompression?: SpiceWanCompression
+  /** zlib-glz compression for WAN (default: 'auto') */
+  zlibGlzWanCompression?: SpiceWanCompression
+
+  // ===== Streaming Options =====
+  /** Video streaming detection and compression (default: 'filter') */
+  streamingVideo?: SpiceStreamingMode
+
+  // ===== Audio Options =====
+  /** Playback compression using CELT algorithm (default: 'on') */
+  playbackCompression?: SpicePlaybackCompression
+
+  // ===== GL Acceleration =====
+  /** Enable OpenGL acceleration (requires recent QEMU/SPICE, local-only) */
+  gl?: boolean
+  /** GPU render node for GL acceleration (e.g., '/dev/dri/renderD128') */
+  rendernode?: string
+
+  // ===== Display Options =====
+  /** Disable copy/paste functionality (default: false) */
+  disableCopyPaste?: boolean
+  /** Disable agent file transfer (default: false) */
+  disableAgentFileXfer?: boolean
+  /** Enable seamless migration (default: false) */
+  seamlessMigration?: boolean
 }
 
 /**

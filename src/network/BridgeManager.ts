@@ -186,4 +186,87 @@ export class BridgeManager {
       return []
     }
   }
+
+  /**
+   * Assigns an IP address to a bridge interface.
+   * This is used to set the gateway IP for the bridge subnet.
+   * @param bridgeName - The bridge name
+   * @param ipWithCidr - IP address with CIDR notation (e.g., "10.10.100.1/24")
+   * @throws Error if assignment fails (handles already-exists gracefully)
+   */
+  async assignIP (bridgeName: string, ipWithCidr: string): Promise<void> {
+    this.debug.log(`Assigning IP ${ipWithCidr} to bridge ${bridgeName}`)
+
+    try {
+      await this.executor.execute('ip', ['addr', 'add', ipWithCidr, 'dev', bridgeName])
+      this.debug.log(`IP ${ipWithCidr} assigned to bridge ${bridgeName}`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Handle gracefully if IP already exists
+      if (errorMessage.includes('RTNETLINK answers: File exists')) {
+        this.debug.log(`IP ${ipWithCidr} already exists on bridge ${bridgeName}`)
+        return
+      }
+      const message = `Failed to assign IP ${ipWithCidr} to bridge ${bridgeName}: ${errorMessage}`
+      this.debug.log('error', message)
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Removes an IP address from a bridge interface.
+   * @param bridgeName - The bridge name
+   * @param ipWithCidr - IP address with CIDR notation (e.g., "10.10.100.1/24")
+   * @throws Error if removal fails (handles not-found gracefully)
+   */
+  async removeIP (bridgeName: string, ipWithCidr: string): Promise<void> {
+    this.debug.log(`Removing IP ${ipWithCidr} from bridge ${bridgeName}`)
+
+    try {
+      await this.executor.execute('ip', ['addr', 'del', ipWithCidr, 'dev', bridgeName])
+      this.debug.log(`IP ${ipWithCidr} removed from bridge ${bridgeName}`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Handle gracefully if IP doesn't exist
+      if (errorMessage.includes('Cannot assign requested address') ||
+          errorMessage.includes('RTNETLINK answers: Cannot assign')) {
+        this.debug.log(`IP ${ipWithCidr} not found on bridge ${bridgeName}`)
+        return
+      }
+      const message = `Failed to remove IP ${ipWithCidr} from bridge ${bridgeName}: ${errorMessage}`
+      this.debug.log('error', message)
+      throw new Error(message)
+    }
+  }
+
+  /**
+   * Gets IP addresses assigned to a bridge.
+   * @param bridgeName - The bridge name
+   * @returns Array of IP addresses with CIDR notation
+   */
+  async getIPs (bridgeName: string): Promise<string[]> {
+    this.debug.log(`Getting IPs for bridge ${bridgeName}`)
+
+    try {
+      const output = await this.executor.execute('ip', ['addr', 'show', bridgeName])
+
+      // Parse output to extract IPv4 addresses
+      // Output format: "inet 10.10.100.1/24 ..."
+      const ips: string[] = []
+      const lines = output.split('\n')
+
+      for (const line of lines) {
+        const match = line.match(/inet\s+(\d+\.\d+\.\d+\.\d+\/\d+)/)
+        if (match && match[1]) {
+          ips.push(match[1])
+        }
+      }
+
+      this.debug.log(`Found ${ips.length} IPs on bridge ${bridgeName}: ${ips.join(', ') || 'none'}`)
+      return ips
+    } catch {
+      this.debug.log(`Could not get IPs for bridge ${bridgeName}`)
+      return []
+    }
+  }
 }

@@ -517,23 +517,25 @@ export class HealthMonitor extends EventEmitter {
 
     const orchestrator = new CleanupOrchestrator(vmId, this.debug)
 
-    // TAP device cleanup
+    // TAP device cleanup - detach from bridge but preserve for reuse
+    // This enables persistent TAP devices across crash/restart cycles
     if (config.tapDeviceName) {
       await orchestrator.executeCleanup(
         CleanupResourceType.TAP_DEVICE,
         config.tapDeviceName,
         async () => {
-          await this.tapManager.destroy(config.tapDeviceName!)
+          await this.tapManager.detachFromBridge(config.tapDeviceName!)
         }
       )
     }
 
-    // Firewall chain cleanup
+    // Firewall chain cleanup - detach jump rules but preserve chain and rules
+    // Chain persists for reuse when VM restarts
     await orchestrator.executeCleanup(
       CleanupResourceType.FIREWALL_CHAIN,
       vmId,
       async () => {
-        await this.nftables.removeVMChain(vmId)
+        await this.nftables.detachJumpRules(vmId)
       }
     )
 
@@ -625,11 +627,12 @@ export class HealthMonitor extends EventEmitter {
         'Skipped due to upstream resource cleanup failures'
       )
     } else {
+      // Clear volatile configuration but preserve tapDeviceName for persistent TAP reuse
       await orchestrator.executeCleanup(
         CleanupResourceType.DB_CONFIGURATION,
         vmId,
         async () => {
-          await this.db.clearMachineConfiguration(vmId)
+          await this.db.clearVolatileMachineConfiguration(vmId)
         }
       )
     }

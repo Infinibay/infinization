@@ -241,6 +241,23 @@ export class StateSync {
   }
 
   /**
+   * Gets the QEMU process PID for a VM from the database.
+   *
+   * This method searches through running VMs to find the PID.
+   * Note: This is primarily used during shutdown handling to monitor process exit.
+   *
+   * @param vmId The VM identifier
+   * @returns The PID if found, null otherwise
+   */
+  public async getVMPid (vmId: string): Promise<number | null> {
+    // Search in running VMs to find the PID
+    // This includes VMs that may still be in 'running' status during shutdown
+    const runningVMs = await this.db.findRunningVMs()
+    const vm = runningVMs.find(v => v.id === vmId)
+    return vm?.MachineConfiguration?.qemuPid ?? null
+  }
+
+  /**
    * Updates VM status directly without QMP query
    *
    * Use this when the new status is already known (e.g., from an event).

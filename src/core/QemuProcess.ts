@@ -1,7 +1,7 @@
 import { ChildProcess, spawn } from 'child_process'
 import { promises as fsPromises } from 'fs'
 import { Debugger } from '../utils/debug'
-import { QemuCommandBuilder } from './QemuCommandBuilder'
+import { QemuCommandBuilder, QemuCommandWithPinning } from './QemuCommandBuilder'
 
 /**
  * QemuProcess manages the lifecycle of a QEMU virtual machine process.
@@ -18,6 +18,11 @@ export class QemuProcess {
   private pidFilePath: string | null = null
   private debug: Debugger
   private stopping: boolean = false
+
+  // CPU pinning information (populated after start)
+  private cpuPinningApplied: boolean = false
+  private pinnedCores: number[] = []
+  private numaNodes: number[] = []
 
   /**
    * Create a new QemuProcess instance
@@ -49,19 +54,65 @@ export class QemuProcess {
 
   /**
    * Start the QEMU process
+   *
+   * If CPU pinning is enabled in the command builder, this method will use
+   * `numactl` as a wrapper to pin the QEMU process to specific CPU cores
+   * and NUMA memory nodes.
    */
   async start (): Promise<void> {
-    const { command, args } = this.commandBuilder.buildCommand()
+    // Check if CPU pinning is enabled and get the appropriate command
+    let commandResult: QemuCommandWithPinning
+    if (this.commandBuilder.isCpuPinningEnabled()) {
+      commandResult = await this.commandBuilder.buildCommandWithPinning()
+    } else {
+      const baseCommand = this.commandBuilder.buildCommand()
+      commandResult = {
+        ...baseCommand,
+        wrapperCommand: null,
+        wrapperArgs: [],
+        pinningApplied: false,
+        pinnedCores: [],
+        numaNodes: []
+      }
+    }
+
+    // Store CPU pinning information
+    this.cpuPinningApplied = commandResult.pinningApplied
+    this.pinnedCores = commandResult.pinnedCores
+    this.numaNodes = commandResult.numaNodes
+
+    // Determine actual command and args based on wrapper presence
+    let actualCommand: string
+    let actualArgs: string[]
+
+    if (commandResult.wrapperCommand) {
+      // Use wrapper (e.g., numactl) with QEMU as an argument
+      actualCommand = commandResult.wrapperCommand
+      actualArgs = [
+        ...commandResult.wrapperArgs,
+        commandResult.command,
+        ...commandResult.args
+      ]
+      this.debug.log(`CPU pinning enabled: cores [${commandResult.pinnedCores.join(',')}], NUMA nodes [${commandResult.numaNodes.join(',')}]`)
+    } else {
+      // Direct QEMU execution
+      actualCommand = commandResult.command
+      actualArgs = commandResult.args
+    }
+
     const isDaemonized = this.commandBuilder.isDaemonizeEnabled()
     const pidfilePath = this.pidFilePath || this.commandBuilder.getPidfilePath()
 
     // Log command in a readable format
     this.debug.log(`Starting VM ${this.vmId}`)
-    this.debug.log(`Command: ${command}`)
-    this.debug.log(`Arguments (${args.length}):`)
-    for (let i = 0; i < args.length; i += 2) {
-      const arg = args[i]
-      const value = args[i + 1]
+    if (commandResult.wrapperCommand) {
+      this.debug.log(`Wrapper: ${commandResult.wrapperCommand} ${commandResult.wrapperArgs.join(' ')}`)
+    }
+    this.debug.log(`Command: ${commandResult.command}`)
+    this.debug.log(`Arguments (${commandResult.args.length}):`)
+    for (let i = 0; i < commandResult.args.length; i += 2) {
+      const arg = commandResult.args[i]
+      const value = commandResult.args[i + 1]
       if (value && !value.startsWith('-')) {
         this.debug.log(`  ${arg} ${value}`)
       } else {
@@ -69,7 +120,7 @@ export class QemuProcess {
         if (value) i-- // Reprocess value as next arg
       }
     }
-    this.debug.log(`Full command: ${command} ${args.join(' ')}`)
+    this.debug.log(`Full command: ${actualCommand} ${actualArgs.join(' ')}`)
 
     return new Promise((resolve, reject) => {
       let stderrBuffer = ''
@@ -95,7 +146,7 @@ export class QemuProcess {
         }
       }
 
-      this.process = spawn(command, args, {
+      this.process = spawn(actualCommand, actualArgs, {
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe']
       })
@@ -438,5 +489,30 @@ export class QemuProcess {
    */
   private sleep (ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  // ===========================================================================
+  // CPU Pinning Information
+  // ===========================================================================
+
+  /**
+   * Check if CPU pinning was applied to this process
+   */
+  isCpuPinningApplied (): boolean {
+    return this.cpuPinningApplied
+  }
+
+  /**
+   * Get the CPU cores this process is pinned to
+   */
+  getPinnedCores (): number[] {
+    return [...this.pinnedCores]
+  }
+
+  /**
+   * Get the NUMA nodes used for memory binding
+   */
+  getNumaNodes (): number[] {
+    return [...this.numaNodes]
   }
 }

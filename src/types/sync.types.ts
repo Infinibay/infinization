@@ -72,6 +72,9 @@ export interface DatabaseAdapter {
 
   /** Clear machine configuration (qemuPid, tapDeviceName, qmpSocketPath) */
   clearMachineConfiguration (machineId: string): Promise<void>
+
+  /** Clear only volatile config (qemuPid, qmpSocketPath) - preserves tapDeviceName for reuse */
+  clearVolatileMachineConfiguration (machineId: string): Promise<void>
 }
 
 // =============================================================================

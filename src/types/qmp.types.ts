@@ -94,10 +94,44 @@ export type QMPEventType =
   | 'BLOCK_JOB_COMPLETED'
 
 /**
- * Event data for SHUTDOWN event
+ * Event data for SHUTDOWN event.
+ *
+ * This interface describes the data payload of QEMU's SHUTDOWN event.
+ *
+ * ## Important Limitation
+ *
+ * **The `guest` field does NOT reliably distinguish between guest-initiated and
+ * host-initiated shutdowns when ACPI is involved.**
+ *
+ * Both scenarios produce identical QMP events:
+ * - User clicks "PowerOff" inside the VM → `{ guest: true, reason: 'guest-shutdown' }`
+ * - Host sends `system_powerdown` via QMP → `{ guest: true, reason: 'guest-shutdown' }`
+ *
+ * The only truly host-initiated shutdown that can be identified is the direct `quit` command:
+ * - Host sends `quit` via QMP → `{ guest: false, reason: 'host-qmp-quit' }`
+ *
+ * ## Practical Usage
+ *
+ * When handling SHUTDOWN events, check `reason === 'host-qmp-quit'` to identify
+ * explicit host termination. All other shutdowns should be treated as ACPI-based
+ * where QEMU will terminate automatically after the guest completes its shutdown.
+ *
+ * @example
+ * ```typescript
+ * // ACPI shutdown (guest PowerOff OR host system_powerdown - indistinguishable)
+ * { guest: true, reason: 'guest-shutdown' }
+ *
+ * // Direct host quit command (only truly identifiable host-initiated path)
+ * { guest: false, reason: 'host-qmp-quit' }
+ * ```
  */
 export interface QMPShutdownEventData {
+  /**
+   * true if shutdown went through guest OS (ACPI).
+   * NOTE: This is true for BOTH "guest clicked PowerOff" AND "host sent system_powerdown".
+   */
   guest: boolean
+  /** Reason for the shutdown. Only 'host-qmp-quit' reliably indicates explicit host termination. */
   reason: 'guest-shutdown' | 'guest-reset' | 'guest-panic' | 'host-qmp-quit' | 'host-qmp-system-reset' | 'host-signal' | 'host-ui' | 'subsystem-reset' | 'snapshot-load'
 }
 

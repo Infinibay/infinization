@@ -321,6 +321,31 @@ export class Infinivirt {
   }
 
   /**
+   * Destroys a VM and all its resources permanently.
+   *
+   * Use this when deleting a VM completely. This method:
+   * 1. Stops the VM if running
+   * 2. Destroys the TAP device permanently
+   * 3. Removes the nftables firewall chain and all rules
+   * 4. Clears machine configuration from database
+   *
+   * @param vmId - VM identifier
+   * @returns VMOperationResult indicating success or failure
+   */
+  async destroyVM (vmId: string): Promise<VMOperationResult> {
+    this.ensureInitialized()
+
+    const lifecycle = this.createLifecycle()
+    const result = await lifecycle.destroyResources(vmId)
+
+    if (result.success) {
+      this.untrackVM(vmId)
+    }
+
+    return result
+  }
+
+  /**
    * Restarts a VM.
    *
    * @param vmId - VM identifier

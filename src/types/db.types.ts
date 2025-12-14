@@ -133,8 +133,12 @@ export interface MachineConfigUpdate {
   uefiFirmware?: string | null
   /** Enable hugepages for improved memory performance */
   hugepages?: boolean | null
-  /** CPU affinity configuration (format: {"cores": [0, 1, 2]}) */
+  /** CPU affinity configuration (format: {"cores": [0, 1, 2]}) - cgroups-based */
   cpuPinning?: { cores: number[] } | null
+  /** Enable NUMA-aware CPU pinning via numactl wrapper */
+  enableNumaCtlPinning?: boolean | null
+  /** Strategy for automatic CPU pinning: 'basic' or 'hybrid' */
+  cpuPinningStrategy?: string | null
   // Advanced device configuration
   /** Path to TPM 2.0 socket (swtpm) */
   tpmSocketPath?: string | null
@@ -262,8 +266,12 @@ export interface ExtendedMachineConfigurationRecord extends MachineConfiguration
   uefiFirmware: string | null
   /** Enable hugepages for improved memory performance */
   hugepages: boolean | null
-  /** CPU affinity configuration */
+  /** CPU affinity configuration (cgroups-based) */
   cpuPinning: { cores: number[] } | null
+  /** Enable NUMA-aware CPU pinning via numactl wrapper */
+  enableNumaCtlPinning: boolean | null
+  /** Strategy for automatic CPU pinning: 'basic' or 'hybrid' */
+  cpuPinningStrategy: string | null
   // Advanced device configuration
   /** Path to TPM 2.0 socket (swtpm) */
   tpmSocketPath: string | null

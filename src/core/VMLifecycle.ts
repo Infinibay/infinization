@@ -229,6 +229,63 @@ export class VMLifecycle {
       // 1. Ensure directories exist
       await this.ensureDirectories()
 
+      // 1a. Clean up orphan resources if they exist (from previous failed create or crash)
+      // This handles cases where a VM with the same internalName was partially created
+      if (fs.existsSync(paths.qmpSocketPath)) {
+        this.debug.log('warn', `Found existing QMP socket: ${paths.qmpSocketPath}, removing orphan socket`)
+        try {
+          fs.unlinkSync(paths.qmpSocketPath)
+          this.debug.log('info', `Removed orphan QMP socket: ${paths.qmpSocketPath}`)
+        } catch (unlinkError) {
+          this.debug.log('error', `Failed to remove orphan QMP socket: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
+        }
+      }
+
+      if (fs.existsSync(paths.pidFilePath)) {
+        this.debug.log('warn', `Found existing PID file: ${paths.pidFilePath}, checking if process is alive`)
+        try {
+          const pidContent = fs.readFileSync(paths.pidFilePath, 'utf8').trim()
+          const existingPid = parseInt(pidContent, 10)
+
+          if (!isNaN(existingPid) && existingPid > 0) {
+            try {
+              process.kill(existingPid, 0)
+              // Process is alive - conflict
+              throw new LifecycleError(
+                LifecycleErrorCode.CREATE_FAILED,
+                `A QEMU process (PID ${existingPid}) is already running with internalName '${config.internalName}'. ` +
+                `This may indicate a duplicate VM or orphaned process. ` +
+                `If you are sure no QEMU process should be running, manually remove: ${paths.pidFilePath}`,
+                vmId,
+                { existingPid, pidFilePath: paths.pidFilePath, internalName: config.internalName }
+              )
+            } catch (killError) {
+              if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
+                this.debug.log('info', `Process ${existingPid} is dead, removing orphan PID file`)
+                fs.unlinkSync(paths.pidFilePath)
+                this.debug.log('info', `Removed orphan PID file: ${paths.pidFilePath}`)
+              } else {
+                throw killError
+              }
+            }
+          } else {
+            this.debug.log('warn', `PID file contains invalid content: "${pidContent}", removing`)
+            fs.unlinkSync(paths.pidFilePath)
+          }
+        } catch (readError) {
+          if (readError instanceof LifecycleError) {
+            throw readError
+          }
+          this.debug.log('warn', `Error reading PID file: ${readError instanceof Error ? readError.message : String(readError)}`)
+          try {
+            fs.unlinkSync(paths.pidFilePath)
+            this.debug.log('info', `Removed unreadable PID file: ${paths.pidFilePath}`)
+          } catch (unlinkError) {
+            this.debug.log('error', `Failed to remove orphan PID file: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
+          }
+        }
+      }
+
       // 2. Create disk images
       this.debug.log(`Creating ${config.disks.length} disk image(s)`)
       for (let i = 0; i < config.disks.length; i++) {
@@ -363,7 +420,9 @@ export class VMLifecycle {
         memoryBalloon: effectiveMemoryBalloon,
         uefiFirmware: effectiveUefiFirmware,
         hugepages: effectiveHugepages,
-        displayPort: effectiveDisplayPort
+        displayPort: effectiveDisplayPort,
+        enableNumaCtlPinning: config.enableNumaCtlPinning,
+        cpuPinningStrategy: config.cpuPinningStrategy
       }
 
       const commandBuilder = this.buildQemuCommand(
@@ -556,9 +615,10 @@ export class VMLifecycle {
           }
         }
         // Process is dead but DB says running - update status and continue
+        // Use volatile clear to preserve tapDeviceName for potential reuse
         await this.prisma.updateMachineStatus(vmId, 'off')
-        await this.prisma.clearMachineConfiguration(vmId)
-        this.debug.log(`VM ${vmId} was marked running but process dead, resetting`)
+        await this.prisma.clearVolatileMachineConfiguration(vmId)
+        this.debug.log(`VM ${vmId} was marked running but process dead, resetting (TAP preserved)`)
       }
 
       // 3. Atomically transition status from 'off' to 'starting' with optimistic locking
@@ -638,11 +698,76 @@ export class VMLifecycle {
         }
       }
 
+      // 5b. Clean up orphan PID file if exists (from crashed QEMU or unclean shutdown)
+      // QEMU uses flock() on the PID file, so if a previous process crashed, the lock
+      // is released but the file may remain. If a process is still alive, we should not
+      // attempt to start a duplicate VM.
+      if (fs.existsSync(pidFilePath)) {
+        this.debug.log('warn', `Found existing PID file: ${pidFilePath}, checking if process is alive`)
+        try {
+          const pidContent = fs.readFileSync(pidFilePath, 'utf8').trim()
+          const existingPid = parseInt(pidContent, 10)
+
+          if (!isNaN(existingPid) && existingPid > 0) {
+            // Check if process with this PID is still alive
+            try {
+              process.kill(existingPid, 0) // Signal 0 = just check if process exists
+              // Process is alive - this is a real conflict
+              throw new LifecycleError(
+                LifecycleErrorCode.START_FAILED,
+                `VM ${vmId} appears to have a running QEMU process (PID ${existingPid}) that is not tracked. ` +
+                `This may indicate a previous crash or unclean shutdown. ` +
+                `If you are sure no QEMU process is running for this VM, manually remove: ${pidFilePath}`,
+                vmId,
+                { existingPid, pidFilePath }
+              )
+            } catch (killError) {
+              if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
+                // Process not found (ESRCH) - safe to remove orphan PID file
+                this.debug.log('info', `Process ${existingPid} is dead, removing orphan PID file`)
+                fs.unlinkSync(pidFilePath)
+                this.debug.log('info', `Removed orphan PID file: ${pidFilePath}`)
+              } else {
+                // Re-throw LifecycleError or other errors
+                throw killError
+              }
+            }
+          } else {
+            // Invalid PID content - safe to remove
+            this.debug.log('warn', `PID file contains invalid content: "${pidContent}", removing`)
+            fs.unlinkSync(pidFilePath)
+          }
+        } catch (readError) {
+          if (readError instanceof LifecycleError) {
+            throw readError
+          }
+          // Error reading PID file - try to remove it anyway
+          this.debug.log('warn', `Error reading PID file: ${readError instanceof Error ? readError.message : String(readError)}`)
+          try {
+            fs.unlinkSync(pidFilePath)
+            this.debug.log('info', `Removed unreadable PID file: ${pidFilePath}`)
+          } catch (unlinkError) {
+            this.debug.log('error', `Failed to remove orphan PID file: ${unlinkError instanceof Error ? unlinkError.message : String(unlinkError)}`)
+          }
+        }
+      }
+
       resources.diskPaths = diskPaths
       resources.qmpSocketPath = qmpSocketPath
       resources.pidFilePath = pidFilePath
       resources.guestAgentSocketPath = vmConfig.configuration?.guestAgentSocketPath ?? undefined
-      resources.infiniServiceSocketPath = vmConfig.configuration?.infiniServiceSocketPath ?? undefined
+
+      // 5c. Ensure InfiniService socket path exists (generate if not in database)
+      // This handles VMs created before the InfiniService socket feature was added,
+      // or VMs where the socket path was cleared by the migration script.
+      let infiniServiceSocketPath = vmConfig.configuration?.infiniServiceSocketPath
+      if (!infiniServiceSocketPath) {
+        infiniServiceSocketPath = path.join(this.qmpSocketDir, `${vmId}.socket`)
+        this.debug.log('info', `Generated InfiniService socket path for VM ${vmId}: ${infiniServiceSocketPath}`)
+        // Persist the generated path so future restarts use the same path
+        await this.prisma.updateMachineConfiguration(vmId, { infiniServiceSocketPath })
+      }
+      resources.infiniServiceSocketPath = infiniServiceSocketPath
 
       // 6. Ensure directories exist
       await this.ensureDirectories()
@@ -678,23 +803,45 @@ export class VMLifecycle {
       // 10. Get network bridge from configuration with fallback to default
       const bridge = vmConfig.configuration?.bridge ?? 'virbr0'
 
-      // 11. Create and configure TAP device
-      this.debug.log(`Creating TAP device for VM: ${vmId}`)
-      const tapDevice = await this.tapManager.create(vmId, bridge)
-      resources.tapDevice = tapDevice
-      await this.tapManager.configure(tapDevice, bridge)
+      // 11. Create or reuse TAP device (persistent TAP support)
+      // Check if a TAP device was preserved from a previous stop (persistent lifecycle)
+      let tapDevice: string
+      const existingTapDevice = vmConfig.configuration?.tapDeviceName
 
-      // 12. Setup firewall
+      if (existingTapDevice && await this.tapManager.exists(existingTapDevice)) {
+        // Reuse existing TAP device - just reattach to bridge
+        this.debug.log(`Reusing persistent TAP device: ${existingTapDevice}`)
+        tapDevice = existingTapDevice
+        await this.tapManager.attachToBridge(tapDevice, bridge)
+      } else {
+        // Create new TAP device (first start or after host reboot)
+        this.debug.log(`Creating new TAP device for VM: ${vmId}`)
+        tapDevice = await this.tapManager.create(vmId, bridge)
+        await this.tapManager.configure(tapDevice, bridge)
+
+        // Store TAP device name for persistence across stop/start cycles
+        await this.prisma.updateMachineConfiguration(vmId, { tapDeviceName: tapDevice })
+      }
+      resources.tapDevice = tapDevice
+
+      // 12. Setup firewall (persistent chain support)
+      // Chain persists across stop/start - only jump rules are attached/detached
       this.debug.log(`Configuring firewall for VM: ${vmId}`)
-      await this.nftables.createVMChain(vmId, tapDevice)
+      await this.nftables.ensureVMChain(vmId) // Idempotent - creates chain if not exists
+      await this.nftables.attachJumpRules(vmId, tapDevice) // Connect TAP to persistent chain
+
       const firewallRules = await this.fetchFirewallRules(vmId)
       if (firewallRules.department.length > 0 || firewallRules.vm.length > 0) {
-        await this.nftables.applyRules(
+        // Use applyRulesIfChanged for optimization - skips re-apply if rules unchanged
+        const { changed } = await this.nftables.applyRulesIfChanged(
           vmId,
           tapDevice,
           firewallRules.department,
           firewallRules.vm
         )
+        if (!changed) {
+          this.debug.log(`Firewall rules unchanged for VM ${vmId}, skipped re-apply`)
+        }
       }
 
       // 13. Build QEMU command from stored configuration
@@ -755,10 +902,14 @@ export class VMLifecycle {
           // Advanced device configuration from database
           tpmSocketPath: vmConfig.configuration?.tpmSocketPath,
           guestAgentSocketPath: vmConfig.configuration?.guestAgentSocketPath,
-          infiniServiceSocketPath: vmConfig.configuration?.infiniServiceSocketPath,
+          // Use locally generated/stored infiniServiceSocketPath (includes fallback generation)
+          infiniServiceSocketPath,
           virtioDriversIso: vmConfig.configuration?.virtioDriversIso,
           enableAudio: vmConfig.configuration?.enableAudio,
-          enableUsbTablet: vmConfig.configuration?.enableUsbTablet
+          enableUsbTablet: vmConfig.configuration?.enableUsbTablet,
+          // CPU pinning configuration
+          enableNumaCtlPinning: vmConfig.configuration?.enableNumaCtlPinning,
+          cpuPinningStrategy: this.validateCpuPinningStrategy(vmConfig.configuration?.cpuPinningStrategy)
         }
       )
 
@@ -910,8 +1061,14 @@ export class VMLifecycle {
         // Process is alive but DB says off - continue with stop
       }
 
-      // Try graceful shutdown via QMP
-      if (stopConfig.graceful && qmpSocketPath && pid) {
+      // Early check: If process is already dead, skip QMP operations entirely
+      // This handles the case where guest-initiated shutdown has already completed
+      if (pid && !this.isProcessAlive(pid)) {
+        this.debug.log('info', `QEMU process (PID ${pid}) already terminated for VM ${vmId} - skipping QMP operations`)
+        // Process is dead, jump directly to cleanup (no graceful shutdown needed)
+        // This path is reached when guest initiated shutdown and QEMU exited before stop() was called
+      } else if (stopConfig.graceful && qmpSocketPath && pid) {
+        // Process is alive, try graceful shutdown via QMP
         // Verify socket exists before attempting connection
         const socketExists = fs.existsSync(qmpSocketPath)
         this.debug.log('info', `QMP socket ${qmpSocketPath} exists: ${socketExists}`)
@@ -1024,24 +1181,27 @@ export class VMLifecycle {
       // EventHandler is detached above, so no QMP events will trigger status changes.
       await this.prisma.updateMachineStatus(vmId, 'off')
 
-      // Clear machine configuration (qmpSocketPath, qemuPid, tapDeviceName)
+      // Clear volatile machine configuration (qmpSocketPath, qemuPid)
+      // Note: tapDeviceName is preserved for persistent TAP device reuse on restart
       // This ensures HealthMonitor won't attempt to check a stale PID
-      await this.prisma.clearMachineConfiguration(vmId)
+      await this.prisma.clearVolatileMachineConfiguration(vmId)
 
-      // Cleanup network resources
+      // Detach TAP device from bridge (persistent - not destroyed)
+      // The TAP device persists for reuse when VM restarts
       if (tapDevice) {
         try {
-          await this.tapManager.destroy(tapDevice)
+          await this.tapManager.detachFromBridge(tapDevice)
         } catch (tapError) {
-          this.debug.log('warn', `Failed to destroy TAP device: ${tapError instanceof Error ? tapError.message : String(tapError)}`)
+          this.debug.log('warn', `Failed to detach TAP device: ${tapError instanceof Error ? tapError.message : String(tapError)}`)
         }
       }
 
-      // Remove firewall chain
+      // Detach jump rules from nftables (chain and rules persist)
+      // Only the routing from TAP to chain is removed; firewall rules survive stop/start
       try {
-        await this.nftables.removeVMChain(vmId)
+        await this.nftables.detachJumpRules(vmId)
       } catch (fwError) {
-        this.debug.log('warn', `Failed to remove firewall chain: ${fwError instanceof Error ? fwError.message : String(fwError)}`)
+        this.debug.log('warn', `Failed to detach firewall jump rules: ${fwError instanceof Error ? fwError.message : String(fwError)}`)
       }
 
       // Cleanup empty cgroup scopes if CPU pinning was used
@@ -1069,6 +1229,81 @@ export class VMLifecycle {
         vmId,
         timestamp,
         forced
+      }
+    } catch (error) {
+      if (error instanceof LifecycleError) {
+        throw error
+      }
+      throw this.wrapError(error, LifecycleErrorCode.STOP_FAILED, vmId)
+    }
+  }
+
+  /**
+   * Permanently destroys VM network resources (TAP device and firewall chain).
+   * Call this when deleting a VM completely, NOT during normal stop/start cycles.
+   *
+   * This method:
+   * 1. Stops the VM if running (with force)
+   * 2. Destroys the TAP device permanently
+   * 3. Removes the nftables firewall chain and all rules
+   * 4. Clears all machine configuration from database (including tapDeviceName)
+   *
+   * @param vmId - VM identifier
+   * @returns VMOperationResult indicating success or failure
+   */
+  async destroyResources (vmId: string): Promise<VMOperationResult> {
+    this.debug.log(`Destroying resources for VM: ${vmId}`)
+    const timestamp = new Date()
+
+    try {
+      // Fetch VM configuration
+      const vmConfig = await this.prisma.findMachineWithConfig(vmId)
+      if (!vmConfig) {
+        // VM doesn't exist in DB, just return success
+        return {
+          success: true,
+          message: `VM ${vmId} not found, nothing to destroy`,
+          vmId,
+          timestamp
+        }
+      }
+
+      // Stop VM if running
+      if (vmConfig.status === 'running') {
+        this.debug.log(`VM ${vmId} is running, stopping first`)
+        await this.stop(vmId, { graceful: false, timeout: 5000, force: true })
+      }
+
+      const tapDevice = vmConfig.configuration?.tapDeviceName
+
+      // Destroy TAP device permanently
+      if (tapDevice) {
+        try {
+          await this.tapManager.destroy(tapDevice)
+          this.debug.log(`TAP device destroyed: ${tapDevice}`)
+        } catch (tapError) {
+          this.debug.log('warn', `Failed to destroy TAP device: ${tapError instanceof Error ? tapError.message : String(tapError)}`)
+        }
+      }
+
+      // Remove firewall chain permanently (including all rules)
+      try {
+        await this.nftables.removeVMChain(vmId)
+        this.debug.log(`Firewall chain removed for VM: ${vmId}`)
+      } catch (fwError) {
+        this.debug.log('warn', `Failed to remove firewall chain: ${fwError instanceof Error ? fwError.message : String(fwError)}`)
+      }
+
+      // Clear ALL machine configuration (including tapDeviceName)
+      await this.prisma.clearMachineConfiguration(vmId)
+
+      this.debug.log(`Resources destroyed for VM: ${vmId}`)
+
+      return {
+        success: true,
+        message: `VM ${vmId} resources destroyed successfully`,
+        vmId,
+        timestamp
       }
     } catch (error) {
       if (error instanceof LifecycleError) {
@@ -1445,6 +1680,14 @@ export class VMLifecycle {
       errors.push('Display port is required and must be non-negative')
     }
 
+    // Validate CPU pinning strategy if provided
+    if (config.cpuPinningStrategy !== undefined) {
+      const validStrategies = ['basic', 'hybrid'] as const
+      if (!validStrategies.includes(config.cpuPinningStrategy)) {
+        errors.push(`Invalid cpuPinningStrategy: '${config.cpuPinningStrategy}'. Must be 'basic' or 'hybrid'`)
+      }
+    }
+
     if (errors.length > 0) {
       throw new LifecycleError(
         LifecycleErrorCode.INVALID_CONFIG,
@@ -1488,10 +1731,7 @@ export class VMLifecycle {
     const dirs = [
       this.diskDir,
       this.qmpSocketDir,
-      this.pidfileDir,
-      path.join(this.qmpSocketDir, 'ga'),
-      path.join(this.qmpSocketDir, 'tpm'),
-      path.join(this.qmpSocketDir, 'infini')
+      this.pidfileDir
     ]
     for (const dir of dirs) {
       if (!fs.existsSync(dir)) {
@@ -1535,6 +1775,8 @@ export class VMLifecycle {
   private static readonly VALID_DISK_CACHE_MODES = ['writeback', 'writethrough', 'none', 'unsafe'] as const
   /** Allowed network models */
   private static readonly VALID_NETWORK_MODELS = ['virtio-net-pci', 'e1000'] as const
+  /** Allowed CPU pinning strategies */
+  private static readonly VALID_CPU_PINNING_STRATEGIES = ['basic', 'hybrid'] as const
 
   /**
    * Validates machine type and returns a valid value, logging a warning if invalid.
@@ -1594,6 +1836,24 @@ export class VMLifecycle {
 
     this.debug.log('warn', `Invalid networkModel '${value}', using default '${defaultValue}'`)
     return defaultValue
+  }
+
+  /**
+   * Validates CPU pinning strategy and returns a valid value, logging a warning if invalid.
+   *
+   * @remarks
+   * This method provides defensive validation against corrupt database values.
+   * If the stored strategy is not 'basic' or 'hybrid', it returns 'basic' as the default.
+   */
+  private validateCpuPinningStrategy (value: string | null | undefined): 'basic' | 'hybrid' | undefined {
+    if (value === null || value === undefined) return undefined
+
+    if (VMLifecycle.VALID_CPU_PINNING_STRATEGIES.includes(value as typeof VMLifecycle.VALID_CPU_PINNING_STRATEGIES[number])) {
+      return value as 'basic' | 'hybrid'
+    }
+
+    this.debug.log('warn', `Invalid cpuPinningStrategy '${value}', using default 'basic'`)
+    return 'basic'
   }
 
   /**
@@ -1931,6 +2191,8 @@ export class VMLifecycle {
       virtioDriversIso?: string | null
       enableAudio?: boolean | null
       enableUsbTablet?: boolean | null
+      enableNumaCtlPinning?: boolean | null
+      cpuPinningStrategy?: 'basic' | 'hybrid' | null
     }
   ): QemuCommandBuilder {
     const builder = new QemuCommandBuilder()
@@ -2009,21 +2271,49 @@ export class VMLifecycle {
     }
     // If hugepages not enabled or validation failed, QEMU uses standard memory allocation
 
-    // Display
+    // Display configuration with optimizations
     // Disable SPICE agent (vdagent) if Guest Agent is configured, as Guest Agent provides
     // superior functionality and both share the virtio-serial controller
     const hasGuestAgent = !!(config.guestAgentSocketPath ?? qemuConfig?.guestAgentSocketPath)
     // Use validated display port from qemuConfig if available, otherwise validate from config
     const effectiveDisplayPort = this.validateDisplayPort(qemuConfig?.displayPort ?? config.displayPort)
+
     if (config.displayType === 'spice') {
       const spiceConfig = new SpiceConfig({
         port: effectiveDisplayPort,
         addr: config.displayAddr ?? '0.0.0.0',
         password: config.displayPassword,
         disableTicketing: !config.displayPassword,
-        enableAgent: !hasGuestAgent
+        enableAgent: !hasGuestAgent,
+
+        // ===== Performance Optimizations =====
+        // Use auto_glz for best compression/performance balance
+        imageCompression: 'auto_glz',
+        // Auto JPEG compression for WAN scenarios
+        jpegWanCompression: 'auto',
+        // Auto zlib-glz compression for WAN scenarios
+        zlibGlzWanCompression: 'auto',
+        // Smart video streaming detection (filter mode)
+        streamingVideo: 'filter',
+        // Enable playback compression (CELT algorithm)
+        playbackCompression: 'on',
+
+        // GL acceleration disabled by default (requires recent QEMU/SPICE)
+        // Can be enabled via qemuConfig if needed
+        gl: false,
+
+        // Agent features enabled by default
+        disableCopyPaste: false,
+        disableAgentFileXfer: false,
+        seamlessMigration: false
       })
-      builder.addSpice(spiceConfig)
+
+      // Determine QXL memory based on expected resolution
+      // Default 16MB for standard resolutions, can be overridden via config
+      const qxlMemoryMB = 16
+
+      builder.addSpice(spiceConfig, qxlMemoryMB)
+      this.debug.log(`SPICE display configured with optimizations: compression=auto_glz, streaming=filter, qxl_mem=${qxlMemoryMB}MB`)
     } else {
       const vncConfig = new VncConfig({
         display: effectiveDisplayPort,
@@ -2115,6 +2405,19 @@ export class VMLifecycle {
     if (enableUsbTablet) {
       builder.addUsbTablet()
       this.debug.log('info', 'USB tablet device enabled for absolute mouse positioning')
+    }
+
+    // ===========================================================================
+    // CPU Pinning (numactl wrapper)
+    // ===========================================================================
+
+    // Enable NUMA-aware CPU pinning if configured
+    // This wraps the QEMU process with numactl for CPU affinity and memory binding
+    const enableNumaCtlPinning = config.enableNumaCtlPinning ?? qemuConfig?.enableNumaCtlPinning ?? false
+    if (enableNumaCtlPinning) {
+      const pinningStrategy = config.cpuPinningStrategy ?? qemuConfig?.cpuPinningStrategy ?? 'basic'
+      builder.enableCpuPinning(pinningStrategy, config.cpuCores)
+      this.debug.log(`NUMA-aware CPU pinning enabled: strategy=${pinningStrategy}, vCPUs=${config.cpuCores}`)
     }
 
     // Process options

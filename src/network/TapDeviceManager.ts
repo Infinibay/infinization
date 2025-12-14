@@ -187,6 +187,73 @@ export class TapDeviceManager {
   }
 
   /**
+   * Detaches a TAP device from its bridge without destroying it.
+   * The device remains configured and can be quickly reattached on VM restart.
+   * This enables persistent firewall rules that survive VM stop/start cycles.
+   *
+   * @param tapName - The TAP device name to detach
+   */
+  async detachFromBridge (tapName: string): Promise<void> {
+    this.debug.log(`Detaching TAP device ${tapName} from bridge`)
+
+    if (!await this.exists(tapName)) {
+      this.debug.log(`TAP device ${tapName} does not exist, nothing to detach`)
+      return
+    }
+
+    try {
+      // Remove from bridge using nomaster
+      await this.executor.execute('ip', ['link', 'set', tapName, 'nomaster'])
+      this.debug.log(`TAP device ${tapName} removed from bridge`)
+
+      // Bring interface down
+      await this.executor.execute('ip', ['link', 'set', tapName, 'down'])
+      this.debug.log(`TAP device ${tapName} is now down (detached)`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Handle gracefully - device might already be detached or not exist
+      if (errorMessage.includes('Cannot find device') ||
+          errorMessage.includes('No such device') ||
+          errorMessage.includes('not found')) {
+        this.debug.log(`TAP device ${tapName} does not exist or already detached`)
+        return
+      }
+      // Log warning but don't throw - detach is best-effort
+      this.debug.log('warn', `Failed to detach TAP device ${tapName}: ${errorMessage}`)
+    }
+  }
+
+  /**
+   * Attaches an existing TAP device to a bridge.
+   * Used when restarting a VM to reuse the existing TAP device.
+   *
+   * @param tapName - The TAP device name to attach
+   * @param bridge - The bridge name to attach to
+   * @throws Error if device doesn't exist or attachment fails
+   */
+  async attachToBridge (tapName: string, bridge: string): Promise<void> {
+    this.debug.log(`Attaching TAP device ${tapName} to bridge ${bridge}`)
+
+    if (!await this.exists(tapName)) {
+      throw new Error(`TAP device ${tapName} does not exist, cannot attach to bridge`)
+    }
+
+    try {
+      // Bring interface up first
+      await this.executor.execute('ip', ['link', 'set', tapName, 'up'])
+      this.debug.log(`TAP device ${tapName} is now up`)
+
+      // Attach to bridge
+      await this.executor.execute('ip', ['link', 'set', tapName, 'master', bridge])
+      this.debug.log(`TAP device ${tapName} attached to bridge ${bridge}`)
+    } catch (error) {
+      const message = `Failed to attach TAP device ${tapName} to bridge ${bridge}: ${error instanceof Error ? error.message : String(error)}`
+      this.debug.log('error', message)
+      throw new Error(message)
+    }
+  }
+
+  /**
    * Checks if a TAP device exists.
    * @param tapName - The TAP device name to check
    * @returns true if device exists, false otherwise
