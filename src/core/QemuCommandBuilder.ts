@@ -1029,3 +1029,19 @@ export class QemuCommandBuilder {
     return [...this.args]
   }
 }
+
+/**
+ * IMPORTANT: This builder does NOT use the -no-shutdown flag.
+ *
+ * QEMU Default Behavior (without -no-shutdown):
+ * - When guest OS performs ACPI shutdown (via system_powerdown or guest-initiated)
+ * - QEMU automatically exits after guest completes shutdown sequence
+ * - No explicit 'quit' command needed
+ *
+ * This is the recommended behavior for production VMs as it ensures:
+ * 1. Clean resource cleanup by QEMU itself
+ * 2. Proper exit codes reflecting shutdown success/failure
+ * 3. No orphaned QEMU processes
+ *
+ * Reference: https://stackoverflow.com/questions/45026716/
+ */

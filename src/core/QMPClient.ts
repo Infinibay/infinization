@@ -242,12 +242,65 @@ export class QMPClient extends EventEmitter {
   }
 
   /**
-   * Sends a powerdown request to the guest OS
-   * This triggers a clean shutdown through ACPI
+   * Sends a powerdown request to the guest OS via ACPI.
+   *
+   * This is equivalent to pressing the power button on a physical machine.
+   * The guest OS will receive an ACPI event and initiate its normal shutdown
+   * sequence (running shutdown scripts, closing applications, etc.).
+   *
+   * ## ACPI Shutdown Flow
+   *
+   * 1. This command sends an ACPI power button event to the guest
+   * 2. Guest OS receives the event and runs its shutdown sequence
+   * 3. Guest flushes disk buffers, stops services, unmounts filesystems
+   * 4. Guest signals completion to QEMU
+   * 5. QEMU exits automatically (because we don't use -no-shutdown flag)
+   *
+   * ## Important Behavior
+   *
+   * - Returns immediately (does NOT wait for shutdown completion)
+   * - Guest may take seconds/minutes to complete shutdown
+   * - QEMU will automatically exit after guest completes shutdown
+   * - A SHUTDOWN event will be emitted via QMP when shutdown begins
+   *
+   * ## Why This Method is Preferred Over quit()
+   *
+   * This method is used by VMLifecycle.stop() for graceful shutdowns. The quit()
+   * method is intentionally NOT used because ACPI shutdowns allow guest OS to:
+   * - Flush disk buffers (prevents data loss)
+   * - Run shutdown scripts (graceful service termination)
+   * - Unmount filesystems cleanly (prevents corruption)
+   *
+   * After ACPI shutdown completes, QEMU exits automatically, making quit() redundant.
+   *
+   * @throws Error if QMP command fails or times out
+   *
+   * @see VMLifecycle.stop() for the complete shutdown flow
+   * @see EventHandler.terminateQEMUProcess() for shutdown event handling
+   * @see quit() for immediate termination (NOT recommended for normal use)
+   * @see https://qemu.weilnetz.de/doc/2.10/qemu-qmp-ref.html#system_powerdown
    */
   public async powerdown (): Promise<void> {
     await this.execute('system_powerdown')
   }
+
+  /**
+   * COMPARISON: powerdown() vs quit()
+   *
+   * ┌─────────────────┬──────────────────────────┬────────────────────────────┐
+   * │ Aspect          │ powerdown()              │ quit()                     │
+   * ├─────────────────┼──────────────────────────┼────────────────────────────┤
+   * │ Method          │ ACPI shutdown request    │ Immediate termination      │
+   * │ Guest OS        │ Runs shutdown scripts    │ No guest cooperation       │
+   * │ Data safety     │ Safe (guest flushes)     │ Risk of data loss          │
+   * │ QEMU exit       │ Automatic after guest    │ Immediate                  │
+   * │ Use case        │ Normal shutdown          │ Force kill / cleanup       │
+   * │ Recommended     │ ✓ Yes (default)          │ ✗ Only when necessary      │
+   * └─────────────────┴──────────────────────────┴────────────────────────────┘
+   *
+   * @see powerdown() for graceful ACPI shutdown
+   * @see quit() for immediate termination
+   */
 
   /**
    * Resets the VM (equivalent to pressing reset button)
@@ -272,6 +325,28 @@ export class QMPClient extends EventEmitter {
 
   /**
    * Terminates the QEMU process immediately by sending the QMP `quit` command.
+   *
+   * ## ⚠️ WARNING: This Method is NOT Used in Normal Operations
+   *
+   * This method exists for completeness and emergency scenarios but is intentionally
+   * NOT used in the standard VM shutdown flow. All shutdowns use powerdown() (ACPI)
+   * instead to allow the guest OS to shutdown gracefully.
+   *
+   * **Why quit() is not used:**
+   * 1. Causes immediate QEMU termination without guest cooperation
+   * 2. Risk of data loss (guest can't flush disk buffers)
+   * 3. Risk of filesystem corruption (no clean unmount)
+   * 4. After ACPI shutdown, QEMU exits automatically anyway (redundant)
+   * 5. Socket race conditions (may be unavailable during shutdown)
+   *
+   * **When quit() might be used (edge cases only):**
+   * - QEMU process is hung and not responding to ACPI
+   * - Emergency cleanup when graceful shutdown fails
+   * - Testing and debugging scenarios
+   *
+   * For normal VM shutdown, use:
+   * - VMLifecycle.stop() - handles entire graceful flow
+   * - powerdown() - sends ACPI shutdown signal
    *
    * ## Error Handling Contract
    *
@@ -303,6 +378,9 @@ export class QMPClient extends EventEmitter {
    *
    * @param options Optional configuration
    * @param options.ignoreErrors If true, suppresses ALL errors (default: false)
+   *
+   * @see powerdown() for graceful ACPI shutdown (PREFERRED)
+   * @see VMLifecycle.stop() for the complete shutdown flow
    */
   public async quit (options?: { ignoreErrors?: boolean }): Promise<void> {
     try {

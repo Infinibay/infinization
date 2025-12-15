@@ -1006,14 +1006,103 @@ export class VMLifecycle {
   }
 
   /**
-   * Stops a running VM.
+   * Stops a running VM using ACPI graceful shutdown.
    *
-   * Sends graceful shutdown via ACPI, waits for exit, force kills if timeout,
-   * cleans up TAP device and firewall, updates database.
+   * ## ACPI Shutdown Flow
+   *
+   * This method implements graceful VM shutdown using the ACPI powerdown mechanism:
+   *
+   * 1. **Host sends system_powerdown via QMP** - The `powerdown()` command sends an
+   *    ACPI power button press event to the guest OS
+   * 2. **Guest OS receives ACPI event** - The guest initiates its normal shutdown
+   *    sequence (running shutdown scripts, flushing buffers, closing applications)
+   * 3. **Guest completes shutdown** - After the guest finishes, it signals completion
+   * 4. **QEMU exits automatically** - Because our QEMU instances are NOT started with
+   *    the `-no-shutdown` flag, QEMU automatically exits when the guest shuts down
+   * 5. **VMLifecycle monitors process exit** - We poll the QEMU process status until
+   *    it exits or the timeout expires
+   * 6. **Force kill on timeout** - If the timeout expires and `force: true` (default),
+   *    we send SIGKILL to terminate QEMU immediately
+   * 7. **Resource cleanup** - Detach EventHandler, update DB, clear volatile config,
+   *    detach TAP from bridge, detach firewall jump rules, cleanup cgroup scopes
+   *
+   * ## Why quit() is Never Called
+   *
+   * The QMP `quit` command is intentionally NOT used during normal shutdown because:
+   *
+   * - **ACPI shutdowns are graceful**: The guest OS can flush disk buffers, close files,
+   *   run shutdown scripts (e.g., systemd services), and unmount filesystems safely
+   * - **quit() is immediate**: It terminates QEMU instantly without guest cooperation,
+   *   which can cause data loss or filesystem corruption
+   * - **QEMU auto-exits**: After ACPI shutdown completes, QEMU exits naturally since
+   *   we don't use the `-no-shutdown` flag - making `quit()` redundant
+   * - **Socket race condition**: By the time we'd call quit(), the QMP socket may
+   *   already be closed as QEMU is shutting down
+   *
+   * The `quit()` method exists in QMPClient for emergency scenarios but is not used
+   * in the standard shutdown flow.
+   *
+   * ## Guest-Initiated vs Host-Initiated Shutdowns
+   *
+   * **Host-initiated** (this method):
+   * - Triggered by user clicking PowerOff in UI, calling stopVM mutation
+   * - VMLifecycle.stop() handles entire flow including cleanup
+   * - Configurable timeout (default 30s, backend typically uses 120s)
+   *
+   * **Guest-initiated** (handled by EventHandler):
+   * - Triggered by user shutting down from inside the VM
+   * - EventHandler.terminateQEMUProcess() monitors exit and cleans up
+   * - Fixed 30s monitoring timeout (no force-kill, investigation warranted)
+   *
+   * Both flows produce identical QEMU behavior (ACPI shutdown → auto-exit) and
+   * perform the same resource cleanup. The EventHandler cleanup ensures VMs shut
+   * down cleanly even when the user initiates shutdown from inside the guest OS.
+   *
+   * ## Timeout Behavior
+   *
+   * The timeout applies to waiting for QEMU process exit after ACPI powerdown:
+   * - **Default**: 30 seconds (DEFAULT_STOP_TIMEOUT)
+   * - **Backend override**: Typically 120 seconds for user-initiated operations
+   * - **EventHandler monitoring**: Fixed 30 seconds for guest-initiated shutdowns
+   *
+   * If timeout expires and `force: true`:
+   * - SIGKILL is sent to QEMU process
+   * - VM is marked as stopped in database
+   * - Cleanup proceeds normally
+   * - Result includes `forced: true` flag
+   *
+   * ## PID Invariant
+   *
+   * **INVARIANT**: For running VMs, `qemuPid` must be present in the database.
+   * This method relies on the stored PID to terminate QEMU processes. If `qemuPid`
+   * is missing from the database but a QEMU process is actually running (stray process),
+   * `stop()` cannot terminate it since we have no way to identify which process belongs
+   * to this VM. Such stray processes may occur due to:
+   * - Incomplete cleanup after a crash
+   * - Database corruption or rollback
+   * - Manual process manipulation outside the system
+   *
+   * Use `getStatus()` to detect and diagnose PID/process inconsistencies.
    *
    * @param vmId - VM identifier
    * @param config - Stop configuration (default: graceful with 30s timeout and force)
    * @returns VMOperationResult indicating success or failure
+   *
+   * @see QMPClient.powerdown() for the ACPI shutdown command
+   * @see EventHandler.terminateQEMUProcess() for guest-initiated shutdown handling
+   * @see destroyResources() for permanent VM deletion with resource destruction
+   *
+   * @example
+   * ```typescript
+   * // Graceful shutdown with 2 minute timeout (recommended for user-facing operations)
+   * await lifecycle.stop(vmId, { graceful: true, timeout: 120000, force: true })
+   *
+   * // Quick shutdown for tests or automation
+   * await lifecycle.stop(vmId, { graceful: true, timeout: 5000, force: true })
+   *
+   * // Force kill without attempting graceful (emergency use only)
+   * await lifecycle.stop(vmId, { graceful: false, force: true })
+   * ```
    */
   async stop (vmId: string, config?: VMStopConfig): Promise<VMOperationResult> {
     const stopConfig: Required<VMStopConfig> = {
@@ -1049,6 +1138,12 @@ export class VMLifecycle {
       }
 
       // Check if already stopped
+      // NOTE: When !pid, we assume the VM is already off or in an inconsistent state where
+      // the PID was never recorded. We cannot detect or terminate stray QEMU processes
+      // without a known PID. If a QEMU process is actually running but the PID is missing
+      // from the database (due to crash, corruption, or manual intervention), this method
+      // will report success but the stray process will remain. Use getStatus() to detect
+      // such inconsistencies by checking for processes without corresponding DB PIDs.
       if (vmConfig.status === 'off') {
         if (!pid || !this.isProcessAlive(pid)) {
           return {
@@ -1096,14 +1191,19 @@ export class VMLifecycle {
             // Use existing connection
             this.debug.log('info', `Using existing QMP connection for VM ${vmId}`)
             try {
+              // ACPI powerdown - guest will shutdown gracefully, QEMU exits automatically
               await existingQmpClient.powerdown()
-              this.debug.log('info', `Sent system_powerdown (ACPI) to VM ${vmId} via existing connection`)
+              this.debug.log('info', `Sent system_powerdown (ACPI) to VM ${vmId} - waiting for guest OS to shutdown and QEMU to exit automatically`)
 
-              // Wait for process to exit
+              // Wait for natural QEMU exit (no quit command needed - see class documentation)
+              // QEMU will automatically exit when guest completes shutdown (no -no-shutdown flag).
+              // Timeout protects against hung guests or ACPI-unsupported OSes.
+              this.debug.log('info', `Waiting up to ${stopConfig.timeout}ms for QEMU process ${pid} to exit after ACPI shutdown`)
               const exited = await this.waitForProcessExit(pid, stopConfig.timeout)
 
               if (!exited && stopConfig.force) {
-                this.debug.log(`Graceful shutdown timed out, force killing VM: ${vmId}`)
+                // Timeout protection: guest may not support ACPI or be hung
+                this.debug.log('warn', `ACPI shutdown timed out after ${stopConfig.timeout}ms - guest may not support ACPI or is hung. Force killing VM ${vmId}`)
                 await this.forceKillProcess(pid)
                 forced = true
               }
@@ -1126,15 +1226,20 @@ export class VMLifecycle {
 
               try {
                 await qmpClient.connect()
+                // ACPI powerdown - guest will shutdown gracefully, QEMU exits automatically
                 this.debug.log('info', `QMP connected to ${qmpSocketPath}, sending system_powerdown (ACPI)`)
                 await qmpClient.powerdown()
-                this.debug.log(`Sent powerdown command to VM: ${vmId}`)
+                this.debug.log('info', `Sent system_powerdown (ACPI) to VM ${vmId} - waiting for guest OS to shutdown and QEMU to exit automatically`)
 
-                // Wait for process to exit
+                // Wait for natural QEMU exit (no quit command needed - see class documentation)
+                // QEMU will automatically exit when guest completes shutdown (no -no-shutdown flag).
+                // Timeout protects against hung guests or ACPI-unsupported OSes.
+                this.debug.log('info', `Waiting up to ${stopConfig.timeout}ms for QEMU process ${pid} to exit after ACPI shutdown`)
                 const exited = await this.waitForProcessExit(pid, stopConfig.timeout)
 
                 if (!exited && stopConfig.force) {
-                  this.debug.log(`Graceful shutdown timed out, force killing VM: ${vmId}`)
+                  // Timeout protection: guest may not support ACPI or be hung
+                  this.debug.log('warn', `ACPI shutdown timed out after ${stopConfig.timeout}ms - guest may not support ACPI or is hung. Force killing VM ${vmId}`)
                   await this.forceKillProcess(pid)
                   forced = true
                 }
@@ -1586,6 +1691,22 @@ export class VMLifecycle {
       // Determine consistency
       const dbSaysRunning = vmConfig.status === 'running'
       const consistent = dbSaysRunning === processAlive
+
+      // Warn about potential stray QEMU process: DB says VM is running but no PID is stored.
+      // This indicates the PID was never recorded or was lost (crash, corruption, manual intervention).
+      // A QEMU process may be running without our ability to track or terminate it via stop().
+      // This is a diagnostic aid - the system cannot automatically recover from this state.
+      if (dbSaysRunning && !pid) {
+        this.debug.log('warn', `VM ${vmId}: Database shows status='running' but no qemuPid stored. ` +
+          `A stray QEMU process may exist that cannot be tracked or terminated via stop(). ` +
+          `Manual intervention may be required (check for orphaned qemu-system-* processes).`)
+      }
+
+      // Warn about inconsistent state where DB says running but process is dead
+      if (!consistent && dbSaysRunning && pid && !processAlive) {
+        this.debug.log('warn', `VM ${vmId}: Database shows status='running' with PID ${pid} but process is not alive. ` +
+          `State inconsistency detected - VM may have crashed or been terminated externally.`)
+      }
 
       let qmpStatus: string | null = null
       let uptime: number | null = null

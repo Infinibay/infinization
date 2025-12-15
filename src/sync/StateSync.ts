@@ -258,6 +258,62 @@ export class StateSync {
   }
 
   /**
+   * Gets VM information needed for resource cleanup.
+   *
+   * This method retrieves the TAP device name and CPU pinning status
+   * which are needed during shutdown cleanup (either host-initiated via
+   * VMLifecycle.stop() or guest-initiated via EventHandler).
+   *
+   * @param vmId The VM identifier
+   * @returns Object with tapDeviceName and hasCpuPinning, or null if VM not found
+   */
+  public async getVMInfo (vmId: string): Promise<{
+    tapDeviceName: string | null
+    hasCpuPinning: boolean
+  } | null> {
+    this.debug.log(`getVMInfo: ${vmId}`)
+
+    // Search in running VMs to find the configuration
+    // This includes VMs that may still be in 'running' status during shutdown
+    const runningVMs = await this.db.findRunningVMs()
+    const vm = runningVMs.find(v => v.id === vmId)
+
+    if (!vm) {
+      this.debug.log('info', `VM ${vmId} not found in running VMs for info retrieval`)
+      return null
+    }
+
+    return {
+      tapDeviceName: vm.MachineConfiguration?.tapDeviceName ?? null,
+      // Note: cpuPinning info is not in the RunningVMRecord type, so we default to false
+      // The cleanup is best-effort anyway - orphaned cgroup scopes get cleaned up opportunistically
+      hasCpuPinning: false
+    }
+  }
+
+  /**
+   * Clears volatile machine configuration (qmpSocketPath, qemuPid).
+   *
+   * This method clears only the volatile configuration that changes each time
+   * the VM starts. The TAP device name is preserved for persistent TAP device
+   * reuse across stop/start cycles.
+   *
+   * Used during:
+   * - Normal VM stop via VMLifecycle.stop()
+   * - Guest-initiated shutdown cleanup via EventHandler
+   *
+   * @param vmId The VM identifier
+   * @throws Error if database operation fails
+   *
+   * @see PrismaAdapter.clearVolatileMachineConfiguration()
+   */
+  public async clearVolatileMachineConfiguration (vmId: string): Promise<void> {
+    this.debug.log(`clearVolatileMachineConfiguration: ${vmId}`)
+    await this.db.clearVolatileMachineConfiguration(vmId)
+    this.debug.log('info', `Volatile configuration cleared for VM ${vmId}`)
+  }
+
+  /**
    * Updates VM status directly without QMP query
    *
    * Use this when the new status is already known (e.g., from an event).
