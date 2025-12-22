@@ -248,18 +248,28 @@ export class PrismaAdapter implements DatabaseAdapter {
   /**
    * Update machine status.
    *
+   * Uses updateMany instead of update to be idempotent - if the machine
+   * doesn't exist (e.g., deleted during shutdown), the operation succeeds
+   * with no-op instead of throwing an error. This prevents race conditions
+   * during VM shutdown where multiple events may try to update a deleted machine.
+   *
    * @param id - Machine UUID
    * @param status - New status value
-   * @throws PrismaAdapterError if update fails
+   * @throws PrismaAdapterError if update fails (not for missing records)
    */
   async updateMachineStatus (id: string, status: string): Promise<void> {
     this.debug.log(`updateMachineStatus: ${id} -> ${status}`)
 
     try {
-      await this.prisma.machine.update({
+      const result = await this.prisma.machine.updateMany({
         where: { id },
         data: { status }
       })
+
+      if (result.count === 0) {
+        this.debug.log('warn', `Machine not found for status update: ${id} (may have been deleted)`)
+        return
+      }
 
       this.debug.log('info', `Status updated successfully: ${id} -> ${status}`)
     } catch (error) {

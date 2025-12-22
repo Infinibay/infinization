@@ -46,6 +46,14 @@ export class TapDeviceManager {
     const tapName = this.generateTapName(vmId)
     this.debug.log(`Creating TAP device: ${tapName} for VM: ${vmId}${bridge ? ` (bridge: ${bridge})` : ''}`)
 
+    // Proactively clean up any orphaned TAP devices before creating new ones
+    // This handles TAP devices left behind by crashed/killed QEMU processes
+    this.debug.log('Running orphaned TAP device cleanup before creation')
+    const cleanupStats = await this.cleanupOrphanedTapDevices()
+    if (cleanupStats.cleaned > 0) {
+      this.debug.log(`Cleaned ${cleanupStats.cleaned} orphaned TAP devices before creating ${tapName}`)
+    }
+
     // Check if device already exists (orphaned from previous run) and clean it up
     if (await this.exists(tapName)) {
       this.debug.log(`TAP device ${tapName} already exists (orphaned), cleaning up first`)
@@ -97,12 +105,12 @@ export class TapDeviceManager {
     try {
       // Bring interface up
       await this.executor.execute('ip', ['link', 'set', tapName, 'up'])
-      this.debug.log(`TAP device ${tapName} is now up`)
+      this.debug.log(`TAP device ${tapName} brought up successfully (checking carrier...)`)
 
       // Attach to bridge if specified
       if (bridge) {
         await this.executor.execute('ip', ['link', 'set', tapName, 'master', bridge])
-        this.debug.log(`TAP device ${tapName} attached to bridge ${bridge}`)
+        this.debug.log(`TAP device ${tapName} attached to bridge ${bridge} (waiting for QEMU connection...)`)
       }
     } catch (error) {
       const message = `Failed to configure TAP device ${tapName}: ${error instanceof Error ? error.message : String(error)}`
@@ -130,6 +138,7 @@ export class TapDeviceManager {
 
     // Bring device down first to release kernel resources
     await this.bringDown(tapName)
+    this.debug.log(`TAP device ${tapName} brought down, waiting ${POST_BRINGDOWN_DELAY_MS}ms for kernel cleanup`)
 
     // Wait for kernel to release resources after bringing down
     await sleep(POST_BRINGDOWN_DELAY_MS)
@@ -268,6 +277,187 @@ export class TapDeviceManager {
     } catch {
       this.debug.log(`TAP device ${tapName} does not exist`)
       return false
+    }
+  }
+
+  /**
+   * Checks if a TAP device has carrier (QEMU connected).
+   * A TAP device has carrier when QEMU has successfully attached to it.
+   * Without carrier (NO-CARRIER flag present), the VM has no network connectivity.
+   *
+   * @param tapName - The TAP device name to check
+   * @returns true if device has carrier, false otherwise
+   */
+  async hasCarrier (tapName: string): Promise<boolean> {
+    this.debug.log(`Checking carrier status for TAP device: ${tapName}`)
+
+    try {
+      const output = await this.executor.execute('ip', ['link', 'show', tapName])
+
+      // Parse the first line for interface flags
+      // Example outputs:
+      // "12: vnet-abc123: <NO-CARRIER,BROADCAST,MULTICAST,UP> ..." -> no carrier
+      // "12: vnet-abc123: <BROADCAST,MULTICAST,UP,LOWER_UP> ..." -> has carrier
+      const firstLine = output.split('\n')[0]
+
+      // Check for NO-CARRIER flag (indicates QEMU not connected)
+      if (firstLine.includes('NO-CARRIER')) {
+        this.debug.log(`TAP device ${tapName} has NO-CARRIER flag (QEMU not connected or disconnected)`)
+        return false
+      }
+
+      // Check for LOWER_UP which indicates carrier present and link layer is up
+      // Also check UP to ensure the interface is administratively up
+      const hasUp = firstLine.includes(',UP') || firstLine.includes('<UP')
+      const hasLowerUp = firstLine.includes('LOWER_UP')
+
+      if (hasUp && hasLowerUp) {
+        this.debug.log(`TAP device ${tapName} has carrier (QEMU connected, flags: UP,LOWER_UP)`)
+        return true
+      }
+
+      // UP but no LOWER_UP and no NO-CARRIER - ambiguous state, treat as no carrier
+      this.debug.log(`TAP device ${tapName} in ambiguous state - no LOWER_UP flag`)
+      return false
+    } catch (error) {
+      // Device doesn't exist or other error - treat as no carrier
+      this.debug.log(`Failed to check carrier for ${tapName}: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+  }
+
+  /**
+   * Lists all TAP devices in the system that match our naming convention.
+   * Scans the system for TAP/TUN devices with the TAP_NAME_PREFIX (vnet-).
+   *
+   * @returns Array of TAP device names found in the system
+   */
+  async listAllTapDevices (): Promise<string[]> {
+    this.debug.log(`Scanning system for TAP devices with prefix ${TAP_NAME_PREFIX}`)
+
+    try {
+      const output = await this.executor.execute('ip', ['link', 'show', 'type', 'tuntap'])
+
+      // Parse output to extract device names
+      // Each device line starts with: "index: device_name: <flags>..."
+      const deviceNames: string[] = []
+      const lines = output.split('\n')
+
+      for (const line of lines) {
+        // Match lines like: "12: vnet-abc123: <BROADCAST,MULTICAST,UP>"
+        const match = line.match(/^\d+:\s+([^:@]+)[@:]/)
+        if (match) {
+          const deviceName = match[1].trim()
+          // Only include devices with our prefix
+          if (deviceName.startsWith(TAP_NAME_PREFIX)) {
+            deviceNames.push(deviceName)
+          }
+        }
+      }
+
+      this.debug.log(`Found ${deviceNames.length} TAP devices: [${deviceNames.join(', ')}]`)
+      return deviceNames
+    } catch (error) {
+      // Return empty array if command fails (e.g., no tuntap devices exist)
+      this.debug.log(`Failed to list TAP devices: ${error instanceof Error ? error.message : String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * Determines if a TAP device is orphaned.
+   * A TAP device is considered orphaned if it:
+   * - Has the 'persist on' flag set (won't auto-cleanup)
+   * - Does NOT have carrier (QEMU not connected)
+   *
+   * @param tapName - The TAP device name to check
+   * @returns true if device is orphaned, false otherwise
+   */
+  async isOrphaned (tapName: string): Promise<boolean> {
+    this.debug.log(`Checking if ${tapName} is orphaned...`)
+
+    // Check if device exists
+    if (!await this.exists(tapName)) {
+      this.debug.log(`Device ${tapName} does not exist, not orphaned`)
+      return false
+    }
+
+    // Check carrier status
+    const hasCarrierStatus = await this.hasCarrier(tapName)
+    this.debug.log(`Device ${tapName} has carrier: ${hasCarrierStatus}`)
+
+    if (hasCarrierStatus) {
+      this.debug.log(`Device ${tapName} has carrier (active), not orphaned`)
+      return false
+    }
+
+    // Check for persist flag using detailed link info
+    try {
+      const output = await this.executor.execute('ip', ['-d', 'link', 'show', tapName])
+      const hasPersist = output.includes('persist on')
+      this.debug.log(`Device ${tapName} has persist flag: ${hasPersist}`)
+
+      if (hasPersist) {
+        this.debug.log(`Device ${tapName} is ORPHANED (persist on + no carrier)`)
+        return true
+      } else {
+        this.debug.log(`Device ${tapName} is not persistent, will auto-cleanup`)
+        return false
+      }
+    } catch (error) {
+      this.debug.log(`Failed to check persist flag for ${tapName}: ${error instanceof Error ? error.message : String(error)}`)
+      return false
+    }
+  }
+
+  /**
+   * Cleans up all orphaned TAP devices in the system.
+   * Scans for TAP devices with our prefix that have 'persist on' but no carrier,
+   * indicating they were left behind by crashed/killed QEMU processes.
+   *
+   * @returns Statistics about the cleanup operation
+   */
+  async cleanupOrphanedTapDevices (): Promise<{ total: number; cleaned: number; failed: number }> {
+    this.debug.log('Starting orphaned TAP device cleanup scan')
+
+    const stats = { total: 0, cleaned: 0, failed: 0 }
+    const tapDevices = await this.listAllTapDevices()
+    stats.total = tapDevices.length
+
+    if (tapDevices.length === 0) {
+      this.debug.log('No TAP devices found in system, nothing to clean')
+      return stats
+    }
+
+    for (const tapName of tapDevices) {
+      try {
+        if (await this.isOrphaned(tapName)) {
+          this.debug.log(`Cleaning orphaned TAP device: ${tapName}`)
+          await this.destroy(tapName)
+          stats.cleaned++
+          this.debug.log(`Successfully cleaned orphaned TAP device: ${tapName}`)
+        }
+      } catch (error) {
+        stats.failed++
+        this.debug.log('warn', `Failed to clean ${tapName}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    this.debug.log(`Orphaned TAP cleanup complete: ${stats.cleaned}/${stats.total} devices removed, ${stats.failed} failures`)
+    return stats
+  }
+
+  /**
+   * Gets the current state of a TAP device for diagnostic purposes.
+   * @param tapName - The TAP device name to check
+   * @returns The full output of `ip link show` for the device, or error message
+   */
+  async getDeviceState (tapName: string): Promise<string> {
+    try {
+      const output = await this.executor.execute('ip', ['link', 'show', tapName])
+      return output.trim()
+    } catch (error) {
+      return `Error: ${error instanceof Error ? error.message : String(error)}`
     }
   }
 

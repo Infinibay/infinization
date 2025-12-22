@@ -685,6 +685,8 @@ export class NftablesService {
 
     if (chainExists) {
       this.debug.log(`Base chain ${BASE_FORWARD_CHAIN} already exists`)
+      // Ensure DHCP rules exist even if chain already exists
+      await this.addDHCPAllowRules()
       return
     }
 
@@ -700,6 +702,80 @@ export class NftablesService {
     ])
 
     this.debug.log(`Base chain created: ${BASE_FORWARD_CHAIN}`)
+
+    // Add DHCP allow rules to ensure VMs can obtain IP addresses
+    await this.addDHCPAllowRules()
+  }
+
+  /**
+   * Adds rules to allow DHCP traffic in the bridge firewall.
+   * This is critical for VMs to obtain IP addresses from dnsmasq.
+   *
+   * DHCP uses UDP ports 67 (server) and 68 (client) with broadcast.
+   * The br_netfilter kernel module causes bridge traffic to pass through
+   * nftables, which can block DHCP if not explicitly allowed.
+   */
+  private async addDHCPAllowRules (): Promise<void> {
+    this.debug.log('Adding DHCP allow rules to forward chain')
+
+    // Check if DHCP rules already exist by listing the chain
+    try {
+      const chainOutput = await this.exec([
+        'list', 'chain',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        BASE_FORWARD_CHAIN
+      ])
+
+      // If rules already exist, skip adding them
+      if (chainOutput.includes('udp dport 67') && chainOutput.includes('udp dport 68')) {
+        this.debug.log('DHCP allow rules already exist, skipping')
+        return
+      }
+    } catch {
+      // Chain might not exist yet, continue with adding rules
+    }
+
+    try {
+      // Rule 1: Allow DHCP client -> server (DHCPDISCOVER, DHCPREQUEST)
+      // Clients send to UDP port 67, broadcasts from 0.0.0.0:68 to 255.255.255.255:67
+      await this.exec([
+        'insert', 'rule',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        BASE_FORWARD_CHAIN,
+        'udp', 'dport', '67', 'accept',
+        'comment', '"Allow DHCP client to server"'
+      ])
+      this.debug.log('Added DHCP client->server rule (UDP dport 67)')
+
+      // Rule 2: Allow DHCP server -> client (DHCPOFFER, DHCPACK)
+      // Server responds from port 67 to client port 68
+      await this.exec([
+        'insert', 'rule',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        BASE_FORWARD_CHAIN,
+        'udp', 'dport', '68', 'accept',
+        'comment', '"Allow DHCP server to client"'
+      ])
+      this.debug.log('Added DHCP server->client rule (UDP dport 68)')
+
+      // Rule 3: Allow broadcast traffic for DHCP discovery
+      // DHCP uses broadcast when client doesn't have an IP yet
+      await this.exec([
+        'insert', 'rule',
+        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        BASE_FORWARD_CHAIN,
+        'pkttype', 'broadcast', 'udp', 'dport', '67', 'accept',
+        'comment', '"Allow DHCP broadcast discovery"'
+      ])
+      this.debug.log('Added DHCP broadcast rule')
+
+      this.debug.log('DHCP allow rules added successfully')
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      // Log but don't throw - DHCP rules are best-effort
+      // If they fail, it might be because they already exist or nftables isn't available
+      this.debug.log('warn', `Failed to add DHCP allow rules: ${errorMessage}`)
+    }
   }
 
   /**

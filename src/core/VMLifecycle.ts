@@ -306,10 +306,13 @@ export class VMLifecycle {
       this.debug.log(`MAC address: ${macAddress}`)
 
       // 4. Create and configure TAP device
-      this.debug.log(`Creating TAP device for VM: ${vmId}`)
+      // Note: tapManager.create() proactively cleans up orphaned TAP devices (persist on + no carrier)
+      // before creating the new device, preventing network connectivity issues from stale devices
+      this.debug.log(`Preparing network resources for VM: ${vmId}`)
       const tapDevice = await this.tapManager.create(vmId, config.bridge)
       resources.tapDevice = tapDevice
       await this.tapManager.configure(tapDevice, config.bridge)
+      this.debug.log(`TAP device ${tapDevice} configured successfully for VM: ${vmId}`)
 
       // 5. Fetch and apply firewall rules
       this.debug.log(`Configuring firewall for VM: ${vmId}`)
@@ -459,7 +462,12 @@ export class VMLifecycle {
       }
       this.debug.log(`QEMU process started with PID: ${pid}`)
 
-      // 8a. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
+      // 8a. Verify TAP device connection (QEMU should have attached to the TAP device)
+      this.debug.log(`Verifying TAP device connection: ${tapDevice}`)
+      await this.verifyTapConnection(tapDevice, vmId, pid, config.bridge)
+      this.debug.log(`TAP device ${tapDevice} has carrier - QEMU connected successfully`)
+
+      // 8b. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
       if (config.cpuPinning && config.cpuPinning.length > 0) {
         this.debug.log(`Applying CPU pinning for VM ${vmId}: cores ${config.cpuPinning.join(',')}`)
         await this.cgroupsManager.applyCpuPinning(pid, config.cpuPinning)
@@ -810,14 +818,24 @@ export class VMLifecycle {
 
       if (existingTapDevice && await this.tapManager.exists(existingTapDevice)) {
         // Reuse existing TAP device - just reattach to bridge
-        this.debug.log(`Reusing persistent TAP device: ${existingTapDevice}`)
+        this.debug.log(`Reattaching TAP device ${existingTapDevice} for VM: ${vmId}`)
+
+        // Check if TAP already has carrier (unexpected in start - could indicate stale QEMU)
+        const hasCarrierBefore = await this.tapManager.hasCarrier(existingTapDevice)
+        if (hasCarrierBefore) {
+          this.debug.log('warn', `TAP device ${existingTapDevice} already has carrier, possible stale QEMU process`)
+        }
+
         tapDevice = existingTapDevice
         await this.tapManager.attachToBridge(tapDevice, bridge)
+        this.debug.log(`TAP device ${tapDevice} reattached to bridge ${bridge}`)
       } else {
         // Create new TAP device (first start or after host reboot)
+        // Note: tapManager.create() proactively cleans up orphaned TAP devices
         this.debug.log(`Creating new TAP device for VM: ${vmId}`)
         tapDevice = await this.tapManager.create(vmId, bridge)
         await this.tapManager.configure(tapDevice, bridge)
+        this.debug.log(`TAP device ${tapDevice} created and configured for VM: ${vmId}`)
 
         // Store TAP device name for persistence across stop/start cycles
         await this.prisma.updateMachineConfiguration(vmId, { tapDeviceName: tapDevice })
@@ -931,7 +949,12 @@ export class VMLifecycle {
       }
       this.debug.log(`QEMU process started with PID: ${pid}`)
 
-      // 14a. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
+      // 14a. Verify TAP device connection (QEMU should have attached to the TAP device)
+      this.debug.log(`Verifying TAP device connection: ${tapDevice}`)
+      await this.verifyTapConnection(tapDevice, vmId, pid, bridge)
+      this.debug.log(`TAP device ${tapDevice} has carrier - QEMU connected successfully`)
+
+      // 14b. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
       if (vmConfig.configuration?.cpuPinning?.cores && vmConfig.configuration.cpuPinning.cores.length > 0) {
         this.debug.log(`Applying CPU pinning for VM ${vmId}: cores ${vmConfig.configuration.cpuPinning.cores.join(',')}`)
         await this.cgroupsManager.applyCpuPinning(pid, vmConfig.configuration.cpuPinning.cores)
@@ -2822,5 +2845,80 @@ export class VMLifecycle {
    */
   private sleep (ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  /**
+   * Verifies that QEMU successfully connected to the TAP device.
+   * Checks carrier state with retries to allow time for QEMU to attach.
+   *
+   * When QEMU starts with a TAP device, it should open the TAP file descriptor
+   * which brings the carrier up. If the TAP remains in NO-CARRIER state,
+   * it indicates QEMU failed to connect (permissions issue, config mismatch, etc.).
+   *
+   * @param tapDevice - TAP device name to verify
+   * @param vmId - VM identifier for error context
+   * @param pid - QEMU process PID for diagnostics
+   * @param bridge - Bridge name for diagnostics
+   * @throws LifecycleError if TAP has no carrier after timeout
+   */
+  private async verifyTapConnection (
+    tapDevice: string,
+    vmId: string,
+    pid: number,
+    bridge: string
+  ): Promise<void> {
+    const MAX_RETRIES = 10
+    const RETRY_DELAY_MS = 500 // Total timeout: 5 seconds
+
+    this.debug.log(`Verifying TAP device connection for ${tapDevice} (VM: ${vmId})`)
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      const hasCarrier = await this.tapManager.hasCarrier(tapDevice)
+
+      if (hasCarrier) {
+        this.debug.log(`TAP device ${tapDevice} has carrier - QEMU connected successfully (attempt ${attempt}/${MAX_RETRIES})`)
+        return
+      }
+
+      if (attempt < MAX_RETRIES) {
+        this.debug.log(`TAP device ${tapDevice} has no carrier yet, retrying in ${RETRY_DELAY_MS}ms (attempt ${attempt}/${MAX_RETRIES})`)
+        await this.sleep(RETRY_DELAY_MS)
+      }
+    }
+
+    // Verification failed - collect diagnostic information
+    this.debug.log('error', `TAP device ${tapDevice} has no carrier after ${MAX_RETRIES} retries`)
+
+    // Get TAP device state for diagnostics
+    const tapState = await this.tapManager.getDeviceState(tapDevice)
+
+    // Get bridge state for diagnostics (reuse tapManager.getDeviceState which uses safe command execution)
+    const bridgeState = await this.tapManager.getDeviceState(bridge)
+
+    // Check if QEMU process is still alive
+    const processAlive = this.isProcessAlive(pid)
+
+    const errorMessage = [
+      `QEMU failed to connect to TAP device ${tapDevice}.`,
+      'The TAP device has no carrier, indicating QEMU did not attach to it.',
+      'This may be caused by:',
+      '  (1) QEMU permissions issue accessing /dev/net/tun',
+      '  (2) TAP device configuration error',
+      '  (3) QEMU network configuration mismatch',
+      '',
+      `Diagnostics:`,
+      `  - TAP Device: ${tapDevice}`,
+      `  - Bridge: ${bridge}`,
+      `  - QEMU PID: ${pid}`,
+      `  - Process Alive: ${processAlive}`,
+      `  - TAP State: ${tapState}`,
+      `  - Bridge State: ${bridgeState}`
+    ].join('\n')
+
+    throw new LifecycleError(
+      LifecycleErrorCode.NETWORK_ERROR,
+      errorMessage,
+      vmId
+    )
   }
 }
