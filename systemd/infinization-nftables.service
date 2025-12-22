@@ -1,6 +1,6 @@
 [Unit]
-Description=Infinivirt nftables Firewall Rules
-Documentation=https://github.com/infinibay/infinivirt
+Description=Infinization nftables Firewall Rules
+Documentation=https://github.com/infinibay/infinization
 After=network.target nftables.service
 Before=infinibay.service
 Wants=network.target
@@ -10,10 +10,10 @@ Type=oneshot
 RemainAfterExit=yes
 
 # Load persistent firewall rules on boot
-ExecStart=/usr/sbin/nft -f /etc/infinivirt/nftables/infinivirt.nft
+ExecStart=/usr/sbin/nft -f /etc/infinization/nftables/infinization.nft
 
-# Clear infinivirt table on stop (optional - leaves rules in place by default)
-# ExecStop=/usr/sbin/nft delete table bridge infinivirt
+# Clear infinization table on stop (optional - leaves rules in place by default)
+# ExecStop=/usr/sbin/nft delete table bridge infinization
 
 # Retry configuration
 Restart=on-failure
@@ -24,7 +24,7 @@ ProtectSystem=strict
 ProtectHome=yes
 NoNewPrivileges=no
 PrivateTmp=yes
-ReadOnlyPaths=/etc/infinivirt/nftables
+ReadOnlyPaths=/etc/infinization/nftables
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]

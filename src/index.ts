@@ -3,7 +3,7 @@ export { QemuCommandBuilder, QemuCommand, QemuCommandWithPinning } from './core/
 export { QemuProcess } from './core/QemuProcess'
 export { QMPClient } from './core/QMPClient'
 export { VMLifecycle } from './core/VMLifecycle'
-export { Infinivirt } from './core/Infinivirt'
+export { Infinization } from './core/Infinization'
 
 // CPU classes
 export {
@@ -119,8 +119,8 @@ export {
   NftablesError,
   ChainListResult,
   FirewallApplyResult,
-  INFINIVIRT_TABLE_NAME,
-  INFINIVIRT_TABLE_FAMILY,
+  INFINIZATION_TABLE_NAME,
+  INFINIZATION_TABLE_FAMILY,
   DEFAULT_CHAIN_PRIORITY,
   NFTABLES_COMMENT_PREFIX,
   SUPPORTED_PROTOCOLS,
@@ -245,8 +245,8 @@ export {
   RESTART_DELAY_MS,
   PROCESS_EXIT_POLL_INTERVAL,
   RUNTIME_DISK_SIZE_PLACEHOLDER_GB,
-  // Infinivirt config
-  InfinivirtConfig,
+  // Infinization config
+  InfinizationConfig,
   EventManagerLike,
   ActiveVMResources,
   // Helper functions
@@ -324,7 +324,7 @@ export {
   VMFirewallConfig as ConfigVMFirewallConfig,
   FirewallRuleInput as ConfigFirewallRuleInput,
   // Re-exported from lifecycle.types
-  InfinivirtConfig as ConfigInfinivirtConfig,
+  InfinizationConfig as ConfigInfinizationConfig,
   // Re-exported from sync.types
   HealthMonitorConfig as ConfigHealthMonitorConfig,
   EventHandlerConfig as ConfigEventHandlerConfig,

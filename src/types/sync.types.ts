@@ -151,7 +151,7 @@ export interface HealthMonitorConfig {
   checkIntervalMs: number
   /** Whether to cleanup resources for crashed VMs (default: true) */
   enableCleanup: boolean
-  /** Directory where pidfiles are stored (default: /var/run/infinivirt/pids) */
+  /** Directory where pidfiles are stored (default: /var/run/infinization/pids) */
   pidfileDir?: string
   /** Optional callback when a crash is detected */
   onCrashDetected?: (vmId: string) => Promise<void>

@@ -1,6 +1,6 @@
-# QEMU Options Reference para Infinivirt
+# QEMU Options Reference para Infinization
 
-Este documento detalla las opciones de QEMU relevantes para implementar Infinivirt, basado en el análisis del código actual de Infinibay y las capacidades de QEMU.
+Este documento detalla las opciones de QEMU relevantes para implementar Infinization, basado en el análisis del código actual de Infinibay y las capacidades de QEMU.
 
 ## Mapeo: Funcionalidad Actual → Opciones QEMU
 
@@ -26,7 +26,7 @@ Este documento detalla las opciones de QEMU relevantes para implementar Infinivi
 taskset -c 0-3 qemu-system-x86_64 ...
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Usar siempre `-cpu host` con KVM para máximo rendimiento
 - CPU pinning debe implementarse externamente (cgroups v2)
 - Las estrategias BasicStrategy/HybridRandomStrategy del backend se traducen a configuración de cgroups
@@ -55,7 +55,7 @@ taskset -c 0-3 qemu-system-x86_64 ...
 -device virtio-balloon-pci,id=balloon0
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Para VMs de producción: memoria fija sin hotplug (más simple)
 - Balloon device útil para overcommit de memoria del host
 - `maxmem` debe estar alineado a page size del host
@@ -104,7 +104,7 @@ taskset -c 0-3 qemu-system-x86_64 ...
 -drive file=disk.qcow2,discard=unmap
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Usar qcow2 para snapshots y thin provisioning
 - virtio-blk para máximo rendimiento
 - virtio-scsi si se necesita TRIM/discard
@@ -147,7 +147,7 @@ taskset -c 0-3 qemu-system-x86_64 ...
 -device virtio-net-pci,netdev=net0,mq=on,vectors=10
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - TAP devices requieren crear/configurar manualmente (ip tuntap add)
 - Bridge debe existir previamente
 - MAC address debe ser única y en rango QEMU (52:54:00:xx:xx:xx)
@@ -192,7 +192,7 @@ taskset -c 0-3 qemu-system-x86_64 ...
 -chardev spicevmc,id=spicechannel0,name=vdagent
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - SPICE preferido para Linux guests
 - VNC para compatibilidad universal
 - Password limitado a 8 caracteres (inseguro para redes públicas)
@@ -225,7 +225,7 @@ taskset -c 0-3 qemu-system-x86_64 ...
 
 # UEFI con vars persistentes (recomendado)
 -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd
--drive if=pflash,format=raw,file=/var/lib/infinivirt/vm-123/OVMF_VARS.fd
+-drive if=pflash,format=raw,file=/var/lib/infinization/vm-123/OVMF_VARS.fd
 ```
 
 **Instalación de OVMF:**
@@ -237,7 +237,7 @@ apt install ovmf
 dnf install edk2-ovmf
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Windows 11 requiere UEFI + Secure Boot
 - Linux moderno funciona con ambos
 - OVMF_VARS debe ser copia por VM (no compartir)
@@ -267,7 +267,7 @@ dnf install edk2-ovmf
 -drive file=drivers.iso,index=1,media=cdrom
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Generar ISO personalizado para unattended install (como hace el backend actual)
 - Remover CD-ROM después de instalación (via QMP)
 
@@ -292,7 +292,7 @@ dnf install edk2-ovmf
 -machine q35,accel=kvm,kernel-irqchip=split
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Q35 para VMs modernas (PCIe, USB 3.0)
 - i440FX si hay problemas de compatibilidad
 
@@ -334,7 +334,7 @@ modprobe vfio-pci
 echo "10de 1b80" > /sys/bus/pci/drivers/vfio-pci/new_id
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - GPU passthrough requiere configuración del host (IOMMU groups)
 - El backend actual ya valida pciBus en createMachine
 
@@ -362,7 +362,7 @@ cat /dev/kvm
 kvm-ok
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - SIEMPRE usar KVM si está disponible
 - Sin KVM, rendimiento es ~10x menor
 
@@ -373,7 +373,7 @@ kvm-ok
 **Habilitar QMP:**
 ```bash
 # Unix socket (recomendado)
--qmp unix:/var/run/infinivirt/vm-123.sock,server,nowait
+-qmp unix:/var/run/infinization/vm-123.sock,server,nowait
 
 # TCP (menos seguro)
 -qmp tcp:localhost:4444,server,nowait
@@ -423,7 +423,7 @@ kvm-ok
 { "execute": "device_add", "arguments": { "driver": "virtio-blk-pci", "drive": "file1" } }
 ```
 
-**Consideraciones para Infinivirt:**
+**Consideraciones para Infinization:**
 - Unix socket es más seguro que TCP
 - Siempre ejecutar `qmp_capabilities` primero
 - Usar para monitoreo, snapshots, hot-plug
@@ -447,13 +447,13 @@ qemu-system-x86_64 \
 
   # UEFI firmware
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \
-  -drive if=pflash,format=raw,file=/var/lib/infinivirt/vms/vm-123/OVMF_VARS.fd \
+  -drive if=pflash,format=raw,file=/var/lib/infinization/vms/vm-123/OVMF_VARS.fd \
 
   # Disco principal
-  -drive file=/var/lib/infinivirt/vms/vm-123/disk.qcow2,format=qcow2,if=virtio,cache=writeback \
+  -drive file=/var/lib/infinization/vms/vm-123/disk.qcow2,format=qcow2,if=virtio,cache=writeback \
 
   # CD-ROM para instalación
-  -drive file=/tmp/infinivirt/vm-123/install.iso,media=cdrom \
+  -drive file=/tmp/infinization/vm-123/install.iso,media=cdrom \
 
   # Red
   -netdev tap,id=net0,ifname=vnet-vm123,script=no,downscript=no \
@@ -467,13 +467,13 @@ qemu-system-x86_64 \
   -chardev spicevmc,id=spicechannel0,name=vdagent \
 
   # QMP socket
-  -qmp unix:/var/run/infinivirt/vm-123.sock,server,nowait \
+  -qmp unix:/var/run/infinization/vm-123.sock,server,nowait \
 
   # Misc
   -name vm-123 \
   -uuid 550e8400-e29b-41d4-a716-446655440000 \
   -daemonize \
-  -pidfile /var/run/infinivirt/vm-123.pid
+  -pidfile /var/run/infinization/vm-123.pid
 ```
 
 ---
@@ -493,7 +493,7 @@ qemu-system-x86_64 \
 
 ---
 
-## Siguientes Pasos para Infinivirt
+## Siguientes Pasos para Infinization
 
 1. **Networking**: Implementar creación/destrucción de TAP devices
 2. **Storage**: Crear/redimensionar imágenes qcow2 con qemu-img

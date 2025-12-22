@@ -2,7 +2,7 @@
  * Lifecycle Type Definitions
  *
  * This file contains TypeScript types for VM lifecycle operations.
- * Used by VMLifecycle and Infinivirt classes for VM creation, management, and status queries.
+ * Used by VMLifecycle and Infinization classes for VM creation, management, and status queries.
  */
 
 import { UnattendedInstallConfig } from './unattended.types'
@@ -288,7 +288,7 @@ export interface VMCreateConfig {
    * - swtpm_setup for initializing TPM state
    * - Socket created before VM start
    *
-   * @example '/var/run/infinivirt/tpm/vm-abc123.sock'
+   * @example '/var/run/infinization/tpm/vm-abc123.sock'
    */
   tpmSocketPath?: string
 
@@ -305,7 +305,7 @@ export interface VMCreateConfig {
    * - qemu-guest-agent package installed in the VM
    * - Guest agent service running
    *
-   * @example '/var/run/infinivirt/ga/vm-abc123.sock'
+   * @example '/var/run/infinization/ga/vm-abc123.sock'
    */
   guestAgentSocketPath?: string
 
@@ -321,7 +321,7 @@ export interface VMCreateConfig {
    * **Guest Requirements:**
    * - InfiniService agent installed in the VM
    *
-   * @example '/var/run/infinivirt/infini/vm-abc123.sock'
+   * @example '/var/run/infinization/infini/vm-abc123.sock'
    */
   infiniServiceSocketPath?: string
 
@@ -335,7 +335,7 @@ export interface VMCreateConfig {
    * - https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/
    * - /usr/share/virtio-win/virtio-win.iso (packaged)
    *
-   * @example '/var/lib/infinivirt/isos/virtio-win.iso'
+   * @example '/var/lib/infinization/isos/virtio-win.iso'
    */
   virtioDriversIso?: string
 
@@ -576,13 +576,13 @@ export const DEFAULT_BOOT_TIMEOUT = 60000
 export const DEFAULT_QMP_CONNECT_TIMEOUT = 5000
 
 /** Default directory for QMP sockets */
-export const DEFAULT_QMP_SOCKET_DIR = '/var/run/infinivirt'
+export const DEFAULT_QMP_SOCKET_DIR = '/var/run/infinization'
 
 /** Default directory for disk images */
-export const DEFAULT_DISK_DIR = '/var/lib/infinivirt/disks'
+export const DEFAULT_DISK_DIR = '/var/lib/infinization/disks'
 
 /** Default directory for PID files */
-export const DEFAULT_PIDFILE_DIR = '/var/run/infinivirt/pids'
+export const DEFAULT_PIDFILE_DIR = '/var/run/infinization/pids'
 
 /** Default network model for VMs */
 export const DEFAULT_NETWORK_MODEL = 'virtio-net-pci'
@@ -611,19 +611,19 @@ export const PROCESS_EXIT_POLL_INTERVAL = 100
 export const RUNTIME_DISK_SIZE_PLACEHOLDER_GB = 1
 
 // =============================================================================
-// Infinivirt Configuration Types
+// Infinization Configuration Types
 // =============================================================================
 
 /**
- * Configuration for Infinivirt main class.
+ * Configuration for Infinization main class.
  *
  * Note: Pass your application's PrismaClient singleton for connection pooling.
- * Infinivirt does not create or manage its own Prisma instance.
+ * Infinization does not create or manage its own Prisma instance.
  */
-export interface InfinivirtConfig {
+export interface InfinizationConfig {
   /**
    * Pre-configured Prisma client instance.
-   * Required - infinivirt does not create its own Prisma client.
+   * Required - infinization does not create its own Prisma client.
    * Pass your application's singleton for shared connection pooling.
    */
   prismaClient: unknown
@@ -643,7 +643,7 @@ export interface InfinivirtConfig {
 
 /**
  * Minimal interface for backend EventManager integration.
- * Allows infinivirt to emit events to the backend without direct dependency.
+ * Allows infinization to emit events to the backend without direct dependency.
  */
 export interface EventManagerLike {
   /** Emit a CRUD event for a resource */

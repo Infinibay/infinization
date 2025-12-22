@@ -87,16 +87,16 @@ export enum NftablesErrorCode {
 // ============================================================================
 
 /** Name of the nftables table for all VM firewall rules */
-export const INFINIVIRT_TABLE_NAME = 'infinivirt'
+export const INFINIZATION_TABLE_NAME = 'infinization'
 
 /** Address family used for VM firewall rules (bridge for Layer 2 filtering) */
-export const INFINIVIRT_TABLE_FAMILY = NftablesFamily.BRIDGE
+export const INFINIZATION_TABLE_FAMILY = NftablesFamily.BRIDGE
 
 /** Default priority for base chains (lower = higher priority in nftables) */
 export const DEFAULT_CHAIN_PRIORITY = 0
 
 /** Prefix for comments in nftables rules (for identification) */
-export const NFTABLES_COMMENT_PREFIX = 'infinivirt'
+export const NFTABLES_COMMENT_PREFIX = 'infinization'
 
 /** Supported protocols for firewall rules */
 export const SUPPORTED_PROTOCOLS = ['tcp', 'udp', 'icmp', 'all'] as const
@@ -145,12 +145,12 @@ export function generateVMChainName (vmId: string): string {
  *
  * @example
  * const tableConfig: NftablesTableConfig = {
- *   name: 'infinivirt',
+ *   name: 'infinization',
  *   family: NftablesFamily.BRIDGE
  * }
  */
 export interface NftablesTableConfig {
-  /** Table name (e.g., "infinivirt") */
+  /** Table name (e.g., "infinization") */
   name: string
   /** Address family (use BRIDGE for VM filtering) */
   family: NftablesFamily
@@ -162,7 +162,7 @@ export interface NftablesTableConfig {
  * @example
  * const chainConfig: NftablesChainConfig = {
  *   name: 'forward',
- *   table: 'infinivirt',
+ *   table: 'infinization',
  *   family: NftablesFamily.BRIDGE,
  *   hook: NftablesHookType.FORWARD,
  *   priority: 0,
@@ -190,7 +190,7 @@ export interface NftablesChainConfig {
  * @example
  * const ruleConfig: NftablesRuleConfig = {
  *   chain: 'vm_abc123',
- *   table: 'infinivirt',
+ *   table: 'infinization',
  *   family: NftablesFamily.BRIDGE,
  *   expression: 'ip protocol tcp tcp dport 443 accept'
  * }

@@ -1,14 +1,14 @@
 /**
  * Prisma Database Adapter
  *
- * This class provides a bridge between infinivirt and the PostgreSQL database via Prisma ORM.
+ * This class provides a bridge between infinization and the PostgreSQL database via Prisma ORM.
  * It implements the DatabaseAdapter interface from sync.types.ts for compatibility with
  * StateSync, EventHandler, and HealthMonitor classes.
  *
  * @example
  * ```typescript
  * import { PrismaClient } from '@prisma/client'
- * import { PrismaAdapter } from '@infinibay/infinivirt'
+ * import { PrismaAdapter } from '@infinibay/infinization'
  *
  * const prisma = new PrismaClient()
  * const adapter = new PrismaAdapter(prisma)

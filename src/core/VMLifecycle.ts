@@ -2482,7 +2482,7 @@ export class VMLifecycle {
     if (config.gpuPciAddress) {
       // Validate ROM file path early to provide clear error message
       if (config.gpuRomfile) {
-        const ALLOWED_ROM_DIR = '/var/lib/infinivirt/roms/'
+        const ALLOWED_ROM_DIR = '/var/lib/infinization/roms/'
         const normalizedRomPath = path.resolve(config.gpuRomfile)
         if (!normalizedRomPath.startsWith(ALLOWED_ROM_DIR)) {
           throw new LifecycleError(

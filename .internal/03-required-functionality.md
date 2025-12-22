@@ -1,6 +1,6 @@
-# Funcionalidades Requeridas para Infinivirt
+# Funcionalidades Requeridas para Infinization
 
-Este documento lista todas las funcionalidades que Infinivirt necesita implementar, basado en el análisis del código actual de Infinibay.
+Este documento lista todas las funcionalidades que Infinization necesita implementar, basado en el análisis del código actual de Infinibay.
 
 ## 1. Gestión del Ciclo de Vida de VMs
 
@@ -366,7 +366,7 @@ interface InstallConfig {
 
 ```typescript
 interface QMPConnection {
-  socketPath: string  // /var/run/infinivirt/vm-123.sock
+  socketPath: string  // /var/run/infinization/vm-123.sock
   connect(): Promise<void>
   disconnect(): Promise<void>
   execute(command: string, args?: object): Promise<any>
@@ -530,12 +530,12 @@ qemu-img snapshot -d snap1 disk.qcow2     # Eliminar
 
 ---
 
-## 10. Módulos de Infinivirt
+## 10. Módulos de Infinization
 
 ### Arquitectura propuesta
 
 ```
-infinivirt/
+infinization/
 ├── src/
 │   ├── core/
 │   │   ├── QemuProcess.ts      # Spawn y manage QEMU process

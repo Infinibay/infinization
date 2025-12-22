@@ -37,8 +37,8 @@ import {
   NftablesErrorCode,
   NftablesError,
   NftablesRuleTokens,
-  INFINIVIRT_TABLE_NAME,
-  INFINIVIRT_TABLE_FAMILY,
+  INFINIZATION_TABLE_NAME,
+  INFINIZATION_TABLE_FAMILY,
   DEFAULT_CHAIN_PRIORITY,
   generateVMChainName
 } from '../types/firewall.types'
@@ -79,7 +79,7 @@ export class NftablesService {
 
   /**
    * Initializes the nftables infrastructure for VM firewall management.
-   * Creates the infinivirt table and base forward chain if they don't exist.
+   * Creates the infinization table and base forward chain if they don't exist.
    *
    * @throws Error if initialization fails (except for already-exists errors)
    */
@@ -117,7 +117,7 @@ export class NftablesService {
         // Create the VM chain (regular chain, no hook)
         await this.exec([
           'add', 'chain',
-          INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+          INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
           chainName
         ])
         this.debug.log(`VM chain created: ${chainName}`)
@@ -267,7 +267,7 @@ export class NftablesService {
       // Step 1b: Verify jump rules were actually removed
       const verifyOutput = await this.exec([
         '-a', 'list', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN
       ])
 
@@ -294,7 +294,7 @@ export class NftablesService {
       // Step 4: Flush all rules in the chain first (required before deletion)
       await this.exec([
         'flush', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         chainName
       ])
 
@@ -306,7 +306,7 @@ export class NftablesService {
         async () => {
           await this.exec([
             'delete', 'chain',
-            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
             chainName
           ])
         },
@@ -344,7 +344,7 @@ export class NftablesService {
           // List all rules in forward chain and manually delete any remaining jumps
           const output = await this.exec([
             '-a', 'list', 'chain',
-            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
             BASE_FORWARD_CHAIN
           ])
 
@@ -355,7 +355,7 @@ export class NftablesService {
             this.debug.log(`Manually removing orphaned jump rule handle ${handle}`)
             await this.exec([
               'delete', 'rule',
-              INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+              INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
               BASE_FORWARD_CHAIN,
               'handle', handle
             ])
@@ -365,7 +365,7 @@ export class NftablesService {
           await sleep(1000)
           await this.exec([
             'delete', 'chain',
-            INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+            INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
             chainName
           ])
 
@@ -395,7 +395,7 @@ export class NftablesService {
     try {
       await this.exec([
         'flush', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         chainName
       ])
       this.debug.log(`Rules flushed from chain: ${chainName}`)
@@ -415,22 +415,22 @@ export class NftablesService {
   }
 
   /**
-   * Lists all chains in the infinivirt table.
+   * Lists all chains in the infinization table.
    * Useful for debugging and health checks.
    *
    * @returns Array of chain names
    */
   async listChains (): Promise<string[]> {
-    this.debug.log('Listing chains in infinivirt table')
+    this.debug.log('Listing chains in infinization table')
 
     try {
       const output = await this.exec([
         'list', 'chains',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
       ])
 
       // Parse output to extract chain names
-      // Format: table bridge infinivirt { chain forward { ... } chain vm_abc { ... } }
+      // Format: table bridge infinization { chain forward { ... } chain vm_abc { ... } }
       const chainRegex = /chain\s+(\w+)\s*\{/g
       const chains: string[] = []
       let match
@@ -457,7 +457,7 @@ export class NftablesService {
   }
 
   /**
-   * Checks if a chain exists in the infinivirt table.
+   * Checks if a chain exists in the infinization table.
    *
    * @param chainName - Chain name to check
    * @returns true if chain exists
@@ -468,7 +468,7 @@ export class NftablesService {
     try {
       await this.exec([
         'list', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         chainName
       ])
       this.debug.log(`Chain ${chainName} exists`)
@@ -507,7 +507,7 @@ export class NftablesService {
       // Create the VM chain (regular chain, no hook)
       await this.exec([
         'add', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         chainName
       ])
       this.debug.log(`VM chain created: ${chainName}`)
@@ -659,21 +659,21 @@ export class NftablesService {
   }
 
   /**
-   * Creates the infinivirt table if it doesn't already exist.
+   * Creates the infinization table if it doesn't already exist.
    */
   private async createTableIfNotExists (): Promise<void> {
     try {
       // Try to list the table - if it exists, we're done
-      await this.exec(['list', 'table', INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME])
-      this.debug.log(`Table ${INFINIVIRT_TABLE_FAMILY} ${INFINIVIRT_TABLE_NAME} already exists`)
+      await this.exec(['list', 'table', INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME])
+      this.debug.log(`Table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} already exists`)
     } catch {
       // Table doesn't exist, create it
-      this.debug.log(`Creating table ${INFINIVIRT_TABLE_FAMILY} ${INFINIVIRT_TABLE_NAME}`)
+      this.debug.log(`Creating table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
       await this.exec([
         'add', 'table',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
       ])
-      this.debug.log(`Table created: ${INFINIVIRT_TABLE_FAMILY} ${INFINIVIRT_TABLE_NAME}`)
+      this.debug.log(`Table created: ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
     }
   }
 
@@ -696,7 +696,7 @@ export class NftablesService {
     // The chain definition includes: type filter, hook forward, priority 0
     await this.exec([
       'add', 'chain',
-      INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
       BASE_FORWARD_CHAIN,
       '{ type filter hook forward priority ' + DEFAULT_CHAIN_PRIORITY + '; policy accept; }'
     ])
@@ -722,7 +722,7 @@ export class NftablesService {
     try {
       const chainOutput = await this.exec([
         'list', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN
       ])
 
@@ -740,7 +740,7 @@ export class NftablesService {
       // Clients send to UDP port 67, broadcasts from 0.0.0.0:68 to 255.255.255.255:67
       await this.exec([
         'insert', 'rule',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN,
         'udp', 'dport', '67', 'accept',
         'comment', '"Allow DHCP client to server"'
@@ -751,7 +751,7 @@ export class NftablesService {
       // Server responds from port 67 to client port 68
       await this.exec([
         'insert', 'rule',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN,
         'udp', 'dport', '68', 'accept',
         'comment', '"Allow DHCP server to client"'
@@ -762,7 +762,7 @@ export class NftablesService {
       // DHCP uses broadcast when client doesn't have an IP yet
       await this.exec([
         'insert', 'rule',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN,
         'pkttype', 'broadcast', 'udp', 'dport', '67', 'accept',
         'comment', '"Allow DHCP broadcast discovery"'
@@ -818,7 +818,7 @@ export class NftablesService {
       // Get current rules in the forward chain
       const output = await this.exec([
         '-a', 'list', 'chain',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN
       ])
 
@@ -838,7 +838,7 @@ export class NftablesService {
 
         await this.exec([
           'delete', 'rule',
-          INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+          INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
           BASE_FORWARD_CHAIN,
           'handle', handle
         ])
@@ -869,7 +869,7 @@ export class NftablesService {
   private async addRuleTokens (chainName: string, tokens: NftablesRuleTokens): Promise<void> {
     await this.exec([
       'add', 'rule',
-      INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME,
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
       chainName,
       ...tokens
     ])

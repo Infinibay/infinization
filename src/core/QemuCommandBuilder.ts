@@ -43,7 +43,7 @@ export interface QemuCommandWithPinning extends QemuCommand {
  * It supports all essential QEMU options for VM management.
  */
 export class QemuCommandBuilder {
-  private static readonly ALLOWED_ROM_DIR = '/var/lib/infinivirt/roms/'
+  private static readonly ALLOWED_ROM_DIR = '/var/lib/infinization/roms/'
 
   private binary: string = 'qemu-system-x86_64'
   private args: string[] = []
@@ -352,7 +352,7 @@ export class QemuCommandBuilder {
    * Automatically enables multifunction support for GPU passthrough.
    *
    * @param pciBus - PCI bus address (e.g., '01:00.0' or '0000:01:00.0')
-   * @param romfile - Optional path to GPU ROM file (must be in /var/lib/infinivirt/roms/)
+   * @param romfile - Optional path to GPU ROM file (must be in /var/lib/infinization/roms/)
    * @returns this for method chaining
    * @throws Error if PCI address format is invalid
    *
@@ -368,7 +368,7 @@ export class QemuCommandBuilder {
    * - UEFI firmware is recommended for GPU passthrough
    *
    * **Security:**
-   * - ROM files must be located in /var/lib/infinivirt/roms/
+   * - ROM files must be located in /var/lib/infinization/roms/
    * - Path traversal attempts will be rejected
    *
    * @example
@@ -377,7 +377,7 @@ export class QemuCommandBuilder {
    *   .enableKvm()
    *   .setMachine('q35')
    *   .addGpuPassthrough('01:00.0')
-   *   .addGpuPassthrough('0000:02:00.0', '/var/lib/infinivirt/roms/gpu.rom')
+   *   .addGpuPassthrough('0000:02:00.0', '/var/lib/infinization/roms/gpu.rom')
    * ```
    */
   addGpuPassthrough (pciBus: string, romfile?: string): this {
@@ -463,7 +463,7 @@ export class QemuCommandBuilder {
    * controllers, and other PCI devices.
    *
    * @param pciBus - PCI bus address (e.g., '04:00.0' or '0000:04:00.0')
-   * @param romfile - Optional path to device ROM file (must be in /var/lib/infinivirt/roms/)
+   * @param romfile - Optional path to device ROM file (must be in /var/lib/infinization/roms/)
    * @returns this for method chaining
    * @throws Error if PCI address format is invalid
    *
@@ -474,7 +474,7 @@ export class QemuCommandBuilder {
    * - Check IOMMU groups to ensure isolation
    *
    * **Security:**
-   * - ROM files must be located in /var/lib/infinivirt/roms/
+   * - ROM files must be located in /var/lib/infinization/roms/
    * - Path traversal attempts will be rejected
    *
    * @example
@@ -639,7 +639,7 @@ export class QemuCommandBuilder {
    * // Create UEFI boot with per-VM vars
    * builder
    *   .setFirmware('/usr/share/OVMF/OVMF_CODE.fd')
-   *   .setUefiVars('/var/lib/infinivirt/vms/myvm/uefi-vars.fd')
+   *   .setUefiVars('/var/lib/infinization/vms/myvm/uefi-vars.fd')
    * ```
    */
   setUefiVars (varsPath: string): this {

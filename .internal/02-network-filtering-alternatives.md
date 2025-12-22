@@ -1,4 +1,4 @@
-# Alternativas de Filtrado de Red para Infinivirt
+# Alternativas de Filtrado de Red para Infinization
 
 Este documento analiza las alternativas modernas a iptables para implementar filtrado de red en VMs, dado que iptables está deprecated.
 
@@ -11,7 +11,7 @@ Este documento analiza las alternativas modernas a iptables para implementar fil
 | tc + eBPF | 10-15 mpps | Alta | Muy específico |
 | iptables | 39 mpps | Media | Deprecated, evitar |
 
-**Recomendación**: Usar **nftables** como backend de firewall para Infinivirt.
+**Recomendación**: Usar **nftables** como backend de firewall para Infinization.
 
 ---
 
@@ -129,7 +129,7 @@ protected executeCommand(commandParts: string[]): Promise<string> {
 await this.executeCommand(['7z', 'x', isoPath, '-o' + extractDir])
 ```
 
-**Para Infinivirt, reutilizamos este patrón:**
+**Para Infinization, reutilizamos este patrón:**
 
 ```typescript
 // Reutilizar executeCommand del backend o crear utility compartida
@@ -183,7 +183,7 @@ await nft.addRule({
 
 ---
 
-## 2. eBPF/XDP (No recomendado para Infinivirt)
+## 2. eBPF/XDP (No recomendado para Infinization)
 
 ### ¿Qué es?
 
@@ -194,7 +194,7 @@ eBPF es una **máquina virtual en el kernel** que permite ejecutar código sandb
 - **24 millones de paquetes/segundo por core**
 - Procesa paquetes antes del network stack (zero-copy path)
 
-### Por qué NO para Infinivirt
+### Por qué NO para Infinization
 
 1. **Overkill**: Target users (1-50 VMs) no necesitan este nivel de rendimiento
 2. **Complejidad**: Requiere escribir código C, compilar a bytecode, debugging complejo
@@ -223,7 +223,7 @@ tc (Traffic Control) es el subsistema de QoS de Linux. Desde kernel 4.1, soporta
 | Rendimiento | 24 mpps | 10-15 mpps |
 | Dirección | Solo ingress | Ingress **y egress** |
 
-### Por qué NO para Infinivirt
+### Por qué NO para Infinization
 
 - Misma complejidad que eBPF (código C)
 - Beneficio principal (egress filtering) también disponible en nftables
@@ -266,13 +266,13 @@ Chain ibay-vnet0-pre
 
 ---
 
-## 5. Arquitectura Propuesta para Infinivirt
+## 5. Arquitectura Propuesta para Infinization
 
 ### Opción A: nftables puro (Recomendado)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                   Infinivirt Backend                     │
+│                   Infinization Backend                     │
 │  ┌─────────────────────────────────────────────────┐   │
 │  │            FirewallService                        │   │
 │  │  ┌───────────────┐    ┌──────────────────────┐  │   │
@@ -366,7 +366,7 @@ function translateToNft(rule: FirewallRule, vmInterface: string): string {
 ### Lifecycle hooks
 
 ```typescript
-class InfinivirtVMManager {
+class InfinizationVMManager {
   async startVM(vmId: string) {
     // 1. Crear TAP device
     const tapName = await this.createTapDevice(vmId)
@@ -395,7 +395,7 @@ class InfinivirtVMManager {
 
 ## 6. Comparativa Final
 
-### Para Infinivirt específicamente
+### Para Infinization específicamente
 
 | Criterio | nftables | eBPF/XDP |
 |----------|----------|----------|
@@ -409,7 +409,7 @@ class InfinivirtVMManager {
 
 ### Decisión
 
-**nftables** es la opción correcta para Infinivirt:
+**nftables** es la opción correcta para Infinization:
 - Rendimiento más que suficiente para 1-50 VMs
 - Sintaxis moderna y unificada
 - Bien documentado y soportado
@@ -431,21 +431,21 @@ export class NftablesService {
   }
 
   async initializeVMTable(): Promise<void> {
-    await this.exec('add table bridge infinivirt')
+    await this.exec('add table bridge infinization')
   }
 
   async createVMChain(vmId: string): Promise<void> {
     const chainName = `vm_${vmId}`
-    await this.exec(`add chain bridge infinivirt ${chainName}`)
+    await this.exec(`add chain bridge infinization ${chainName}`)
   }
 
   async addRule(vmId: string, rule: FirewallRule, tapName: string): Promise<void> {
     const nftRule = this.translateRule(rule, tapName)
-    await this.exec(`add rule bridge infinivirt vm_${vmId} ${nftRule}`)
+    await this.exec(`add rule bridge infinization vm_${vmId} ${nftRule}`)
   }
 
   async removeVMRules(vmId: string): Promise<void> {
-    await this.exec(`delete chain bridge infinivirt vm_${vmId}`)
+    await this.exec(`delete chain bridge infinization vm_${vmId}`)
   }
 }
 ```

@@ -7,13 +7,13 @@ import debug from 'debug'
  * Example usage:
  * const debugger = new Debugger('module1');
  * debugger.log('Hello World'); // logs to the 'default' debug instance
- * debugger.log('error', 'Hello World'); // logs to the 'infinivirt:module1:error' debug instance
+ * debugger.log('error', 'Hello World'); // logs to the 'infinization:module1:error' debug instance
  */
 export class Debugger {
   private debuggers: { [key: string]: debug.Debugger } = {}
 
   constructor (private module: string) {
-    this.debuggers.default = debug('infinivirt:' + module)
+    this.debuggers.default = debug('infinization:' + module)
   }
 
   public log (...args: string[]) {
@@ -24,7 +24,7 @@ export class Debugger {
       // If there are two arguments, log to the specified debug
       const [subDebug, message] = args
       if (!this.debuggers[subDebug]) {
-        this.debuggers[subDebug] = debug(`infinivirt:${this.module}:${subDebug}`)
+        this.debuggers[subDebug] = debug(`infinization:${this.module}:${subDebug}`)
       }
       this.debuggers[subDebug](message)
     }

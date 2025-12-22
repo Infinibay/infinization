@@ -16,7 +16,7 @@
  *   VMInfo,
  *   VMOperation,
  *   VMOperationStatus
- * } from '@infinibay/infinivirt'
+ * } from '@infinibay/infinization'
  *
  * // Create a VM with full type safety
  * const config: VMCreateConfig = {
@@ -224,7 +224,7 @@ export interface VMDisplayInfo {
  * ```typescript
  * const hardware: VMHardwareConfig = {
  *   gpuPciAddress: '0000:01:00.0',
- *   gpuRomfile: '/var/lib/infinivirt/roms/gpu.rom'
+ *   gpuRomfile: '/var/lib/infinization/roms/gpu.rom'
  * }
  * ```
  */

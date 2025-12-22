@@ -16,14 +16,14 @@
  *   StorageConfig,
  *   QemuConfig,
  *   VMCompleteConfig
- * } from '@infinibay/infinivirt'
+ * } from '@infinibay/infinization'
  *
  * // Create a complete VM configuration
  * const config: VMCompleteConfig = {
  *   vm: { id: 'vm-123', name: 'my-vm', internalName: 'vm-abc' },
  *   display: { type: 'spice', port: 5901 },
  *   network: { bridge: 'virbr0' },
- *   storage: { path: '/var/lib/infinivirt/disks/vm-abc.qcow2', sizeGB: 50 }
+ *   storage: { path: '/var/lib/infinization/disks/vm-abc.qcow2', sizeGB: 50 }
  * }
  * ```
  */
@@ -45,7 +45,7 @@ import type { NetworkOptions as QemuNetworkOptions } from './qemu.types'
 import { validatePciAddress } from './qemu.types'
 
 /** Allowed directory for GPU ROM files */
-const ALLOWED_ROM_DIR = '/var/lib/infinivirt/roms/'
+const ALLOWED_ROM_DIR = '/var/lib/infinization/roms/'
 
 // Import VM resource constants from vm.types to centralize limits
 import {
@@ -208,8 +208,8 @@ export {
 // =============================================================================
 
 export {
-  /** Configuration for Infinivirt main class */
-  InfinivirtConfig,
+  /** Configuration for Infinization main class */
+  InfinizationConfig,
   /** Minimal interface for backend EventManager integration */
   EventManagerLike,
   /** Resources tracked by the active VMs map */
@@ -324,7 +324,7 @@ import { FirewallRuleInput } from './firewall.types'
  * @example
  * ```typescript
  * const storage: StorageConfig = {
- *   path: '/var/lib/infinivirt/disks/vm-abc.qcow2',
+ *   path: '/var/lib/infinization/disks/vm-abc.qcow2',
  *   format: 'qcow2',
  *   sizeGB: 50,
  *   bus: 'virtio',
@@ -471,7 +471,7 @@ export interface QemuProcessConfig {
  *     bridge: 'virbr0'
  *   },
  *   storage: {
- *     path: '/var/lib/infinivirt/disks/vm-abc.qcow2',
+ *     path: '/var/lib/infinization/disks/vm-abc.qcow2',
  *     sizeGB: 50
  *   }
  * }
@@ -528,7 +528,7 @@ export interface VMResourcesConfig {
  * const hardware: VMHardwarePassthroughConfig = {
  *   gpuPciAddress: '0000:01:00.0',
  *   gpuAudioPciAddress: '0000:01:00.1',  // GPU's HDMI/DP audio function
- *   gpuRomfile: '/var/lib/infinivirt/roms/gpu.rom'
+ *   gpuRomfile: '/var/lib/infinization/roms/gpu.rom'
  * }
  * ```
  */
@@ -627,7 +627,7 @@ export interface ConfigValidationWarning {
  *
  * @example
  * ```typescript
- * import { ConfigDefaults } from '@infinibay/infinivirt'
+ * import { ConfigDefaults } from '@infinibay/infinization'
  *
  * const port = userPort ?? ConfigDefaults.display.spicePort
  * ```

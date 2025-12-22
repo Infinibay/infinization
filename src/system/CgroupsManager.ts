@@ -29,8 +29,8 @@ const CGROUPS_V2_BASE = '/sys/fs/cgroup'
 /** Controller file that indicates cgroups v2 is active */
 const CGROUPS_V2_CONTROLLERS = '/sys/fs/cgroup/cgroup.controllers'
 
-/** Path for Infinivirt's cgroup slice */
-const INFINIVIRT_SLICE = '/sys/fs/cgroup/infinivirt.slice'
+/** Path for Infinization's cgroup slice */
+const INFINIZATION_SLICE = '/sys/fs/cgroup/infinization.slice'
 
 /**
  * CgroupsManager manages cgroup operations for VM CPU pinning.
@@ -75,11 +75,11 @@ export class CgroupsManager {
 
     // Create unique scope name for this VM process
     const scopeName = `qemu-${pid}.scope`
-    const scopePath = path.join(INFINIVIRT_SLICE, scopeName)
+    const scopePath = path.join(INFINIZATION_SLICE, scopeName)
 
     try {
-      // Ensure the infinivirt slice exists
-      await this.ensureInfinivirtSlice()
+      // Ensure the infinization slice exists
+      await this.ensureInfinizationSlice()
 
       // Create the cgroup scope for this VM
       await this.createCgroupScope(scopePath)
@@ -109,7 +109,7 @@ export class CgroupsManager {
    * Performs opportunistic cleanup of empty cgroup scopes.
    *
    * Since cgroup scopes are named by PID (qemu-{pid}.scope) rather than VM ID,
-   * this method scans all scopes under the infinivirt slice and removes any
+   * this method scans all scopes under the infinization slice and removes any
    * that have no active processes. This is safe to call at any time as it
    * only removes empty scopes.
    *
@@ -125,14 +125,14 @@ export class CgroupsManager {
     let cleanedCount = 0
 
     try {
-      if (!await this.pathExists(INFINIVIRT_SLICE)) {
+      if (!await this.pathExists(INFINIZATION_SLICE)) {
         return 0
       }
 
-      const entries = await fs.readdir(INFINIVIRT_SLICE)
+      const entries = await fs.readdir(INFINIZATION_SLICE)
       for (const entry of entries) {
         if (entry.startsWith('qemu-') && entry.endsWith('.scope')) {
-          const scopePath = path.join(INFINIVIRT_SLICE, entry)
+          const scopePath = path.join(INFINIZATION_SLICE, entry)
           // Check if this scope has any active processes
           const procsPath = path.join(scopePath, 'cgroup.procs')
           if (await this.pathExists(procsPath)) {
@@ -276,21 +276,21 @@ export class CgroupsManager {
   }
 
   /**
-   * Ensures the infinivirt slice directory exists.
+   * Ensures the infinization slice directory exists.
    */
-  private async ensureInfinivirtSlice (): Promise<void> {
-    if (await this.pathExists(INFINIVIRT_SLICE)) {
+  private async ensureInfinizationSlice (): Promise<void> {
+    if (await this.pathExists(INFINIZATION_SLICE)) {
       return
     }
 
     try {
-      await fs.mkdir(INFINIVIRT_SLICE, { recursive: true })
-      this.debug.log(`Created infinivirt slice: ${INFINIVIRT_SLICE}`)
+      await fs.mkdir(INFINIZATION_SLICE, { recursive: true })
+      this.debug.log(`Created infinization slice: ${INFINIZATION_SLICE}`)
 
       // Enable cpuset controller for the slice
       await this.enableCpusetInParent()
     } catch (error) {
-      throw new Error(`Failed to create infinivirt slice: ${error instanceof Error ? error.message : String(error)}`)
+      throw new Error(`Failed to create infinization slice: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -335,16 +335,16 @@ export class CgroupsManager {
   }
 
   /**
-   * Enables the cpuset controller for the infinivirt slice.
+   * Enables the cpuset controller for the infinization slice.
    */
   private async enableCpusetController (): Promise<void> {
-    // Enable cpuset in the infinivirt slice's subtree_control
-    const sliceSubtreeControl = path.join(INFINIVIRT_SLICE, 'cgroup.subtree_control')
+    // Enable cpuset in the infinization slice's subtree_control
+    const sliceSubtreeControl = path.join(INFINIZATION_SLICE, 'cgroup.subtree_control')
     try {
       const current = await fs.readFile(sliceSubtreeControl, 'utf8')
       if (!current.includes('cpuset')) {
         await fs.writeFile(sliceSubtreeControl, '+cpuset')
-        this.debug.log('Enabled cpuset controller in infinivirt slice')
+        this.debug.log('Enabled cpuset controller in infinization slice')
       }
     } catch (error) {
       this.debug.log('warn', `Failed to enable cpuset in slice: ${error instanceof Error ? error.message : String(error)}`)

@@ -1,31 +1,31 @@
 /**
- * Infinivirt - Main Public API for VM Management
+ * Infinization - Main Public API for VM Management
  *
- * This is the primary entry point for the infinivirt library.
+ * This is the primary entry point for the infinization library.
  * It manages shared resources (database, event handling, health monitoring)
  * and provides a clean interface for VM lifecycle operations.
  *
  * Note: Pass your application's PrismaClient singleton for connection pooling.
- * Infinivirt does not create or manage its own Prisma instance.
+ * Infinization does not create or manage its own Prisma instance.
  *
  * @example
  * ```typescript
  * import { PrismaClient } from '@prisma/client'
- * import { Infinivirt } from '@infinibay/infinivirt'
+ * import { Infinization } from '@infinibay/infinization'
  * import { getEventManager } from '@backend/services/EventManager'
  *
  * // Use your application's Prisma singleton
  * const prisma = new PrismaClient()
  *
- * const infinivirt = new Infinivirt({
+ * const infinization = new Infinization({
  *   prismaClient: prisma,
  *   eventManager: getEventManager(),
  *   healthMonitorInterval: 30000
  * })
  *
- * await infinivirt.initialize()
+ * await infinization.initialize()
  *
- * const result = await infinivirt.createVM({
+ * const result = await infinization.createVM({
  *   vmId: 'machine-uuid-from-db',
  *   name: 'test-vm',
  *   internalName: 'vm-abc123',
@@ -41,8 +41,8 @@
  * console.log('VM created:', result.vmId)
  *
  * // Later, cleanup
- * await infinivirt.stopVM(result.vmId)
- * await infinivirt.shutdown()
+ * await infinization.stopVM(result.vmId)
+ * await infinization.shutdown()
  * ```
  */
 
@@ -54,7 +54,7 @@ import { HealthMonitor } from '../sync/HealthMonitor'
 import { NftablesService } from '../network/NftablesService'
 import { Debugger } from '../utils/debug'
 import {
-  InfinivirtConfig,
+  InfinizationConfig,
   VMCreateConfig,
   VMCreateResult,
   VMStartConfig,
@@ -80,7 +80,7 @@ import { QMPBlockInfo } from '../types/qmp.types'
 type PrismaClientLike = any
 
 /**
- * Infinivirt is the main public API for VM management.
+ * Infinization is the main public API for VM management.
  *
  * It handles:
  * - Automatic nftables initialization
@@ -89,9 +89,9 @@ type PrismaClientLike = any
  * - Centralized resource management
  * - Clean interface for VM operations
  */
-export class Infinivirt {
+export class Infinization {
   private readonly debug: Debugger
-  private readonly config: InfinivirtConfig
+  private readonly config: InfinizationConfig
   private prisma!: PrismaAdapter
   private eventHandler!: EventHandler
   private healthMonitor!: HealthMonitor
@@ -107,12 +107,12 @@ export class Infinivirt {
   private readonly pidfileDir: string
 
   /**
-   * Creates a new Infinivirt instance.
+   * Creates a new Infinization instance.
    *
    * @param config - Configuration options (prismaClient is required)
    */
-  constructor (config: InfinivirtConfig) {
-    this.debug = new Debugger('infinivirt')
+  constructor (config: InfinizationConfig) {
+    this.debug = new Debugger('infinization')
     this.config = config
     this.eventManager = config.eventManager
 
@@ -121,7 +121,7 @@ export class Infinivirt {
     this.qmpSocketDir = config.qmpSocketDir ?? DEFAULT_QMP_SOCKET_DIR
     this.pidfileDir = config.pidfileDir ?? DEFAULT_PIDFILE_DIR
 
-    this.debug.log('Infinivirt instance created')
+    this.debug.log('Infinization instance created')
   }
 
   // ===========================================================================
@@ -129,7 +129,7 @@ export class Infinivirt {
   // ===========================================================================
 
   /**
-   * Initializes the Infinivirt system.
+   * Initializes the Infinization system.
    *
    * - Creates/configures database adapter
    * - Initializes nftables infrastructure
@@ -143,14 +143,14 @@ export class Infinivirt {
       return
     }
 
-    this.debug.log('Initializing Infinivirt')
+    this.debug.log('Initializing Infinization')
 
     try {
       // Initialize Prisma adapter (prismaClient is required)
       if (!this.config.prismaClient) {
         throw new LifecycleError(
           LifecycleErrorCode.INVALID_CONFIG,
-          'prismaClient is required in InfinivirtConfig'
+          'prismaClient is required in InfinizationConfig'
         )
       }
       this.prisma = new PrismaAdapter(this.config.prismaClient as PrismaClientLike)
@@ -193,7 +193,7 @@ export class Infinivirt {
       }
 
       this.initialized = true
-      this.debug.log('Infinivirt initialized successfully')
+      this.debug.log('Infinization initialized successfully')
     } catch (error) {
       this.debug.log('error', `Initialization failed: ${error instanceof Error ? error.message : String(error)}`)
       throw error
@@ -201,7 +201,7 @@ export class Infinivirt {
   }
 
   /**
-   * Shuts down the Infinivirt system.
+   * Shuts down the Infinization system.
    *
    * - Stops health monitoring
    * - Detaches all event handlers
@@ -210,7 +210,7 @@ export class Infinivirt {
    * - Closes database connection (if owned)
    */
   async shutdown (): Promise<void> {
-    this.debug.log('Shutting down Infinivirt')
+    this.debug.log('Shutting down Infinization')
 
     // Stop health monitor
     if (this.healthMonitor) {
@@ -234,7 +234,7 @@ export class Infinivirt {
     }
 
     this.initialized = false
-    this.debug.log('Infinivirt shutdown complete')
+    this.debug.log('Infinization shutdown complete')
   }
 
   /**
@@ -557,7 +557,7 @@ export class Infinivirt {
     if (!this.initialized) {
       throw new LifecycleError(
         LifecycleErrorCode.INVALID_STATE,
-        'Infinivirt not initialized. Call initialize() first.'
+        'Infinization not initialized. Call initialize() first.'
       )
     }
   }

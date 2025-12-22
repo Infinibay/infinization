@@ -3,7 +3,7 @@
  * This enables firewall rules to survive system reboots.
  *
  * The persistence mechanism works as follows:
- * 1. After any rule change, exportToDisk() saves the current infinivirt table
+ * 1. After any rule change, exportToDisk() saves the current infinization table
  * 2. On system boot, a systemd service loads rules using restoreFromDisk()
  * 3. Individual VM rule files are also maintained for debugging/recovery
  *
@@ -24,8 +24,8 @@ import { dirname } from 'path'
 import { CommandExecutor } from '@utils/commandExecutor'
 import { Debugger } from '@utils/debug'
 import {
-  INFINIVIRT_TABLE_NAME,
-  INFINIVIRT_TABLE_FAMILY
+  INFINIZATION_TABLE_NAME,
+  INFINIZATION_TABLE_FAMILY
 } from '../types/firewall.types'
 
 // ============================================================================
@@ -33,13 +33,13 @@ import {
 // ============================================================================
 
 /** Directory for nftables persistence files */
-export const NFTABLES_PERSISTENCE_DIR = '/etc/infinivirt/nftables'
+export const NFTABLES_PERSISTENCE_DIR = '/etc/infinization/nftables'
 
-/** Main ruleset file containing the full infinivirt table */
-export const NFTABLES_MAIN_FILE = `${NFTABLES_PERSISTENCE_DIR}/infinivirt.nft`
+/** Main ruleset file containing the full infinization table */
+export const NFTABLES_MAIN_FILE = `${NFTABLES_PERSISTENCE_DIR}/infinization.nft`
 
 /** Backup file for the previous ruleset (for rollback) */
-export const NFTABLES_BACKUP_FILE = `${NFTABLES_PERSISTENCE_DIR}/infinivirt.nft.bak`
+export const NFTABLES_BACKUP_FILE = `${NFTABLES_PERSISTENCE_DIR}/infinization.nft.bak`
 
 /** Lock file to prevent concurrent writes */
 export const NFTABLES_LOCK_FILE = `${NFTABLES_PERSISTENCE_DIR}/.lock`
@@ -66,7 +66,7 @@ export interface RestoreResult {
 }
 
 export interface PersistenceConfig {
-  /** Directory for persistence files (default: /etc/infinivirt/nftables) */
+  /** Directory for persistence files (default: /etc/infinization/nftables) */
   persistenceDir?: string
   /** Whether to create backup before overwriting (default: true) */
   createBackup?: boolean
@@ -98,7 +98,7 @@ export class NftablesPersistence {
   // ============================================================================
 
   /**
-   * Exports the current infinivirt nftables table to disk.
+   * Exports the current infinization nftables table to disk.
    * This should be called after any rule changes to ensure persistence.
    *
    * The export process:
@@ -112,7 +112,7 @@ export class NftablesPersistence {
    */
   async exportToDisk (): Promise<PersistenceResult> {
     const timestamp = new Date()
-    const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
+    const mainFile = `${this.config.persistenceDir}/infinization.nft`
 
     this.debug.log('Exporting nftables rules to disk')
 
@@ -130,12 +130,12 @@ export class NftablesPersistence {
         const ruleset = await this.getCurrentRuleset()
 
         if (!ruleset) {
-          this.debug.log('No infinivirt table found, nothing to export')
+          this.debug.log('No infinization table found, nothing to export')
           return {
             success: true,
             filePath: mainFile,
             timestamp,
-            error: 'No infinivirt table exists'
+            error: 'No infinization table exists'
           }
         }
 
@@ -190,7 +190,7 @@ export class NftablesPersistence {
    */
   async restoreFromDisk (): Promise<RestoreResult> {
     const timestamp = new Date()
-    const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
+    const mainFile = `${this.config.persistenceDir}/infinization.nft`
 
     this.debug.log('Restoring nftables rules from disk')
 
@@ -248,7 +248,7 @@ export class NftablesPersistence {
    * @returns true if a valid persistence file exists
    */
   async hasPersistenceFile (): Promise<boolean> {
-    const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
+    const mainFile = `${this.config.persistenceDir}/infinization.nft`
 
     try {
       const exists = await this.fileExists(mainFile)
@@ -267,8 +267,8 @@ export class NftablesPersistence {
    * @returns true if file was removed or didn't exist
    */
   async removePersistenceFile (): Promise<boolean> {
-    const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
-    const backupFile = `${this.config.persistenceDir}/infinivirt.nft.bak`
+    const mainFile = `${this.config.persistenceDir}/infinization.nft`
+    const backupFile = `${this.config.persistenceDir}/infinization.nft.bak`
 
     this.debug.log('Removing persistence files')
 
@@ -301,7 +301,7 @@ export class NftablesPersistence {
    */
   async rollbackToBackup (): Promise<RestoreResult> {
     const timestamp = new Date()
-    const backupFile = `${this.config.persistenceDir}/infinivirt.nft.bak`
+    const backupFile = `${this.config.persistenceDir}/infinization.nft.bak`
 
     this.debug.log('Rolling back to backup ruleset')
 
@@ -321,7 +321,7 @@ export class NftablesPersistence {
       await this.executor.execute('nft', ['-f', backupFile])
 
       // Copy backup to main file
-      const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
+      const mainFile = `${this.config.persistenceDir}/infinization.nft`
       await fs.copyFile(backupFile, mainFile)
 
       this.debug.log('Rolled back to backup successfully')
@@ -356,8 +356,8 @@ export class NftablesPersistence {
     mainFileModified?: Date
     tableExists: boolean
   }> {
-    const mainFile = `${this.config.persistenceDir}/infinivirt.nft`
-    const backupFile = `${this.config.persistenceDir}/infinivirt.nft.bak`
+    const mainFile = `${this.config.persistenceDir}/infinization.nft`
+    const backupFile = `${this.config.persistenceDir}/infinization.nft.bak`
 
     const mainFileExists = await this.fileExists(mainFile)
     const backupFileExists = await this.fileExists(backupFile)
@@ -373,7 +373,7 @@ export class NftablesPersistence {
     try {
       await this.executor.execute('nft', [
         'list', 'table',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
       ])
       tableExists = true
     } catch {
@@ -394,13 +394,13 @@ export class NftablesPersistence {
   // ============================================================================
 
   /**
-   * Gets the current infinivirt table ruleset from the kernel.
+   * Gets the current infinization table ruleset from the kernel.
    */
   private async getCurrentRuleset (): Promise<string | null> {
     try {
       const output = await this.executor.execute('nft', [
         'list', 'table',
-        INFINIVIRT_TABLE_FAMILY, INFINIVIRT_TABLE_NAME
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
       ])
       return output
     } catch (error) {
@@ -420,9 +420,9 @@ export class NftablesPersistence {
     const header = [
       '#!/usr/sbin/nft -f',
       '#',
-      '# Infinivirt nftables rules',
+      '# Infinization nftables rules',
       `# Exported: ${timestamp.toISOString()}`,
-      '# DO NOT EDIT - This file is managed by infinivirt',
+      '# DO NOT EDIT - This file is managed by infinization',
       '#',
       ''
     ].join('\n')
@@ -440,7 +440,7 @@ export class NftablesPersistence {
     }
 
     // Should contain table definition
-    if (!content.includes(`table ${INFINIVIRT_TABLE_FAMILY} ${INFINIVIRT_TABLE_NAME}`)) {
+    if (!content.includes(`table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)) {
       return false
     }
 

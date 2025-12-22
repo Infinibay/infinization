@@ -1,15 +1,15 @@
 #!/bin/bash
 #
-# Installs the infinivirt-nftables systemd service
+# Installs the infinization-nftables systemd service
 # This service restores firewall rules on system boot
 #
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_FILE="infinivirt-nftables.service"
+SERVICE_FILE="infinization-nftables.service"
 SYSTEMD_DIR="/etc/systemd/system"
-PERSISTENCE_DIR="/etc/infinivirt/nftables"
+PERSISTENCE_DIR="/etc/infinization/nftables"
 
 # Check for root
 if [ "$EUID" -ne 0 ]; then
@@ -17,7 +17,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo "Installing infinivirt-nftables service..."
+echo "Installing infinization-nftables service..."
 
 # Create persistence directory if it doesn't exist
 if [ ! -d "$PERSISTENCE_DIR" ]; then
@@ -37,17 +37,17 @@ systemctl daemon-reload
 
 # Enable service (but don't start - it will start on next boot)
 echo "Enabling service..."
-systemctl enable infinivirt-nftables.service
+systemctl enable infinization-nftables.service
 
 echo ""
 echo "Installation complete!"
 echo ""
 echo "The service will automatically load firewall rules on system boot."
 echo "Current status:"
-systemctl status infinivirt-nftables.service --no-pager || true
+systemctl status infinization-nftables.service --no-pager || true
 echo ""
 echo "Notes:"
-echo "  - Firewall rules are stored in: $PERSISTENCE_DIR/infinivirt.nft"
-echo "  - Rules are automatically exported by infinivirt after changes"
-echo "  - To manually load rules: systemctl start infinivirt-nftables"
-echo "  - To check status: systemctl status infinivirt-nftables"
+echo "  - Firewall rules are stored in: $PERSISTENCE_DIR/infinization.nft"
+echo "  - Rules are automatically exported by infinization after changes"
+echo "  - To manually load rules: systemctl start infinization-nftables"
+echo "  - To check status: systemctl status infinization-nftables"

@@ -321,10 +321,10 @@ export interface VMConfigRecord extends MachineRecord {
 // =============================================================================
 
 /** Default path prefix for VM disk images */
-export const DEFAULT_DISK_PATH_PREFIX = '/var/lib/infinivirt/disks'
+export const DEFAULT_DISK_PATH_PREFIX = '/var/lib/infinization/disks'
 
 /** Default path prefix for QMP Unix sockets */
-export const DEFAULT_QMP_SOCKET_PATH_PREFIX = '/var/run/infinivirt'
+export const DEFAULT_QMP_SOCKET_PATH_PREFIX = '/var/run/infinization'
 
 /** Default disk image format */
 export const DEFAULT_DISK_FORMAT = 'qcow2'
