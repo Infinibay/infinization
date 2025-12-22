@@ -107,6 +107,12 @@ export class TapDeviceManager {
       await this.executor.execute('ip', ['link', 'set', tapName, 'up'])
       this.debug.log(`TAP device ${tapName} brought up successfully (checking carrier...)`)
 
+      // Disable checksum offloading to fix DHCP issues with virtio-net
+      // When offloading is enabled, broadcast DHCP packets may have invalid checksums
+      // that cause them to be dropped before reaching the VM
+      await this.executor.execute('ethtool', ['-K', tapName, 'tx', 'off', 'rx', 'off'])
+      this.debug.log(`TAP device ${tapName} checksum offloading disabled`)
+
       // Attach to bridge if specified
       if (bridge) {
         await this.executor.execute('ip', ['link', 'set', tapName, 'master', bridge])
