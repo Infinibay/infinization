@@ -67,10 +67,31 @@ export class BridgeManager {
       // Bring the bridge up
       await this.executor.execute('ip', ['link', 'set', bridgeName, 'up'])
       this.debug.log(`Bridge ${bridgeName} is now up`)
+
+      // Disable checksum offloading to fix DHCP issues
+      await this.disableChecksumOffloading(bridgeName)
     } catch (error) {
       const message = `Failed to create bridge ${bridgeName}: ${error instanceof Error ? error.message : String(error)}`
       this.debug.log('error', message)
       throw new Error(message)
+    }
+  }
+
+  /**
+   * Disables checksum offloading on a bridge to fix DHCP issues.
+   * When offloading is enabled, dnsmasq DHCP responses may have invalid checksums
+   * that cause VMs to reject the packets.
+   * @param bridgeName - The bridge name
+   */
+  async disableChecksumOffloading (bridgeName: string): Promise<void> {
+    this.debug.log(`Disabling checksum offloading for bridge ${bridgeName}`)
+
+    try {
+      await this.executor.execute('ethtool', ['-K', bridgeName, 'tx', 'off'])
+      this.debug.log(`Bridge ${bridgeName} checksum offloading disabled`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      this.debug.log('warn', `Failed to disable checksum offloading for ${bridgeName}: ${errorMessage}`)
     }
   }
 
