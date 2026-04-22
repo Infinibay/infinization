@@ -11,10 +11,12 @@ import * as path from 'path'
 import {
   DatabaseAdapter,
   MachineConfigurationRecord,
+  RunningVMRecord,
   HealthMonitorConfig,
   HealthCheckResult,
   HealthCheckSummary,
   CrashEvent,
+  OrphanEvent,
   DEFAULT_HEALTH_CHECK_INTERVAL,
   CleanupResourceType,
   CleanupStatus,
@@ -25,8 +27,8 @@ import {
   CLEANUP_RETRY_BASE_DELAY_MS,
   CLEANUP_RETRY_MAX_DELAY_MS
 } from '../types/sync.types'
-import { TapDeviceManager } from '../network/TapDeviceManager'
 import { NftablesService } from '../network/NftablesService'
+import { TapDeviceManager } from '../network/TapDeviceManager'
 import { Debugger } from '../utils/debug'
 import { DEFAULT_PIDFILE_DIR } from '../types/lifecycle.types'
 
@@ -374,6 +376,8 @@ export class HealthMonitor extends EventEmitter {
       alive,
       crashed,
       errors,
+      orphansDetected: 0,
+      orphansCleaned: 0,
       timestamp,
       results
     }
@@ -384,6 +388,211 @@ export class HealthMonitor extends EventEmitter {
 
     return summary
   }
+
+  /**
+   * Scans pidfile directory for QEMU processes whose VM is NOT in 'running' state.
+   *
+   * This detects "orphan" processes that survived an incorrect shutdown — e.g. the
+   * backend crashed/restarted and lost its in-memory state while a QEMU process kept
+   * running. For each orphan found, the process is killed, resources cleaned up, and
+   * an 'orphan-detected' event emitted.
+   *
+   * @returns Array of orphan events describing what was found and cleaned up
+   */
+  public async checkOrphanProcesses (): Promise<OrphanEvent[]> {
+    const orphans: OrphanEvent[] = []
+    const detectedAt = new Date()
+
+    if (!fs.existsSync(this.pidfileDir)) {
+      this.debug.log('Pidfile directory does not exist, skipping orphan scan')
+      return orphans
+    }
+
+    let pidFiles: string[]
+    try {
+      pidFiles = fs.readdirSync(this.pidfileDir)
+        .filter(f => f.endsWith('.pid'))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error'
+      this.debug.log('error', `Failed to read pidfile directory: ${message}`)
+      return orphans
+    }
+
+    if (pidFiles.length === 0) {
+      return orphans
+    }
+
+    this.debug.log(`Scanning ${pidFiles.length} pidfiles for orphan processes`)
+
+    for (const pidFile of pidFiles) {
+      const pidfilePath = path.join(this.pidfileDir, pidFile)
+      const internalName = path.basename(pidFile, '.pid')
+
+      try {
+        // Read PID from file
+        const pidContent = fs.readFileSync(pidfilePath, 'utf8').trim()
+        const pid = parseInt(pidContent, 10)
+
+        if (isNaN(pid)) {
+          this.debug.log('warn', `Invalid PID in ${pidfilePath}: "${pidContent}" — removing stale pidfile`)
+          fs.unlinkSync(pidfilePath)
+          continue
+        }
+
+        // Check if the process is actually alive
+        if (!this.isProcessAlive(pid)) {
+          // Dead process with leftover pidfile — just clean up the file
+          this.debug.log(`Removing stale pidfile for dead process: ${pidfilePath} (PID ${pid})`)
+          fs.unlinkSync(pidfilePath)
+          continue
+        }
+
+        // Process is alive — check DB status
+        const vmRecord = await this.db.findMachineByInternalName(internalName)
+
+        if (!vmRecord) {
+          // No DB record at all — orphan from a deleted VM
+          this.debug.log('warn', `Orphan QEMU process ${pid} has no DB record (internalName: ${internalName}) — killing`)
+          const event = await this.killOrphan(internalName, pid, pidfilePath, 'unknown (no DB record)', detectedAt)
+          orphans.push(event)
+          continue
+        }
+
+        if (vmRecord.status === 'running') {
+          // Legitimate running VM — skip
+          // But verify PID matches what the DB says
+          const dbPid = vmRecord.MachineConfiguration?.qemuPid
+          if (dbPid !== null && dbPid !== undefined && dbPid !== pid) {
+            this.debug.log('warn',
+              `PID mismatch for ${internalName}: pidfile says ${pid}, DB says ${dbPid}. ` +
+              `Killing orphan ${pid} and cleaning up.`
+            )
+            const event = await this.killOrphan(internalName, pid, pidfilePath, vmRecord.status, detectedAt)
+            orphans.push(event)
+          }
+          continue
+        }
+
+        // Process alive but VM not in 'running' state — this is an orphan
+        this.debug.log('warn',
+          `Orphan QEMU process ${pid} found for VM ${vmRecord.id} ` +
+          `(internalName: ${internalName}, DB status: "${vmRecord.status}") — killing`
+        )
+
+        // Update DB status to 'off' in case it was stale
+        try {
+          await this.db.updateMachineStatus(vmRecord.id, 'off')
+        } catch {
+          // Best effort — the important thing is killing the process
+        }
+
+        const event = await this.killOrphan(
+          internalName,
+          pid,
+          pidfilePath,
+          vmRecord.status,
+          detectedAt,
+          vmRecord
+        )
+        orphans.push(event)
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unknown error'
+        this.debug.log('error', `Error processing pidfile ${pidfilePath}: ${message}`)
+      }
+    }
+
+    if (orphans.length > 0) {
+      this.debug.log(`Orphan scan complete: ${orphans.length} orphan(s) detected and killed`)
+    }
+
+    return orphans
+  }
+
+  /**
+   * Kills an orphan QEMU process with SIGTERM → SIGKILL escalation,
+   * cleans up its pidfile, and optionally cleans up VM resources.
+   */
+  private async killOrphan (
+    internalName: string,
+    pid: number,
+    pidfilePath: string,
+    dbStatus: string,
+    detectedAt: Date,
+    vmRecord?: RunningVMRecord | null
+  ): Promise<OrphanEvent> {
+    let killed = false
+
+    // Try SIGTERM first
+    try {
+      process.kill(pid, 'SIGTERM')
+      this.debug.log(`Sent SIGTERM to orphan process ${pid} (${internalName})`)
+
+      // Wait up to 5 seconds for graceful shutdown
+      const gracePeriodMs = 5000
+      const startTime = Date.now()
+      while (Date.now() - startTime < gracePeriodMs) {
+        if (!this.isProcessAlive(pid)) {
+          killed = true
+          break
+        }
+        await new Promise(resolve => setTimeout(resolve, 500))
+      }
+
+      // If still alive, SIGKILL
+      if (!killed) {
+        this.debug.log('warn', `Orphan process ${pid} did not exit after SIGTERM — sending SIGKILL`)
+        process.kill(pid, 'SIGKILL')
+        killed = true
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ESRCH') {
+        // Already dead — that's fine
+        killed = true
+        this.debug.log(`Orphan process ${pid} already exited`)
+      } else {
+        this.debug.log('error', `Failed to kill orphan process ${pid}: ${String(err)}`)
+      }
+    }
+
+    // Remove pidfile
+    try {
+      if (fs.existsSync(pidfilePath)) {
+        fs.unlinkSync(pidfilePath)
+        this.debug.log(`Removed orphan pidfile: ${pidfilePath}`)
+      }
+    } catch (err) {
+      this.debug.log('error', `Failed to remove pidfile ${pidfilePath}: ${String(err)}`)
+    }
+
+    // Attempt resource cleanup if we have the VM record
+    let cleanupPerformed = false
+    let cleanupResult: CleanupResult | undefined
+
+    if (vmRecord?.MachineConfiguration) {
+      try {
+        cleanupResult = await this.cleanupVMResources(vmRecord.id, vmRecord.MachineConfiguration)
+        cleanupPerformed = true
+      } catch (err) {
+        this.debug.log('error', `Resource cleanup failed for orphan VM ${vmRecord.id}: ${String(err)}`)
+      }
+    }
+
+    const event: OrphanEvent = {
+      vmId: vmRecord?.id ?? internalName,
+      pid,
+      dbStatus,
+      pidfilePath,
+      detectedAt,
+      killed,
+      cleanupPerformed,
+      cleanupResult
+    }
+
+    this.emit('orphan-detected', event)
+    return event
+  }
+
 
   /**
    * Checks if a specific VM process is alive
@@ -709,7 +918,18 @@ export class HealthMonitor extends EventEmitter {
 
     this.isChecking = true
     try {
-      await this.checkAllVMs()
+      // Phase 1: Check known running VMs for crashes
+      const summary = await this.checkAllVMs()
+
+      // Phase 2: Scan for orphan QEMU processes (alive but VM not in 'running' state)
+      const orphans = await this.checkOrphanProcesses()
+
+      // Emit combined summary event with orphan stats
+      this.emit('check-complete', {
+        ...summary,
+        orphansDetected: orphans.length,
+        orphansCleaned: orphans.filter(o => o.killed).length
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error'
       this.debug.log('error', `Health check failed: ${message}`)

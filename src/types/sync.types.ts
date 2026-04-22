@@ -75,6 +75,9 @@ export interface DatabaseAdapter {
 
   /** Clear only volatile config (qemuPid, qmpSocketPath) - preserves tapDeviceName for reuse */
   clearVolatileMachineConfiguration (machineId: string): Promise<void>
+
+  /** Find a machine by internal name (used for orphan detection from pidfile names) */
+  findMachineByInternalName (internalName: string): Promise<RunningVMRecord | null>
 }
 
 // =============================================================================
@@ -171,6 +174,7 @@ export interface HealthCheckResult {
 }
 
 /**
+/**
  * Summary of all health checks in a cycle
  */
 export interface HealthCheckSummary {
@@ -178,6 +182,10 @@ export interface HealthCheckSummary {
   alive: number
   crashed: number
   errors: number
+  /** Number of orphan QEMU processes detected during this cycle */
+  orphansDetected: number
+  /** Number of orphan processes successfully killed and cleaned up */
+  orphansCleaned: number
   timestamp: Date
   results: HealthCheckResult[]
 }
@@ -190,6 +198,21 @@ export interface CrashEvent {
   pid: number
   lastKnownStatus: string
   detectedAt: Date
+  cleanupPerformed: boolean
+  cleanupResult?: CleanupResult
+}
+
+/**
+ * Event emitted when an orphan QEMU process is detected
+ * (process alive but VM not in 'running' state in DB)
+ */
+export interface OrphanEvent {
+  vmId: string
+  pid: number
+  dbStatus: string
+  pidfilePath: string
+  detectedAt: Date
+  killed: boolean
   cleanupPerformed: boolean
   cleanupResult?: CleanupResult
 }

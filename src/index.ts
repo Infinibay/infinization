@@ -179,10 +179,10 @@ export {
   SyncError,
   SyncErrorCode,
   // Health monitor types
-  HealthMonitorConfig,
   HealthCheckResult,
   HealthCheckSummary,
   CrashEvent,
+  OrphanEvent,
   // Event handler types
   EventHandlerConfig,
   VMEventData,
@@ -404,6 +404,44 @@ export {
   isUnattendedError,
   createUnattendedError
 } from './types/unattended.types'
+
+
+// Types - Backup
+export {
+  // Enums
+  BackupType,
+  BackupStatus,
+  BackupCompression,
+  // Configuration types
+  BackupConfig,
+  BackupRestoreOptions,
+  BackupSchedule,
+  // Metadata & result types
+  BackupDiskInfo,
+  BackupMetadata,
+  BackupResult,
+  BackupRestoreResult,
+  BackupProgress,
+  // Error types
+  BackupErrorCode,
+  BackupErrorInfo,
+  BackupError,
+  // Constants
+  DEFAULT_BACKUP_DIR,
+  DEFAULT_BACKUP_TYPE,
+  DEFAULT_BACKUP_COMPRESSION,
+  DEFAULT_RETENTION_COUNT,
+  MAX_CONCURRENT_BACKUPS,
+  BACKUP_MANIFEST_FILENAME,
+  // Type guards
+  isValidBackupType,
+  isValidBackupStatus,
+  isBackupError
+} from './types/backup.types'
+// Backup classes
+export { BackupScheduler, ScheduledJob, ScheduleAdapter } from './backup/BackupScheduler'
+export { BackupScheduleService, CreateScheduleInput, UpdateScheduleInput } from './backup/BackupScheduleService'
+export { BackupService, BackupServiceOptions, BackupServiceEvents } from './backup/BackupService'
 
 // System classes
 export { CgroupsManager } from './system/CgroupsManager'

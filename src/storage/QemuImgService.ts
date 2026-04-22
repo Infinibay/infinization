@@ -142,6 +142,14 @@ export class QemuImgService {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
 
+      if (errorMessage.includes('Failed to get') && errorMessage.includes('lock')) {
+        throw new StorageError(
+          StorageErrorCode.IMAGE_IN_USE,
+          `Image is locked by another process (likely a running VM): ${path}`,
+          path,
+          'qemu-img info'
+        )
+      }
       if (errorMessage.includes('No such file') || errorMessage.includes('Could not open')) {
         throw new StorageError(
           StorageErrorCode.IMAGE_NOT_FOUND,
@@ -325,6 +333,14 @@ export class QemuImgService {
         }
       }
 
+      if (errorMessage.includes('Failed to get') && errorMessage.includes('lock')) {
+        throw new StorageError(
+          StorageErrorCode.IMAGE_IN_USE,
+          `Image is locked by another process (likely a running VM): ${path}`,
+          path,
+          'qemu-img check'
+        )
+      }
       if (errorMessage.includes('No such file') || errorMessage.includes('Could not open')) {
         throw new StorageError(
           StorageErrorCode.IMAGE_NOT_FOUND,

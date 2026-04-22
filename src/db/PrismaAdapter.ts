@@ -153,6 +153,11 @@ interface PrismaClientLike {
       select?: Record<string, unknown>
       include?: Record<string, unknown>
     }) => Promise<PrismaMachineRecord | null>
+    findFirst: (args: {
+      where: Record<string, unknown>
+      select?: Record<string, unknown>
+      include?: Record<string, unknown>
+    }) => Promise<PrismaMachineRecord | null>
     findMany: (args: {
       where?: Record<string, unknown>
       select?: Record<string, unknown>
@@ -242,6 +247,57 @@ export class PrismaAdapter implements DatabaseAdapter {
         id,
         error
       )
+    }
+  }
+
+
+  /**
+   * Find a machine by its internal name.
+   * Used by orphan process detection to map pidfile names back to VM records.
+   *
+   * @param internalName - The internal VM name (derived from pidfile name)
+   * @returns RunningVMRecord with configuration, or null if not found
+   */
+  async findMachineByInternalName (internalName: string): Promise<RunningVMRecord | null> {
+    this.debug.log(`findMachineByInternalName: ${internalName}`)
+
+    try {
+      const machine = await this.prisma.machine.findFirst({
+        where: { internalName },
+        include: {
+          configuration: {
+            select: {
+              qemuPid: true,
+              tapDeviceName: true,
+              qmpSocketPath: true,
+              guestAgentSocketPath: true,
+              infiniServiceSocketPath: true
+            }
+          }
+        }
+      })
+
+      if (!machine) {
+        this.debug.log('info', `Machine not found by internalName: ${internalName}`)
+        return null
+      }
+
+      return {
+        id: machine.id,
+        status: machine.status,
+        MachineConfiguration: machine.configuration
+          ? {
+              qemuPid: machine.configuration.qemuPid,
+              tapDeviceName: machine.configuration.tapDeviceName,
+              qmpSocketPath: machine.configuration.qmpSocketPath,
+              guestAgentSocketPath: machine.configuration.guestAgentSocketPath ?? null,
+              infiniServiceSocketPath: machine.configuration.infiniServiceSocketPath ?? null
+            }
+          : null
+      }
+    } catch (error) {
+      this.debug.log('error', `findMachineByInternalName failed: ${String(error)}`)
+      return null
     }
   }
 
