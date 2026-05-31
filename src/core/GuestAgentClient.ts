@@ -170,9 +170,9 @@ export class GuestAgentClient {
     if (args && args.length > 0) {
       execArgs.arg = args
     }
-    if (options?.cwd) {
-      execArgs.cwd = options.cwd
-    }
+    // NOTE: the QEMU Guest Agent `guest-exec` schema has no `cwd` parameter —
+    // passing one makes QGA reject the whole command. Working directory is not
+    // supported here; callers must use absolute paths. `options.cwd` is ignored.
 
     const result = await this.execute<GuestExecResult>('guest-exec', execArgs)
 
