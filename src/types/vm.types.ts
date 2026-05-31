@@ -340,7 +340,7 @@ export interface VMOperationHistory {
 
 /** Valid VM status values for type checking */
 const VALID_VM_STATUSES: VMStatus[] = [
-  'building',
+  'starting',
   'running',
   'off',
   'suspended',

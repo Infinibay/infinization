@@ -292,12 +292,18 @@ export class VMLifecycle {
         const diskConfig = config.disks[i]
         const diskPath = paths.diskPaths[i]
 
-        this.debug.log(`Creating disk ${i}: ${diskPath} (${diskConfig.sizeGB}GB)`)
+        if (diskConfig.backingFile) {
+          this.debug.log(`Creating disk ${i}: ${diskPath} (thin clone of ${diskConfig.backingFile})`)
+        } else {
+          this.debug.log(`Creating disk ${i}: ${diskPath} (${diskConfig.sizeGB}GB)`)
+        }
         await this.qemuImg.createImage({
           path: diskPath,
           sizeGB: diskConfig.sizeGB,
           format: diskConfig.format ?? DEFAULT_DISK_FORMAT,
-          preallocation: 'metadata'
+          // Preallocation is ignored for thin clones (can't preallocate on a backing chain).
+          preallocation: diskConfig.backingFile ? undefined : 'metadata',
+          backingFile: diskConfig.backingFile
         })
       }
 

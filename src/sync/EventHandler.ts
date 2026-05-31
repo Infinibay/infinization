@@ -65,7 +65,11 @@ const STATE_CHANGE_EVENTS: QMPEventType[] = [
 ]
 
 /**
- * Mapping from QMP events to database status
+ * Mapping from QMP events to database status.
+ *
+ * Note: 'running' here only means "the QEMU CPU is executing", not "the OS
+ * is ready". Whether the guest OS has finished installing and infiniservice
+ * has handshaked is tracked separately by MachineConfiguration.setupComplete.
  */
 const EVENT_TO_STATUS: Partial<Record<QMPEventType, DBVMStatus>> = {
   'SHUTDOWN': 'off',
@@ -239,13 +243,19 @@ export class EventHandler extends EventEmitter {
 
   /**
    * Gets the QMP client for an attached VM.
-   * Returns undefined if the VM is not attached.
+   * Returns undefined if the VM is not attached OR if its QMP client is no
+   * longer connected. Callers should not need to defensively check
+   * `isConnected()` themselves.
    *
    * @param vmId The VM identifier
-   * @returns The QMPClient instance or undefined
+   * @returns The connected QMPClient instance, or undefined
    */
   public getQMPClient (vmId: string): QMPClient | undefined {
-    return this.attachedVMs.get(vmId)?.qmpClient
+    const client = this.attachedVMs.get(vmId)?.qmpClient
+    if (!client || !client.isConnected()) {
+      return undefined
+    }
+    return client
   }
 
   /**

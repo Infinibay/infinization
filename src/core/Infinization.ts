@@ -48,6 +48,7 @@
 
 import { VMLifecycle } from './VMLifecycle'
 import { QMPClient } from './QMPClient'
+import { GuestAgentClient } from './GuestAgentClient'
 import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { HealthMonitor } from '../sync/HealthMonitor'
@@ -487,6 +488,56 @@ export class Infinization {
   getPrismaAdapter (): PrismaAdapter {
     this.ensureInitialized()
     return this.prisma
+  }
+
+  /**
+   * Gets the QMP client for a specific VM, if attached.
+   * Returns undefined if the VM is not attached or the client is disconnected.
+   *
+   * @param vmId - The VM identifier in the database
+   */
+  public getQMPClient (vmId: string): QMPClient | undefined {
+    return this.eventHandler.getQMPClient(vmId)
+  }
+
+  /**
+   * Execute a command inside a running VM via the QEMU Guest Agent (QGA).
+   *
+   * QGA is a separate Unix socket from the QMP socket — `guest-exec` and
+   * `guest-exec-status` are NOT QMP commands and must not be sent over the
+   * QMP socket (QEMU rejects them as unknown).
+   *
+   * This method opens a transient `GuestAgentClient` against the VM's QGA
+   * socket, runs the command, and disconnects. It does not cache the
+   * connection because guest-exec is an infrequent operation.
+   *
+   * @param vmId - The VM identifier (used only for logging/tracing)
+   * @param guestAgentSocketPath - Path to the VM's QEMU Guest Agent socket
+   * @param command - Command to execute inside the guest
+   * @param args - Optional command arguments
+   * @param options - Optional execution options (timeout, cwd)
+   * @returns stdout, stderr, and exit code
+   * @throws Error if the guest agent is unreachable or the command times out
+   */
+  public async guestExec (
+    vmId: string,
+    guestAgentSocketPath: string,
+    command: string,
+    args?: string[],
+    options?: { timeout?: number, cwd?: string }
+  ): Promise<{ stdout: string, stderr: string, exitCode: number }> {
+    this.ensureInitialized()
+    this.debug.log(`Guest-exec on VM ${vmId}: ${command} ${(args ?? []).join(' ')}`)
+
+    const client = new GuestAgentClient(guestAgentSocketPath)
+    try {
+      await client.connect()
+      return await client.guestExec(command, args, options)
+    } finally {
+      await client.disconnect().catch((err) => {
+        this.debug.log('warn', `Failed to disconnect QGA client for VM ${vmId}: ${err?.message ?? err}`)
+      })
+    }
   }
 
   /**

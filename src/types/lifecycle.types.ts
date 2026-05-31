@@ -30,6 +30,17 @@ export interface DiskConfig {
   cache?: string
   /** Enable discard/TRIM support (default: true) */
   discard?: boolean
+  /**
+   * Optional absolute path to a backing qcow2 file. When set, the disk
+   * is created as a thin linked clone (qcow2 backing chain) instead of a
+   * fresh zeroed image. Size is inherited from the backing file; sizeGB
+   * is ignored by qemu-img create when backingFile is present.
+   *
+   * The backing file must outlive every clone that references it —
+   * modifying or deleting it corrupts all dependents. Treat it as
+   * read-only after seal.
+   */
+  backingFile?: string
 }
 
 /**

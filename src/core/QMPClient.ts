@@ -488,6 +488,11 @@ export class QMPClient extends EventEmitter {
   }
 
   // ===========================================================================
+  // Note: guest-exec / guest-exec-status are NOT QMP commands. They live on
+  // the QEMU Guest Agent socket and are handled by `GuestAgentClient`.
+  // ===========================================================================
+
+  // ===========================================================================
   // Private Methods
   // ===========================================================================
 

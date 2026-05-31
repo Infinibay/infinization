@@ -88,7 +88,7 @@ export interface DatabaseAdapter {
  * Database VM status values (from Prisma Machine.status)
  */
 export type DBVMStatus =
-  | 'building'
+  | 'starting'
   | 'running'
   | 'off'
   | 'suspended'
@@ -330,7 +330,7 @@ export const CLEANUP_RETRY_MAX_DELAY_MS = 10000
 
 /** Valid DB status values for type checking */
 const VALID_DB_STATUSES: DBVMStatus[] = [
-  'building',
+  'starting',
   'running',
   'off',
   'suspended',

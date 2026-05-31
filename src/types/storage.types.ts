@@ -92,14 +92,22 @@ export interface ImageCheckResult {
 export interface CreateImageOptions {
   /** Image file path */
   path: string
-  /** Size in gigabytes */
+  /**
+   * Size in gigabytes. Ignored when `backingFile` is set — thin clones
+   * inherit their virtual size from the backing image.
+   */
   sizeGB: number
   /** Image format */
   format: ImageFormat
   /** Cluster size (qcow2 only) */
   clusterSize?: number
-  /** Preallocation mode */
+  /** Preallocation mode (ignored when backingFile is set — thin clones cannot preallocate). */
   preallocation?: 'off' | 'metadata' | 'falloc' | 'full'
+  /**
+   * Optional path to a qcow2 backing file. When set, the image is created
+   * as a thin linked clone: `qemu-img create -f qcow2 -F qcow2 -b <backing> <path>`.
+   */
+  backingFile?: string
 }
 
 /**

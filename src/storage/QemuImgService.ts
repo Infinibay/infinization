@@ -44,26 +44,45 @@ export class QemuImgService {
    * @throws StorageError if image creation fails
    */
   async createImage (options: CreateImageOptions): Promise<void> {
-    const { path, sizeGB, format, clusterSize, preallocation } = options
-    this.debug.log(`Creating ${format} image: ${path} (${sizeGB}GB)`)
+    const { path, sizeGB, format, clusterSize, preallocation, backingFile } = options
+    if (backingFile) {
+      this.debug.log(`Creating ${format} thin clone: ${path} (backing: ${backingFile})`)
+    } else {
+      this.debug.log(`Creating ${format} image: ${path} (${sizeGB}GB)`)
+    }
 
     const args: string[] = ['create', '-f', format]
 
-    // Add optional qcow2-specific options
-    if (format === 'qcow2') {
-      const qcow2Options: string[] = []
-      if (clusterSize) {
-        qcow2Options.push(`cluster_size=${clusterSize}`)
+    // Linked-clone path: reference the backing file and let qcow2 inherit
+    // its virtual size. Preallocation and cluster tuning don't apply here —
+    // a thin clone allocates on write.
+    if (backingFile) {
+      if (format !== 'qcow2') {
+        throw new StorageError(
+          StorageErrorCode.INVALID_FORMAT,
+          `backingFile requires qcow2 format (got: ${format})`,
+          path,
+          'qemu-img create'
+        )
       }
-      if (preallocation) {
-        qcow2Options.push(`preallocation=${preallocation}`)
+      args.push('-F', 'qcow2', '-b', backingFile, path)
+    } else {
+      // Add optional qcow2-specific options
+      if (format === 'qcow2') {
+        const qcow2Options: string[] = []
+        if (clusterSize) {
+          qcow2Options.push(`cluster_size=${clusterSize}`)
+        }
+        if (preallocation) {
+          qcow2Options.push(`preallocation=${preallocation}`)
+        }
+        if (qcow2Options.length > 0) {
+          args.push('-o', qcow2Options.join(','))
+        }
       }
-      if (qcow2Options.length > 0) {
-        args.push('-o', qcow2Options.join(','))
-      }
-    }
 
-    args.push(path, `${sizeGB}G`)
+      args.push(path, `${sizeGB}G`)
+    }
 
     try {
       await this.executor.execute('qemu-img', args)

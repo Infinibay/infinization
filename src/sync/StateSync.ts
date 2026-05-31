@@ -17,17 +17,28 @@ import {
 import { Debugger } from '../utils/debug'
 
 /**
- * Mapping from QMP status values to database status values
+ * Mapping from QMP status values to database status values.
+ *
+ * Notes on migration-related QMP states:
+ *  - `inmigrate`     : destination is paused awaiting incoming data → "starting"
+ *  - `prelaunch`     : VM launched paused, awaiting first run        → "starting"
+ *  - `restore-vm`    : restoring VM state from a snapshot            → "starting"
+ *  - `postmigrate`   : source VM stopped after migration completed   → "suspended"
+ *  - `finish-migrate`: destination paused while finishing migration  → "suspended"
+ *
+ * `postmigrate` and `finish-migrate` describe an already-existing VM that is
+ * paused, not a VM being booted, so we surface them as "suspended" rather than
+ * "starting" to avoid confusing post-migration UI as a boot.
  */
 const QMP_TO_DB_STATUS_MAP: Record<QMPVMStatus, DBVMStatus> = {
   'running': 'running',
   'paused': 'suspended',
   'shutdown': 'off',
-  'inmigrate': 'building',
-  'postmigrate': 'building',
-  'prelaunch': 'building',
-  'finish-migrate': 'building',
-  'restore-vm': 'building',
+  'inmigrate': 'starting',
+  'postmigrate': 'suspended',
+  'prelaunch': 'starting',
+  'finish-migrate': 'suspended',
+  'restore-vm': 'starting',
   'suspended': 'suspended',
   'watchdog': 'error',
   'guest-panicked': 'error',

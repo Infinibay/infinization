@@ -360,3 +360,29 @@ export interface QMPSocketOptions {
   /** Command execution timeout in milliseconds */
   commandTimeout?: number
 }
+
+/**
+ * Result of a QEMU Guest Agent guest-exec command (immediate response).
+ */
+export interface GuestExecResult {
+  /** Process ID of the spawned command, null if execution failed */
+  pid: number | null
+  /** Whether the command was successfully started */
+  executed: boolean
+}
+
+/**
+ * Result of a QEMU Guest Agent guest-exec-status query (polling response).
+ */
+export interface GuestExecStatusResult {
+  /** Exit code of the process, null if still running */
+  exitcode: number | null
+  /** Whether the process has exited */
+  exited: boolean
+  /** Base64-encoded stdout output */
+  'out-data': string | null
+  /** Base64-encoded stderr output */
+  'err-data': string | null
+  /** Error message if the process failed to execute */
+  'emsg'?: string
+}
