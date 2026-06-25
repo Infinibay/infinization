@@ -17,6 +17,8 @@ import {
   HealthCheckSummary,
   CrashEvent,
   OrphanEvent,
+  ReconcileResult,
+  ReconcileSummary,
   DEFAULT_HEALTH_CHECK_INTERVAL,
   CleanupResourceType,
   CleanupStatus,
@@ -509,6 +511,93 @@ export class HealthMonitor extends EventEmitter {
   }
 
   /**
+   * Startup reconciliation for VMs stuck in transient states after a
+   * backend/process crash. For each VM in 'starting' / 'powering_off_update' /
+   * 'rebuilding' (overridable), checks real qemuPid liveness and resolves the row
+   * to a terminal state:
+   *   live pid                    -> 'running' (caller re-attaches QMP)
+   *   dead/no pid + 'rebuilding'  -> 'error' (half-rebuilt qcow2 must not be handed out)
+   *   dead/no pid otherwise       -> 'off' + clearVolatileMachineConfiguration
+   * Complements checkAllVMs() (running) and checkOrphanProcesses() (live-but-not-
+   * running). Invoke once at startup BEFORE attachToRunningVMs.
+   */
+  public async reconcileTransientStates (
+    statuses: string[] = ['starting', 'powering_off_update', 'rebuilding']
+  ): Promise<ReconcileSummary> {
+    const timestamp = new Date()
+    const results: ReconcileResult[] = []
+    const promotedToRunning: string[] = []
+    const resetToOff: string[] = []
+    const resetToError: string[] = []
+    const skipped: string[] = []
+
+    let vms: RunningVMRecord[] = []
+    try {
+      vms = await this.db.findMachinesByStatuses(statuses)
+    } catch (err) {
+      this.debug.log('error', `reconcileTransientStates query failed: ${String(err)}`)
+      return { totalChecked: 0, promotedToRunning, resetToOff, resetToError, skipped, timestamp, results }
+    }
+
+    if (vms.length === 0) {
+      this.debug.log('No VMs in transient states to reconcile')
+      return { totalChecked: 0, promotedToRunning, resetToOff, resetToError, skipped, timestamp, results }
+    }
+
+    this.debug.log(`Reconciling ${vms.length} VM(s) in transient states`)
+
+    for (const vm of vms) {
+      const pid = vm.MachineConfiguration?.qemuPid ?? null
+      const pidAlive = pid !== null && this.isProcessAlive(pid)
+      const previousStatus = vm.status
+
+      try {
+        if (pidAlive) {
+          await this.db.updateMachineStatus(vm.id, 'running')
+          promotedToRunning.push(vm.id)
+          results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'promoted_running' })
+          this.debug.log('info', `Reconcile: VM ${vm.id} (${previousStatus}) has live PID ${pid} -> 'running'`)
+          continue
+        }
+
+        if (this.config.enableCleanup && vm.MachineConfiguration) {
+          try {
+            await this.cleanupVMResources(vm.id, vm.MachineConfiguration)
+          } catch (cleanupErr) {
+            this.debug.log('warn', `Reconcile cleanup failed for VM ${vm.id}: ${String(cleanupErr)}`)
+          }
+        }
+
+        if (previousStatus === 'rebuilding') {
+          await this.db.clearVolatileMachineConfiguration(vm.id)
+          await this.db.updateMachineStatus(vm.id, 'error')
+          resetToError.push(vm.id)
+          results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_error', reason: 'crash during rebuild' })
+          this.debug.log('warn', `Reconcile: VM ${vm.id} stuck 'rebuilding' with no live PID -> 'error'`)
+          continue
+        }
+
+        await this.db.clearVolatileMachineConfiguration(vm.id)
+        await this.db.updateMachineStatus(vm.id, 'off')
+        resetToOff.push(vm.id)
+        results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_off' })
+        this.debug.log('info', `Reconcile: VM ${vm.id} (${previousStatus}) no live PID -> 'off' (TAP preserved)`)
+      } catch (err) {
+        skipped.push(vm.id)
+        results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'skipped', reason: String(err) })
+        this.debug.log('error', `Reconcile failed for VM ${vm.id}: ${String(err)}`)
+      }
+    }
+
+    this.debug.log(
+      `Reconcile complete: ${promotedToRunning.length} promoted, ${resetToOff.length} -> off, ` +
+      `${resetToError.length} -> error, ${skipped.length} skipped`
+    )
+    this.emit('reconcile-complete', { promotedToRunning, resetToOff, resetToError, skipped, timestamp })
+    return { totalChecked: vms.length, promotedToRunning, resetToOff, resetToError, skipped, timestamp, results }
+  }
+
+  /**
    * Kills an orphan QEMU process with SIGTERM → SIGKILL escalation,
    * cleans up its pidfile, and optionally cleans up VM resources.
    */
@@ -616,7 +705,7 @@ export class HealthMonitor extends EventEmitter {
    * @param pid The process ID to check
    * @returns True if the process exists and is not a zombie
    */
-  private isProcessAlive (pid: number): boolean {
+  public isProcessAlive (pid: number): boolean {
     try {
       // First check: process.kill with signal 0 checks if process exists
       // without actually sending a signal

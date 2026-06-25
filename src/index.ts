@@ -127,6 +127,7 @@ export {
   CONNECTION_STATES,
   MAX_CHAIN_NAME_LENGTH,
   VM_CHAIN_PREFIX,
+  FirewallDefaultAction,
   generateVMChainName
 } from './types/firewall.types'
 
@@ -391,12 +392,15 @@ export {
   UnattendedError,
   // Constants
   DEFAULT_INSTALLATION_TIMEOUT,
+  OS_INSTALLATION_TIMEOUTS,
   CDROM_DEVICE_NAME,
   ISO_BOOT_ORDER,
   DEFAULT_MAX_RESETS,
   DEFAULT_CHECK_INTERVAL,
   DEFAULT_LOCALE,
   DEFAULT_TIMEZONE,
+  // Helpers
+  getInstallationTimeout,
   // Type guards
   isValidOSType,
   isValidInstallationPhase,
@@ -449,3 +453,4 @@ export { CgroupsManager } from './system/CgroupsManager'
 // Utilities
 export { Debugger } from './utils/debug'
 export { CommandExecutor } from './utils/commandExecutor'
+export { KeyedMutex } from './utils/KeyedMutex'

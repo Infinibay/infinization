@@ -29,11 +29,13 @@ import { createHash } from 'crypto'
 import { CommandExecutor } from '@utils/commandExecutor'
 import { Debugger } from '@utils/debug'
 import { retryOnBusy, sleep } from '@utils/retry'
+import { KeyedMutex } from '@utils/KeyedMutex'
 import { FirewallRuleTranslator } from './FirewallRuleTranslator'
 import { NftablesPersistence } from './NftablesPersistence'
 import {
   FirewallRuleInput,
   FirewallApplyResult,
+  FirewallDefaultAction,
   NftablesErrorCode,
   NftablesError,
   NftablesRuleTokens,
@@ -65,6 +67,13 @@ export class NftablesService {
   private persistence: NftablesPersistence
   /** Whether to persist rules to disk after changes */
   private enablePersistence: boolean
+  /**
+   * Serializes mutations to a given VM chain, keyed by chain name. Ensures apply and
+   * remove operations on the same chain run one-at-a-time (no interleaving). Only
+   * effective when callers share a single NftablesService instance — see
+   * getInfinization().getNftablesService(); the backend bridges use that shared one.
+   */
+  private chainLock = new KeyedMutex()
 
   constructor (config: NftablesServiceConfig = {}) {
     this.executor = new CommandExecutor()
@@ -139,23 +148,56 @@ export class NftablesService {
   }
 
   /**
-   * Applies firewall rules to a VM.
-   * Merges department rules with VM-specific rules, respecting overridesDept flags.
+   * Applies firewall rules to a VM **atomically and fail-closed**.
+   *
+   * Merges department rules with VM-specific rules (respecting overridesDept),
+   * injects the established/related allow rule, and appends a terminal rule that
+   * enforces the department's default posture:
+   *   - defaultAction 'drop'   (BLOCK_ALL): traffic not explicitly accepted is dropped.
+   *   - defaultAction 'accept' (ALLOW_ALL): traffic not explicitly dropped is accepted.
+   *
+   * The whole ruleset (flush + every rule + terminal) is applied in a SINGLE
+   * `nft -f -` transaction. This guarantees:
+   *   - **Atomicity**: there is never a window where the chain is flushed/half-populated
+   *     while jump rules are live — the kernel swaps the chain contents in one step.
+   *   - **Fail-closed**: if any rule is rejected by nft, the ENTIRE transaction is
+   *     rolled back and the chain keeps its PREVIOUS ruleset (we throw). We never
+   *     degrade to a flushed/partial chain that falls through to accept.
+   *
+   * A rule that fails to *translate* in JS is skipped and counted in `failedRules`
+   * (not silently dropped). Because the chain ends in a terminal drop under BLOCK_ALL,
+   * skipping a rule denies rather than exposes that traffic.
    *
    * @param vmId - The VM identifier
    * @param tapDeviceName - The TAP device name for this VM
    * @param departmentRules - Rules inherited from the department
    * @param vmRules - Rules specific to this VM
+   * @param defaultAction - Terminal posture (default 'drop' = fail-closed)
    * @returns Result containing count of applied/failed rules
    */
   async applyRules (
     vmId: string,
     tapDeviceName: string,
     departmentRules: FirewallRuleInput[],
-    vmRules: FirewallRuleInput[]
+    vmRules: FirewallRuleInput[],
+    defaultAction: FirewallDefaultAction = 'drop'
+  ): Promise<FirewallApplyResult> {
+    // Serialize all mutations to this VM's chain so a department-wide reapply cannot
+    // interleave with a per-VM resync (or a concurrent removeVMChain), which would
+    // otherwise yield duplicate/missing rules or a half-applied chain.
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.applyRulesUnlocked(vmId, tapDeviceName, departmentRules, vmRules, defaultAction))
+  }
+
+  private async applyRulesUnlocked (
+    vmId: string,
+    tapDeviceName: string,
+    departmentRules: FirewallRuleInput[],
+    vmRules: FirewallRuleInput[],
+    defaultAction: FirewallDefaultAction = 'drop'
   ): Promise<FirewallApplyResult> {
     const chainName = generateVMChainName(vmId)
-    this.debug.log(`Applying firewall rules to chain ${chainName} for VM ${vmId}`)
+    this.debug.log(`Applying firewall rules to chain ${chainName} for VM ${vmId} (defaultAction=${defaultAction})`)
 
     const result: FirewallApplyResult = {
       totalRules: 0,
@@ -166,79 +208,122 @@ export class NftablesService {
     }
 
     try {
-      // Ensure chain exists
+      // Ensure chain + jump rules exist (idempotent). The atomic ruleset below also
+      // re-asserts the chain via `add chain`, but createVMChain wires the jump rules
+      // from the base forward chain on first creation.
       const exists = await this.chainExists(chainName)
       if (!exists) {
         this.debug.log(`Chain ${chainName} does not exist, creating it`)
         await this.createVMChain(vmId, tapDeviceName)
       }
 
-      // Flush existing rules in the chain before applying new ones
-      await this.flushVMRules(vmId)
-
       // Merge rules (VM rules can override department rules)
       const mergedRules = this.mergeRules(departmentRules, vmRules)
 
-      // Inject default rule for established/related traffic
-      // This ensures connections initiated by the VM (or accepted via explicit rules) continue to work
+      // Inject default rule for established/related traffic so connections initiated
+      // by the VM (or accepted via explicit rules) keep working under a terminal drop.
       mergedRules.push(this.getDefaultEstablishedRule())
-      this.debug.log('Injected default established/related rule (priority 9999)')
 
-      // Sort by priority after adding default rule
+      // Sort by priority (lower number = evaluated first)
       mergedRules.sort((a, b) => a.priority - b.priority)
 
       result.totalRules = mergedRules.length
 
-      this.debug.log(`Processing ${mergedRules.length} merged rules (including default established/related)`)
+      // Translate every rule to an nft rule line. Translation failures are recorded
+      // but do not abort the apply (the terminal drop keeps the result fail-closed).
+      const { lines, applied, failures } = this.buildRuleLines(mergedRules, tapDeviceName)
+      result.failures = failures
+      result.failedRules = failures.length
 
-      // Apply each rule
-      // Note: Rules are applied in priority order (ascending). Since nftables evaluates
-      // rules in the order they were added to the chain, applying rules sorted by priority
-      // ensures the intended evaluation order. For stronger guarantees in future iterations,
-      // consider using explicit insert semantics (e.g., `insert rule` with position handles).
-      for (const rule of mergedRules) {
-        try {
-          // Handle INOUT direction by creating two rules (one for each direction)
-          // The translator only handles concrete directions (IN or OUT), so we expand
-          // INOUT here to maintain clear separation of responsibilities.
-          if (rule.direction === 'INOUT') {
-            // Create rule for IN direction
-            const inRule = { ...rule, direction: 'IN' as const }
-            const inTokens = FirewallRuleTranslator.translateToTokens(inRule, tapDeviceName)
-            await this.addRuleTokens(chainName, inTokens)
+      // Build a single atomic transaction: re-assert chain, flush it, re-add every
+      // rule, and append the terminal posture rule last (after the established rule).
+      const ruleset = this.buildAtomicRuleset(chainName, lines, defaultAction)
 
-            // Create rule for OUT direction
-            const outRule = { ...rule, direction: 'OUT' as const }
-            const outTokens = FirewallRuleTranslator.translateToTokens(outRule, tapDeviceName)
-            await this.addRuleTokens(chainName, outTokens)
-          } else {
-            const tokens = FirewallRuleTranslator.translateToTokens(rule, tapDeviceName)
-            await this.addRuleTokens(chainName, tokens)
-          }
+      // Apply atomically. On ANY error the kernel rolls back the whole transaction,
+      // so the chain retains its previous rules — fail-closed.
+      await this.execFile(ruleset)
 
-          result.appliedRules++
-          this.debug.log(`Applied rule: ${rule.name}`)
-        } catch (error) {
-          result.failedRules++
-          const errorMsg = error instanceof Error ? error.message : String(error)
-          result.failures.push({
-            ruleName: rule.name,
-            error: errorMsg
-          })
-          this.debug.log('error', `Failed to apply rule ${rule.name}: ${errorMsg}`)
-        }
-      }
-
-      this.debug.log(`Applied ${result.appliedRules}/${result.totalRules} rules to chain ${chainName}`)
+      result.appliedRules = applied
+      this.debug.log(`Atomically applied ${result.appliedRules}/${result.totalRules} rules to chain ${chainName} (terminal: ${defaultAction})`)
 
       // Persist rules to disk after successful apply
       await this.persistToDiskIfEnabled()
 
       return result
     } catch (error) {
-      const message = `Failed to apply rules to chain ${chainName}: ${error instanceof Error ? error.message : String(error)}`
+      const message = `Failed to apply rules to chain ${chainName} (chain retains previous ruleset): ${error instanceof Error ? error.message : String(error)}`
       this.debug.log('error', message)
       throw this.wrapError(error, NftablesErrorCode.COMMAND_FAILED)
+    }
+  }
+
+  /**
+   * Translates a list of merged rules into nft rule-body strings (one per rule;
+   * INOUT expands to two). Records translation failures instead of throwing so a
+   * single bad rule cannot abort the whole apply.
+   */
+  private buildRuleLines (
+    mergedRules: FirewallRuleInput[],
+    tapDeviceName: string
+  ): { lines: string[]; applied: number; failures: Array<{ ruleName: string; error: string }> } {
+    const lines: string[] = []
+    let applied = 0
+    const failures: Array<{ ruleName: string; error: string }> = []
+
+    for (const rule of mergedRules) {
+      try {
+        if (rule.direction === 'INOUT') {
+          // Expand INOUT into concrete IN and OUT rules (translator handles only IN/OUT).
+          const inRule = { ...rule, direction: 'IN' as const }
+          lines.push(FirewallRuleTranslator.translateToTokens(inRule, tapDeviceName).join(' '))
+          const outRule = { ...rule, direction: 'OUT' as const }
+          lines.push(FirewallRuleTranslator.translateToTokens(outRule, tapDeviceName).join(' '))
+        } else {
+          lines.push(FirewallRuleTranslator.translateToTokens(rule, tapDeviceName).join(' '))
+        }
+        applied++
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error)
+        failures.push({ ruleName: rule.name, error: errorMsg })
+        this.debug.log('error', `Failed to translate rule ${rule.name}: ${errorMsg}`)
+      }
+    }
+
+    return { lines, applied, failures }
+  }
+
+  /**
+   * Builds the atomic `nft -f` ruleset for a VM chain: re-assert the chain (idempotent),
+   * flush it, re-add every rule body, and append the terminal posture rule.
+   */
+  private buildAtomicRuleset (
+    chainName: string,
+    ruleBodies: string[],
+    defaultAction: FirewallDefaultAction
+  ): string {
+    const prefix = `${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} ${chainName}`
+    const terminal = defaultAction === 'drop' ? 'drop' : 'accept'
+    const lines = [
+      `add chain ${prefix}`,
+      `flush chain ${prefix}`,
+      ...ruleBodies.map(body => `add rule ${prefix} ${body}`),
+      `add rule ${prefix} ${terminal} comment "infinization-default-${terminal}"`
+    ]
+    return lines.join('\n') + '\n'
+  }
+
+  /**
+   * Applies a complete ruleset atomically via `nft -f -` (read from stdin).
+   * The whole ruleset is one nftables transaction: all-or-nothing.
+   */
+  private async execFile (ruleset: string): Promise<string> {
+    this.debug.log(`Applying atomic ruleset via 'nft -f -':\n${ruleset}`)
+    try {
+      return await this.executor.execute('nft', ['-f', '-'], { stdin: ruleset })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.debug.log('error', `nft -f failed (transaction rolled back): ${message}`)
+      throw error
     }
   }
 
@@ -256,7 +341,28 @@ export class NftablesService {
    * @param vmId - The VM identifier
    */
   async removeVMChain (vmId: string): Promise<void> {
-    const chainName = generateVMChainName(vmId)
+    // Resolve the (non-invertible) chain name from the vmId and delegate, then drop
+    // the vmId-keyed rule-hash cache entry regardless of the removal outcome.
+    await this.removeVMChainByName(generateVMChainName(vmId))
+    this.ruleHashCache.delete(vmId)
+  }
+
+  /**
+   * Removes a VM firewall chain BY CHAIN NAME: detach jump rules, flush, delete.
+   *
+   * Reconciliation/cleanup paths know only the chain name — the chain name is a
+   * SHA-256-derived, non-invertible function of the vmId, so they cannot recover the
+   * vmId to call removeVMChain(). Best-effort: logs and returns on missing chains
+   * rather than throwing.
+   *
+   * @param chainName - The nftables chain name (e.g. from listChains())
+   */
+  async removeVMChainByName (chainName: string): Promise<void> {
+    // Same per-chain lock as applyRules — a remove must not interleave with an apply.
+    return this.chainLock.runExclusive(chainName, () => this.removeVMChainByNameUnlocked(chainName))
+  }
+
+  private async removeVMChainByNameUnlocked (chainName: string): Promise<void> {
     this.debug.log(`Removing VM chain: ${chainName}`)
 
     try {
@@ -317,9 +423,6 @@ export class NftablesService {
         }
       )
 
-      // Clear rules hash cache for this VM
-      this.ruleHashCache.delete(vmId)
-
       this.debug.log(`VM chain removed: ${chainName}`)
 
       // Persist changes to disk after successful removal
@@ -332,8 +435,6 @@ export class NftablesService {
           errorMessage.includes('does not exist') ||
           errorMessage.includes('No such chain')) {
         this.debug.log(`Chain ${chainName} does not exist, nothing to remove`)
-        // Still clear cache even if chain didn't exist
-        this.ruleHashCache.delete(vmId)
         return
       }
 
@@ -370,7 +471,6 @@ export class NftablesService {
           ])
 
           this.debug.log(`Manual cleanup succeeded for chain ${chainName}`)
-          this.ruleHashCache.delete(vmId)
           return // Success
         } catch (manualError) {
           this.debug.log('error', `Manual cleanup also failed: ${manualError instanceof Error ? manualError.message : String(manualError)}`)
@@ -586,13 +686,15 @@ export class NftablesService {
     vmId: string,
     tapDeviceName: string,
     departmentRules: FirewallRuleInput[],
-    vmRules: FirewallRuleInput[]
+    vmRules: FirewallRuleInput[],
+    defaultAction: FirewallDefaultAction = 'drop'
   ): Promise<{ changed: boolean; result?: FirewallApplyResult }> {
     // Compute hash of the merged rules (including default established/related rule)
-    // This ensures the hash matches the effective rule set applied by applyRules()
+    // AND the terminal posture — changing the policy must invalidate the cache.
+    // This ensures the hash matches the effective rule set applied by applyRules().
     const mergedRules = this.mergeRules(departmentRules, vmRules)
     mergedRules.push(this.getDefaultEstablishedRule())
-    const newHash = this.hashRules(mergedRules)
+    const newHash = this.hashRules(mergedRules, defaultAction)
     const cachedHash = this.ruleHashCache.get(vmId)
 
     if (cachedHash === newHash) {
@@ -603,7 +705,7 @@ export class NftablesService {
     this.debug.log(`Rules changed for VM ${vmId} (old: ${cachedHash?.substring(0, 8) ?? 'none'}..., new: ${newHash.substring(0, 8)}...), applying`)
 
     // Apply the rules
-    const result = await this.applyRules(vmId, tapDeviceName, departmentRules, vmRules)
+    const result = await this.applyRules(vmId, tapDeviceName, departmentRules, vmRules, defaultAction)
 
     // Update cache only on successful apply
     if (result.failedRules === 0) {
@@ -648,13 +750,13 @@ export class NftablesService {
   }
 
   /**
-   * Computes a SHA-256 hash of the firewall rules.
+   * Computes a SHA-256 hash of the firewall rules plus the terminal posture.
    * Rules are sorted by priority before hashing for consistent results.
    */
-  private hashRules (rules: FirewallRuleInput[]): string {
+  private hashRules (rules: FirewallRuleInput[], defaultAction: FirewallDefaultAction = 'drop'): string {
     // Sort by priority to ensure consistent hash regardless of input order
     const sorted = [...rules].sort((a, b) => a.priority - b.priority)
-    const serialized = JSON.stringify(sorted)
+    const serialized = JSON.stringify({ defaultAction, rules: sorted })
     return createHash('sha256').update(serialized).digest('hex')
   }
 
@@ -692,8 +794,16 @@ export class NftablesService {
 
     this.debug.log(`Creating base chain ${BASE_FORWARD_CHAIN}`)
 
-    // Create base chain with forward hook
-    // The chain definition includes: type filter, hook forward, priority 0
+    // Create base chain with forward hook.
+    //
+    // IMPORTANT: the base forward chain keeps `policy accept` ON PURPOSE. This is a
+    // bridge-family chain hooked at `forward`, so it sees ALL bridged forwarding on
+    // the host — not just infinization-managed TAPs. Setting `policy drop` here would
+    // silently break any unrelated bridge on the box. Default-deny is enforced
+    // PER-VM instead: applyRules() appends a terminal `drop` to each VM chain
+    // (see buildAtomicRuleset), so traffic jumped into a VM chain that isn't
+    // explicitly accepted is dropped within that chain. DHCP is allowed here (above
+    // the jump rules) so VMs can still obtain a lease under default-deny.
     await this.exec([
       'add', 'chain',
       INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
@@ -904,14 +1014,19 @@ export class NftablesService {
     // Find VM rules that override department rules
     const overridingRules = vmRules.filter(r => r.overridesDept)
 
-    // Filter out department rules that are overridden
-    // A department rule is considered overridden if there's a VM rule with overridesDept=true
-    // that has the same direction and protocol (simple conflict detection)
+    // Filter out department rules that are overridden. A department rule is
+    // overridden only by a VM rule (overridesDept=true) that targets the SAME
+    // traffic — full tuple: protocol + direction + port ranges + IPs. The old
+    // check matched on (direction, protocol) alone, so a VM override for a single
+    // port (e.g. tcp/443 IN) silently suppressed EVERY department tcp/IN rule
+    // (including, say, "block tcp/23 telnet"), defeating department policy.
     const filteredDeptRules = departmentRules.filter(deptRule => {
-      return !overridingRules.some(vmRule =>
-        vmRule.direction === deptRule.direction &&
-        vmRule.protocol.toLowerCase() === deptRule.protocol.toLowerCase()
-      )
+      const overriddenBy = overridingRules.find(vmRule => this.rulesTargetSameTraffic(vmRule, deptRule))
+      if (overriddenBy) {
+        this.debug.log(`Department rule "${deptRule.name}" overridden by VM rule "${overriddenBy.name}" (same traffic)`)
+        return false
+      }
+      return true
     })
 
     // Combine and sort by priority (lower number = higher priority in evaluation order)
@@ -925,6 +1040,26 @@ export class NftablesService {
     )
 
     return merged
+  }
+
+  /**
+   * Returns true if two rules target the same traffic flow (protocol + direction +
+   * source/destination port ranges + source/destination IPs). INOUT matches both
+   * IN and OUT. This MUST stay consistent with the backend's conflict detection so
+   * an override suppresses exactly the department rule(s) it actually conflicts with.
+   */
+  private rulesTargetSameTraffic (a: FirewallRuleInput, b: FirewallRuleInput): boolean {
+    const protocolMatch = (a.protocol || 'all').toLowerCase() === (b.protocol || 'all').toLowerCase()
+    const directionMatch = a.direction === b.direction || a.direction === 'INOUT' || b.direction === 'INOUT'
+    const portMatch =
+      (a.srcPortStart ?? null) === (b.srcPortStart ?? null) &&
+      (a.srcPortEnd ?? null) === (b.srcPortEnd ?? null) &&
+      (a.dstPortStart ?? null) === (b.dstPortStart ?? null) &&
+      (a.dstPortEnd ?? null) === (b.dstPortEnd ?? null)
+    const ipMatch =
+      (a.srcIpAddr ?? null) === (b.srcIpAddr ?? null) &&
+      (a.dstIpAddr ?? null) === (b.dstIpAddr ?? null)
+    return protocolMatch && directionMatch && portMatch && ipMatch
   }
 
 

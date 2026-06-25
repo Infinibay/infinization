@@ -17,6 +17,11 @@ import { Debugger } from '@utils/debug'
  * // List interfaces on a bridge
  * const interfaces = await bridgeManager.listInterfaces('virbr0')
  */
+/** Linux interface names: max 15 chars, restricted charset (no whitespace/shell metachars). */
+const IFNAME_RE = /^[A-Za-z0-9_.-]{1,15}$/
+/** IPv4 address with CIDR suffix, e.g. "10.10.100.1/24". */
+const IPV4_CIDR_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
+
 export class BridgeManager {
   private executor: CommandExecutor
   private debug: Debugger
@@ -24,6 +29,24 @@ export class BridgeManager {
   constructor () {
     this.executor = new CommandExecutor()
     this.debug = new Debugger('bridge')
+  }
+
+  /** Validates a bridge/interface name; throws on anything outside the safe charset. */
+  private assertValidBridgeName (bridgeName: string): void {
+    if (!IFNAME_RE.test(bridgeName)) {
+      throw new Error(`Invalid bridge name: "${bridgeName}" (must match ${IFNAME_RE})`)
+    }
+  }
+
+  /** Validates an IPv4/CIDR string (octets 0-255, prefix 0-32); throws if malformed. */
+  private assertValidCidr (ipWithCidr: string): void {
+    const m = IPV4_CIDR_RE.exec(ipWithCidr)
+    const ok = m &&
+      m.slice(1, 5).every((o) => Number(o) >= 0 && Number(o) <= 255) &&
+      Number(m[5]) >= 0 && Number(m[5]) <= 32
+    if (!ok) {
+      throw new Error(`Invalid IPv4/CIDR address: "${ipWithCidr}"`)
+    }
   }
 
   /**
@@ -50,6 +73,7 @@ export class BridgeManager {
    * @throws Error if bridge already exists or creation fails
    */
   async create (bridgeName: string): Promise<void> {
+    this.assertValidBridgeName(bridgeName)
     this.debug.log(`Creating bridge: ${bridgeName}`)
 
     // Check if bridge already exists
@@ -216,6 +240,8 @@ export class BridgeManager {
    * @throws Error if assignment fails (handles already-exists gracefully)
    */
   async assignIP (bridgeName: string, ipWithCidr: string): Promise<void> {
+    this.assertValidBridgeName(bridgeName)
+    this.assertValidCidr(ipWithCidr)
     this.debug.log(`Assigning IP ${ipWithCidr} to bridge ${bridgeName}`)
 
     try {
@@ -241,6 +267,8 @@ export class BridgeManager {
    * @throws Error if removal fails (handles not-found gracefully)
    */
   async removeIP (bridgeName: string, ipWithCidr: string): Promise<void> {
+    this.assertValidBridgeName(bridgeName)
+    this.assertValidCidr(ipWithCidr)
     this.debug.log(`Removing IP ${ipWithCidr} from bridge ${bridgeName}`)
 
     try {

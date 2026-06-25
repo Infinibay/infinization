@@ -65,7 +65,7 @@ export class QemuImgService {
           'qemu-img create'
         )
       }
-      args.push('-F', 'qcow2', '-b', backingFile, path)
+      args.push('-F', 'qcow2', '-b', backingFile, '--', path)
     } else {
       // Add optional qcow2-specific options
       if (format === 'qcow2') {
@@ -81,7 +81,7 @@ export class QemuImgService {
         }
       }
 
-      args.push(path, `${sizeGB}G`)
+      args.push('--', path, `${sizeGB}G`)
     }
 
     try {
@@ -131,6 +131,7 @@ export class QemuImgService {
       const output = await this.executor.execute('qemu-img', [
         'info',
         '--output=json',
+        '--',
         path
       ])
 
@@ -220,6 +221,7 @@ export class QemuImgService {
     try {
       await this.executor.execute('qemu-img', [
         'resize',
+        '--',
         path,
         `${newSizeGB}G`
       ])
@@ -280,7 +282,7 @@ export class QemuImgService {
         args.push('-c')
       }
 
-      args.push(sourcePath, destPath)
+      args.push('--', sourcePath, destPath)
 
       await this.executor.execute('qemu-img', args)
       this.debug.log(`Image converted successfully: ${sourcePath} -> ${destPath}`)
@@ -314,6 +316,7 @@ export class QemuImgService {
       const output = await this.executor.execute('qemu-img', [
         'check',
         '--output=json',
+        '--',
         path
       ])
 

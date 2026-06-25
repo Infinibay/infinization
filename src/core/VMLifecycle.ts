@@ -75,6 +75,18 @@ import { PrismaAdapterError, PrismaAdapterErrorCode } from '../types/db.types'
 import { UnattendedInstaller } from '../unattended/UnattendedInstaller'
 import { CgroupsManager } from '../system/CgroupsManager'
 import { detectOSType, getDriverPreset } from '../config/DriverPresets'
+import { KeyedMutex } from '../utils/KeyedMutex'
+
+/**
+ * Process-wide lock serializing display-port allocation through QEMU spawn.
+ * findAvailableDisplayPort probes a port by binding+closing a socket, which frees
+ * it long before QEMU actually binds it — so two concurrent creates can probe the
+ * same free port and both hand it to QEMU (the loser gets EADDRINUSE and its
+ * create fails). createLifecycle() builds a NEW VMLifecycle per call, so this must
+ * be a module-level singleton (a per-instance field would never serialize).
+ */
+const displayPortLock = new KeyedMutex()
+const DISPLAY_PORT_LOCK_KEY = 'display-port'
 
 /**
  * Cleanup resources for partial failure recovery
@@ -307,8 +319,19 @@ export class VMLifecycle {
         })
       }
 
-      // 3. Generate MAC address if not provided
-      const macAddress = config.macAddress ?? MacAddressGenerator.generateFromVmId(vmId)
+      // 3. Generate MAC address if not provided. A caller-supplied MAC is untrusted
+      // input that flows into the QEMU `-device` option, so validate its format
+      // before use — a malformed value could inject extra device sub-properties or
+      // impersonate another VM's MAC. (Generated MACs are always well-formed.)
+      let macAddress: string
+      if (config.macAddress != null) {
+        if (!MacAddressGenerator.validate(config.macAddress)) {
+          throw new Error(`Invalid MAC address provided for VM ${vmId}: ${config.macAddress}`)
+        }
+        macAddress = config.macAddress
+      } else {
+        macAddress = MacAddressGenerator.generateFromVmId(vmId)
+      }
       this.debug.log(`MAC address: ${macAddress}`)
 
       // 4. Create and configure TAP device
@@ -415,48 +438,59 @@ export class VMLifecycle {
       // Validate hugepages at creation time - check availability and coerce to false if unavailable
       const effectiveHugepages = this.validateHugepages(config.hugepages)
 
-      // Validate display port at creation time - ensure it's within valid range and available
-      const validatedDisplayPort = this.validateDisplayPort(config.displayPort)
-      const effectiveDisplayPort = await this.findAvailableDisplayPort(validatedDisplayPort)
+      // Serialize display-port allocation through QEMU spawn process-wide so two
+      // concurrent creates cannot both probe the same free port and hand it to
+      // QEMU. Only this brief region is locked (probe -> QEMU binds the port);
+      // the rest of create() stays concurrent across VMs.
+      const { effectiveDisplayPort, qemuProcess } = await displayPortLock.runExclusive(
+        DISPLAY_PORT_LOCK_KEY,
+        async () => {
+          // Validate display port at creation time - ensure it's within valid range and available
+          const validatedDisplayPort = this.validateDisplayPort(config.displayPort)
+          const effectiveDisplayPort = await this.findAvailableDisplayPort(validatedDisplayPort)
 
-      const qemuConfig = {
-        machineType: effectiveMachineType,
-        cpuModel: effectiveCpuModel,
-        diskBus: effectiveDiskBus,
-        diskCacheMode: effectiveDiskCacheMode,
-        networkModel: effectiveNetworkModel,
-        networkQueues: effectiveNetworkQueues,
-        memoryBalloon: effectiveMemoryBalloon,
-        uefiFirmware: effectiveUefiFirmware,
-        hugepages: effectiveHugepages,
-        displayPort: effectiveDisplayPort,
-        enableNumaCtlPinning: config.enableNumaCtlPinning,
-        cpuPinningStrategy: config.cpuPinningStrategy
-      }
+          const qemuConfig = {
+            machineType: effectiveMachineType,
+            cpuModel: effectiveCpuModel,
+            diskBus: effectiveDiskBus,
+            diskCacheMode: effectiveDiskCacheMode,
+            networkModel: effectiveNetworkModel,
+            networkQueues: effectiveNetworkQueues,
+            memoryBalloon: effectiveMemoryBalloon,
+            uefiFirmware: effectiveUefiFirmware,
+            hugepages: effectiveHugepages,
+            displayPort: effectiveDisplayPort,
+            enableNumaCtlPinning: config.enableNumaCtlPinning,
+            cpuPinningStrategy: config.cpuPinningStrategy
+          }
 
-      const commandBuilder = this.buildQemuCommand(
-        config,
-        paths.diskPaths,
-        paths.qmpSocketPath,
-        paths.pidFilePath,
-        tapDevice,
-        macAddress,
-        qemuConfig
+          const commandBuilder = this.buildQemuCommand(
+            config,
+            paths.diskPaths,
+            paths.qmpSocketPath,
+            paths.pidFilePath,
+            tapDevice,
+            macAddress,
+            qemuConfig
+          )
+
+          // 7a. Mount installation ISO if unattended installation is configured
+          if (unattendedInstaller && installationIsoPath) {
+            unattendedInstaller.mountInstallationMedia(commandBuilder, installationIsoPath)
+            this.debug.log('Installation media mounted in QEMU command')
+          }
+
+          // 8. Create and start QEMU process (still holding the port lock so the
+          //    probed port stays reserved until QEMU has actually bound it).
+          this.debug.log(`Starting QEMU process for VM: ${vmId}`)
+          const qemuProcess = new QemuProcess(vmId, commandBuilder)
+          qemuProcess.setQmpSocketPath(paths.qmpSocketPath)
+          qemuProcess.setPidFilePath(paths.pidFilePath)
+          resources.qemuProcess = qemuProcess
+          await qemuProcess.start()
+          return { effectiveDisplayPort, qemuProcess }
+        }
       )
-
-      // 7a. Mount installation ISO if unattended installation is configured
-      if (unattendedInstaller && installationIsoPath) {
-        unattendedInstaller.mountInstallationMedia(commandBuilder, installationIsoPath)
-        this.debug.log('Installation media mounted in QEMU command')
-      }
-
-      // 8. Create and start QEMU process
-      this.debug.log(`Starting QEMU process for VM: ${vmId}`)
-      const qemuProcess = new QemuProcess(vmId, commandBuilder)
-      qemuProcess.setQmpSocketPath(paths.qmpSocketPath)
-      qemuProcess.setPidFilePath(paths.pidFilePath)
-      resources.qemuProcess = qemuProcess
-      await qemuProcess.start()
 
       const pid = qemuProcess.getPid()
       if (!pid) {
@@ -635,17 +669,41 @@ export class VMLifecycle {
         this.debug.log(`VM ${vmId} was marked running but process dead, resetting (TAP preserved)`)
       }
 
-      // 3. Atomically transition status from 'off' to 'starting' with optimistic locking
-      // This prevents duplicate QEMU processes if multiple start requests arrive simultaneously
+      // 2b. Recover from a stale 'starting' left by a previous crash. A successful
+      // start never leaves the row in 'starting' once it returns, so reaching here
+      // in 'starting' means the prior attempt died. Adopt a still-live QEMU as
+      // running; otherwise reset to 'off' so the transition below can proceed
+      // instead of dead-ending on the orphan-pidfile check.
+      if (initialVmConfig.status === 'starting') {
+        const stalePid = initialVmConfig.configuration?.qemuPid
+        if (stalePid && this.isProcessAlive(stalePid)) {
+          await this.prisma.updateMachineStatus(vmId, 'running')
+          this.debug.log(`VM ${vmId} was stale 'starting' but PID ${stalePid} is alive -> 'running'`)
+          return { success: true, message: `VM ${vmId} is already running`, vmId, timestamp }
+        }
+        await this.prisma.updateMachineStatus(vmId, 'off')
+        await this.prisma.clearVolatileMachineConfiguration(vmId)
+        this.debug.log(`VM ${vmId} was stale 'starting' with no live PID, resetting to 'off' (TAP preserved)`)
+      }
+
+      // 3. Atomically transition status from 'off' to 'starting' with optimistic locking.
+      // Re-read AFTER any reset above so version/status are current.
       let vmConfig = initialVmConfig
-      const expectedStatus = initialVmConfig.status === 'running' ? 'off' : initialVmConfig.status
+      let transitionBase = initialVmConfig
+      if (initialVmConfig.status === 'running' || initialVmConfig.status === 'starting') {
+        const refreshed = await this.prisma.findMachineWithConfig(vmId)
+        if (refreshed) transitionBase = refreshed
+      }
+      const expectedStatus = (transitionBase.status === 'running' || transitionBase.status === 'starting')
+        ? 'off'
+        : transitionBase.status
       if (expectedStatus === 'off') {
         try {
           const transitionResult = await this.prisma.transitionVMStatus(
             vmId,
             'off',
             'starting',
-            initialVmConfig.version
+            transitionBase.version
           )
           vmConfig = transitionResult.vmConfig
           this.debug.log(`VM ${vmId} status transitioned to 'starting' (version: ${transitionResult.newVersion})`)
@@ -804,6 +862,12 @@ export class VMLifecycle {
       const displayAddr = vmConfig.configuration?.graphicHost ?? '0.0.0.0'
 
       // 8a. Find an available display port (always start from SPICE_MIN_PORT)
+      // NOTE: the same probe->bind TOCTOU race as create() exists here, but the
+      // allocation is far from the QEMU spawn (TAP/firewall setup in between), so
+      // wrapping it in displayPortLock would over-serialize starts. A tight fix
+      // needs relocating allocation to just before the spawn (or an EADDRINUSE
+      // retry) — tracked as a follow-up. Concurrent starts are far rarer than the
+      // pool's concurrent creates, which create() already guards.
       const displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
 
       // 8b. Update database with allocated port (for UI display)
@@ -1202,7 +1266,7 @@ export class VMLifecycle {
           // Fall through to force kill if enabled
           if (stopConfig.force && this.isProcessAlive(pid)) {
             this.debug.log('warn', `Falling back to force kill for VM ${vmId} (socket missing)`)
-            await this.forceKillProcess(pid)
+            await this.forceKillProcess(pid, vmConfig.internalName)
             forced = true
           } else {
             throw new LifecycleError(
@@ -1233,7 +1297,7 @@ export class VMLifecycle {
               if (!exited && stopConfig.force) {
                 // Timeout protection: guest may not support ACPI or be hung
                 this.debug.log('warn', `ACPI shutdown timed out after ${stopConfig.timeout}ms - guest may not support ACPI or is hung. Force killing VM ${vmId}`)
-                await this.forceKillProcess(pid)
+                await this.forceKillProcess(pid, vmConfig.internalName)
                 forced = true
               }
             } catch (qmpError) {
@@ -1241,7 +1305,7 @@ export class VMLifecycle {
               this.debug.log('error', `QMP powerdown failed for VM ${vmId}: ${errorMsg}`)
               if (stopConfig.force && pid && this.isProcessAlive(pid)) {
                 this.debug.log('warn', `Falling back to force kill for VM ${vmId}`)
-                await this.forceKillProcess(pid)
+                await this.forceKillProcess(pid, vmConfig.internalName)
                 forced = true
               }
             }
@@ -1269,7 +1333,7 @@ export class VMLifecycle {
                 if (!exited && stopConfig.force) {
                   // Timeout protection: guest may not support ACPI or be hung
                   this.debug.log('warn', `ACPI shutdown timed out after ${stopConfig.timeout}ms - guest may not support ACPI or is hung. Force killing VM ${vmId}`)
-                  await this.forceKillProcess(pid)
+                  await this.forceKillProcess(pid, vmConfig.internalName)
                   forced = true
                 }
               } finally {
@@ -1281,7 +1345,7 @@ export class VMLifecycle {
               this.debug.log('error', `QMP powerdown failed for VM ${vmId}: ${errorMsg}`)
               if (stopConfig.force && pid && this.isProcessAlive(pid)) {
                 this.debug.log('warn', `Falling back to force kill for VM ${vmId}`)
-                await this.forceKillProcess(pid)
+                await this.forceKillProcess(pid, vmConfig.internalName)
                 forced = true
               }
             }
@@ -1290,7 +1354,7 @@ export class VMLifecycle {
       } else if (pid && this.isProcessAlive(pid)) {
         // No graceful shutdown, just force kill
         if (stopConfig.force) {
-          await this.forceKillProcess(pid)
+          await this.forceKillProcess(pid, vmConfig.internalName)
           forced = true
         } else {
           throw new LifecycleError(
@@ -1402,7 +1466,10 @@ export class VMLifecycle {
         }
       }
 
-      // Stop VM if running
+      // Stop VM if running.
+      // RE-ENTRANCY: keep this at the lifecycle level (this.stop). The facade
+      // (Infinization.destroyVM) already holds the per-vmId mutex; calling the
+      // facade stopVM here would re-acquire the same key and self-deadlock.
       if (vmConfig.status === 'running') {
         this.debug.log(`VM ${vmId} is running, stopping first`)
         await this.stop(vmId, { graceful: false, timeout: 5000, force: true })
@@ -1458,6 +1525,10 @@ export class VMLifecycle {
     const timestamp = new Date()
 
     try {
+      // RE-ENTRANCY: these self-calls MUST stay at the lifecycle level
+      // (this.stop / this.start). The facade (Infinization.restartVM) holds the
+      // per-vmId mutex for the whole restart; routing back through the facade
+      // methods here would re-acquire the same key and self-deadlock.
       // Stop the VM
       const stopResult = await this.stop(vmId, {
         graceful: true,
@@ -1539,18 +1610,10 @@ export class VMLifecycle {
         )
       }
 
-      const qmpClient = new QMPClient(qmpSocketPath, {
-        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
-      })
-
-      try {
-        await qmpClient.connect()
-        await qmpClient.stop()
-        await this.prisma.updateMachineStatus(vmId, 'suspended')
-        this.emitEvent('machines', 'suspend', vmId)
-      } finally {
-        await qmpClient.disconnect()
-      }
+      // Reuse the EventHandler's live QMP connection (single-client socket).
+      await this.withQMPClient(vmId, qmpSocketPath, (client) => client.stop())
+      await this.prisma.updateMachineStatus(vmId, 'suspended')
+      this.emitEvent('machines', 'suspend', vmId)
 
       return {
         success: true,
@@ -1603,18 +1666,10 @@ export class VMLifecycle {
         )
       }
 
-      const qmpClient = new QMPClient(qmpSocketPath, {
-        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
-      })
-
-      try {
-        await qmpClient.connect()
-        await qmpClient.cont()
-        await this.prisma.updateMachineStatus(vmId, 'running')
-        this.emitEvent('machines', 'resume', vmId)
-      } finally {
-        await qmpClient.disconnect()
-      }
+      // Reuse the EventHandler's live QMP connection (single-client socket).
+      await this.withQMPClient(vmId, qmpSocketPath, (client) => client.cont())
+      await this.prisma.updateMachineStatus(vmId, 'running')
+      this.emitEvent('machines', 'resume', vmId)
 
       return {
         success: true,
@@ -1667,17 +1722,9 @@ export class VMLifecycle {
         )
       }
 
-      const qmpClient = new QMPClient(qmpSocketPath, {
-        connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
-      })
-
-      try {
-        await qmpClient.connect()
-        await qmpClient.reset()
-        this.emitEvent('machines', 'update', vmId, { type: 'hardware' })
-      } finally {
-        await qmpClient.disconnect()
-      }
+      // Reuse the EventHandler's live QMP connection (single-client socket).
+      await this.withQMPClient(vmId, qmpSocketPath, (client) => client.reset())
+      this.emitEvent('machines', 'update', vmId, { type: 'hardware' })
 
       return {
         success: true,
@@ -1740,25 +1787,17 @@ export class VMLifecycle {
       let qmpStatus: string | null = null
       let uptime: number | null = null
 
-      // Query QMP status if process is alive
+      // Query QMP status if process is alive.
+      // Reuse the EventHandler's live QMP connection — opening a second client
+      // on the single-client socket would hang until timeout and leave qmpStatus
+      // null (masking the real run-state) for every monitored VM.
       if (processAlive && qmpSocketPath) {
         try {
-          const qmpClient = new QMPClient(qmpSocketPath, {
-            connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
-          })
-
-          try {
-            await qmpClient.connect()
-            const status = await qmpClient.queryStatus()
-            qmpStatus = status.status
-
-            // Calculate uptime if running
-            // QMP doesn't provide direct uptime, would need to track start time
-          } finally {
-            await qmpClient.disconnect()
-          }
+          const status = await this.withQMPClient(vmId, qmpSocketPath, (client) => client.queryStatus())
+          qmpStatus = status.status
+          // QMP doesn't provide direct uptime, would need to track start time
         } catch {
-          // QMP connection failed, but process is alive
+          // QMP query failed, but process is alive
           this.debug.log('warn', `Failed to query QMP status for VM: ${vmId}`)
         }
       }
@@ -1785,6 +1824,41 @@ export class VMLifecycle {
   // ===========================================================================
   // Private Helper Methods
   // ===========================================================================
+
+  /**
+   * Runs an operation against the VM's QMP socket, reusing the EventHandler's
+   * existing connection when the VM is attached.
+   *
+   * QEMU's QMP socket accepts only ONE client at a time. While EventHandler
+   * holds the connection (true for every monitored/running VM), opening a
+   * second QMPClient connects at the socket level but QEMU never sends the
+   * greeting, so connect() blocks until connectTimeout and the operation fails.
+   * That is why suspend/resume/reset/getStatus historically broke on running
+   * VMs. We therefore borrow the live client when present and only open — and
+   * close — a transient one when the VM is not attached. A BORROWED client is
+   * never disconnected here: it belongs to EventHandler.
+   */
+  private async withQMPClient<T> (
+    vmId: string,
+    qmpSocketPath: string,
+    fn: (client: QMPClient) => Promise<T>
+  ): Promise<T> {
+    const borrowed = this.eventHandler.getQMPClient(vmId)
+    if (borrowed) {
+      this.debug.log('info', `Reusing existing QMP connection for VM ${vmId}`)
+      return await fn(borrowed)
+    }
+
+    const client = new QMPClient(qmpSocketPath, {
+      connectTimeout: DEFAULT_QMP_CONNECT_TIMEOUT
+    })
+    await client.connect()
+    try {
+      return await fn(client)
+    } finally {
+      await client.disconnect()
+    }
+  }
 
   /**
    * Validates VM creation configuration
@@ -2644,16 +2718,75 @@ export class VMLifecycle {
   }
 
   /**
-   * Force kills a process
+   * Verifies that the live process at `pid` is actually this VM's QEMU process
+   * before we send it a destructive signal. Guards against PID reuse: a stale
+   * PID read from the DB may now belong to an unrelated host process.
+   *
+   * Identification: the QEMU cmdline always contains `qemu-system` plus a token
+   * unique to this VM — its internalName, which is embedded in both the -qmp
+   * socket path and the -pidfile path on the command line.
+   *
+   * Linux-only (reads /proc). On other platforms /proc is unavailable so we
+   * cannot verify and conservatively return true to preserve existing behavior.
+   * If the process is already gone (ENOENT) we return false so the caller skips
+   * the kill. Any other read error also returns false (fail closed: never
+   * SIGKILL a PID we could not positively identify).
    */
-  private async forceKillProcess (pid: number): Promise<void> {
+  private pidBelongsToVM (pid: number, token: string): boolean {
+    if (process.platform !== 'linux') {
+      // No /proc to inspect; cannot verify. Preserve prior behavior.
+      return true
+    }
+    if (!token) {
+      this.debug.log('warn', `pidBelongsToVM: empty identifying token for PID ${pid}, cannot verify ownership`)
+      return false
+    }
+    try {
+      const raw = fs.readFileSync(`/proc/${pid}/cmdline`)
+      // /proc/<pid>/cmdline is NUL-delimited; normalize to spaces for matching.
+      const cmdline = raw.toString('utf8').replace(/\0/g, ' ')
+      const looksLikeQemu = cmdline.includes('qemu-system')
+      const matchesVM = cmdline.includes(token)
+      if (!looksLikeQemu || !matchesVM) {
+        this.debug.log('warn', `pidBelongsToVM: PID ${pid} does not match this VM (qemu=${looksLikeQemu}, token='${token}' matched=${matchesVM}) - refusing to signal it`)
+        return false
+      }
+      return true
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException
+      if (err && err.code === 'ENOENT') {
+        // Process already gone (or no /proc entry); nothing to verify or kill.
+        this.debug.log('info', `pidBelongsToVM: PID ${pid} has no /proc entry (already exited)`)
+        return false
+      }
+      this.debug.log('warn', `pidBelongsToVM: failed to read /proc/${pid}/cmdline: ${err?.message ?? String(error)} - refusing to signal PID ${pid}`)
+      return false
+    }
+  }
+
+  /**
+   * Force kills a process, but only after verifying (on Linux) that the PID
+   * still belongs to this VM's QEMU. This prevents SIGKILL-ing an unrelated
+   * host process when the DB-recorded PID has been reused.
+   *
+   * @param pid - The PID to kill
+   * @param token - VM identifying token (internalName) expected in the QEMU cmdline
+   * @returns true if a kill was actually attempted, false if it was skipped
+   */
+  private async forceKillProcess (pid: number, token: string): Promise<boolean> {
+    if (!this.pidBelongsToVM(pid, token)) {
+      this.debug.log('warn', `Skipping force kill of PID ${pid}: not confirmed to be this VM's QEMU process (token='${token}')`)
+      return false
+    }
     try {
       process.kill(pid, 'SIGKILL')
       // Wait a bit for the process to terminate
       await this.waitForProcessExit(pid, 5000)
+      return true
     } catch (error) {
       // Process might already be dead
       this.debug.log('warn', `Force kill failed: ${error instanceof Error ? error.message : String(error)}`)
+      return false
     }
   }
 

@@ -486,7 +486,7 @@ export class BackupService extends EventEmitter {
       const sourceInfo = await this.qemuImg.getImageInfo(sourcePath)
 
       // Create a qcow2 overlay with the parent backup as the backing file
-      const args = ['create', '-f', 'qcow2', '-b', parentDiskBackupPath, '-F', 'qcow2', backupPath]
+      const args = ['create', '-f', 'qcow2', '-b', parentDiskBackupPath, '-F', 'qcow2', '--', backupPath]
       await this.executor.execute('qemu-img', args)
 
       // Optionally apply compression to the overlay

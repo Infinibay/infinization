@@ -47,6 +47,13 @@ export const NFTABLES_LOCK_FILE = `${NFTABLES_PERSISTENCE_DIR}/.lock`
 /** Maximum age of lock file before considering it stale (5 minutes) */
 const LOCK_MAX_AGE_MS = 5 * 60 * 1000
 
+/** How long to keep retrying to acquire the persistence lock before giving up. */
+const LOCK_ACQUIRE_TIMEOUT_MS = 10 * 1000
+/** Base backoff between lock-acquire attempts (doubles, capped at LOCK_RETRY_MAX_MS). */
+const LOCK_RETRY_BASE_MS = 50
+/** Maximum backoff between lock-acquire attempts. */
+const LOCK_RETRY_MAX_MS = 500
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -497,38 +504,45 @@ export class NftablesPersistence {
    */
   private async acquireLock (): Promise<void> {
     const lockFile = `${this.config.persistenceDir}/.lock`
-
-    // Check for stale lock
-    try {
-      const stats = await fs.stat(lockFile)
-      const age = Date.now() - stats.mtime.getTime()
-
-      if (age > LOCK_MAX_AGE_MS) {
-        this.debug.log('Removing stale lock file')
-        await fs.unlink(lockFile)
-      } else {
-        // Lock is held by another process
-        throw new Error('Lock file exists and is not stale')
-      }
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error)
-      // ENOENT means no lock file - that's fine
-      if (!errorMsg.includes('ENOENT')) {
-        if (errorMsg.includes('Lock file exists')) {
-          throw error
-        }
-      }
-    }
-
-    // Ensure directory exists
     await this.ensureDirectory()
 
-    // Create lock file with exclusive flag
-    const handle = await fs.open(lockFile, 'wx')
-    await handle.write(`${process.pid}\n${Date.now()}\n`)
-    await handle.close()
+    const deadline = Date.now() + LOCK_ACQUIRE_TIMEOUT_MS
+    let attempt = 0
 
-    this.debug.log('Lock acquired')
+    // Retry with capped exponential backoff instead of throwing on first contention.
+    // A second rapid change (e.g. two firewall edits) used to make this throw; the
+    // export was then skipped and the on-disk ruleset went stale, so a later reboot
+    // (restoreFromDisk) silently reverted the most recent change. Waiting briefly for
+    // the in-flight export to finish keeps the persisted ruleset current.
+    for (;;) {
+      // Clear a stale lock left by a crashed writer.
+      try {
+        const stats = await fs.stat(lockFile)
+        if (Date.now() - stats.mtime.getTime() > LOCK_MAX_AGE_MS) {
+          this.debug.log('Removing stale lock file')
+          await fs.unlink(lockFile).catch(() => { /* raced with another remover */ })
+        }
+      } catch { /* ENOENT — no lock present, proceed to acquire */ }
+
+      try {
+        const handle = await fs.open(lockFile, 'wx')
+        await handle.write(`${process.pid}\n${Date.now()}\n`)
+        await handle.close()
+        this.debug.log('Lock acquired')
+        return
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error)
+        if (!errorMsg.includes('EEXIST')) {
+          throw error // unexpected filesystem error
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out acquiring nftables persistence lock after ${LOCK_ACQUIRE_TIMEOUT_MS}ms`)
+        }
+        const delay = Math.min(LOCK_RETRY_MAX_MS, LOCK_RETRY_BASE_MS * (2 ** attempt))
+        attempt++
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+    }
   }
 
   /**

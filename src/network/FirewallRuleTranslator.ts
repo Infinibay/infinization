@@ -341,6 +341,15 @@ export class FirewallRuleTranslator {
       )
     }
 
+    // Action must be a known nft verdict — never cast an arbitrary string into the rule.
+    if (!['ACCEPT', 'DROP', 'REJECT'].includes(rule.action)) {
+      throw this.createError(
+        NftablesErrorCode.RULE_INVALID,
+        `Invalid action: ${rule.action} (expected ACCEPT, DROP or REJECT)`,
+        rule.id
+      )
+    }
+
     if (!rule.direction) {
       throw this.createError(
         NftablesErrorCode.RULE_INVALID,
@@ -355,6 +364,23 @@ export class FirewallRuleTranslator {
       throw this.createError(
         NftablesErrorCode.UNSUPPORTED_PROTOCOL,
         `Unsupported protocol: ${rule.protocol}`,
+        rule.id
+      )
+    }
+
+    // A port range END without a START is meaningless — and silently dropping the
+    // port match would turn a per-port rule into an all-ports rule (M6). Reject it.
+    if (rule.srcPortEnd != null && rule.srcPortStart == null) {
+      throw this.createError(
+        NftablesErrorCode.INVALID_PORT_RANGE,
+        'srcPortEnd specified without srcPortStart',
+        rule.id
+      )
+    }
+    if (rule.dstPortEnd != null && rule.dstPortStart == null) {
+      throw this.createError(
+        NftablesErrorCode.INVALID_PORT_RANGE,
+        'dstPortEnd specified without dstPortStart',
         rule.id
       )
     }

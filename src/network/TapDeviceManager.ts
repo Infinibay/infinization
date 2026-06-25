@@ -1,3 +1,4 @@
+import { createHash } from 'crypto'
 import { CommandExecutor } from '../utils/commandExecutor'
 import { Debugger } from '../utils/debug'
 import { retryOnBusy, sleep } from '../utils/retry'
@@ -9,6 +10,14 @@ const POST_BRINGDOWN_DELAY_MS = 200
 const CREATE_MAX_RETRIES = 3
 /** Delay between creation retries (ms) */
 const CREATE_RETRY_DELAY_MS = 500
+/**
+ * Grace window after a TAP is created during which the orphan-cleanup scan will NOT
+ * destroy it. A just-created TAP has no carrier until QEMU attaches (which can take
+ * seconds while the VM boots), so without this guard a concurrent VM's create() —
+ * whose first step is a global orphan scan — would see the booting VM's TAP as
+ * "persist on + no carrier" and tear it down, cutting that VM's network (B7).
+ */
+const CREATE_GRACE_MS = 60_000
 
 /**
  * TapDeviceManager manages TAP network devices for VMs.
@@ -28,9 +37,34 @@ export class TapDeviceManager {
   private executor: CommandExecutor
   private debug: Debugger
 
+  /**
+   * Creation timestamps (epoch ms) of TAPs this process has created, keyed by name.
+   * Static so the grace window is honored across ALL TapDeviceManager instances —
+   * concurrent VM starts may use different instances but must not clean up each
+   * other's just-created TAPs. See CREATE_GRACE_MS / cleanupOrphanedTapDevices.
+   */
+  private static readonly recentlyCreated = new Map<string, number>()
+
   constructor () {
     this.executor = new CommandExecutor()
     this.debug = new Debugger('tap-device')
+  }
+
+  /** Records that a TAP was just created, starting its cleanup grace window. */
+  private static markCreated (tapName: string): void {
+    TapDeviceManager.recentlyCreated.set(tapName, Date.now())
+  }
+
+  /** True if the TAP is still inside its post-creation grace window. */
+  private static isWithinGrace (tapName: string): boolean {
+    const created = TapDeviceManager.recentlyCreated.get(tapName)
+    if (created === undefined) return false
+    if (Date.now() - created >= CREATE_GRACE_MS) {
+      // Window elapsed — drop the entry so the map doesn't grow unbounded.
+      TapDeviceManager.recentlyCreated.delete(tapName)
+      return false
+    }
+    return true
   }
 
   /**
@@ -67,6 +101,9 @@ export class TapDeviceManager {
     for (let attempt = 1; attempt <= CREATE_MAX_RETRIES; attempt++) {
       try {
         await this.executor.execute('ip', ['tuntap', 'add', 'dev', tapName, 'mode', 'tap'])
+        // Start the cleanup grace window so a concurrent create()'s orphan scan won't
+        // tear this TAP down while its VM is still booting (no carrier yet).
+        TapDeviceManager.markCreated(tapName)
         this.debug.log(`TAP device created successfully: ${tapName}${attempt > 1 ? ` (attempt ${attempt})` : ''}`)
         return tapName
       } catch (error) {
@@ -298,37 +335,42 @@ export class TapDeviceManager {
     this.debug.log(`Checking carrier status for TAP device: ${tapName}`)
 
     try {
-      const output = await this.executor.execute('ip', ['link', 'show', tapName])
-
-      // Parse the first line for interface flags
-      // Example outputs:
-      // "12: vnet-abc123: <NO-CARRIER,BROADCAST,MULTICAST,UP> ..." -> no carrier
-      // "12: vnet-abc123: <BROADCAST,MULTICAST,UP,LOWER_UP> ..." -> has carrier
-      const firstLine = output.split('\n')[0]
-
-      // Check for NO-CARRIER flag (indicates QEMU not connected)
-      if (firstLine.includes('NO-CARRIER')) {
-        this.debug.log(`TAP device ${tapName} has NO-CARRIER flag (QEMU not connected or disconnected)`)
+      // Use JSON output (`ip -j`) instead of scraping the human-readable text, which
+      // varies across iproute2 versions and locales. Each entry carries a `flags`
+      // array, e.g. ["BROADCAST","MULTICAST","UP","LOWER_UP"] or [...,"NO-CARRIER"].
+      const output = await this.executor.execute('ip', ['-j', 'link', 'show', tapName])
+      const link = this.parseFirstLink(output)
+      if (!link) {
+        this.debug.log(`TAP device ${tapName} not found / unparseable, treating as no carrier`)
         return false
       }
 
-      // Check for LOWER_UP which indicates carrier present and link layer is up
-      // Also check UP to ensure the interface is administratively up
-      const hasUp = firstLine.includes(',UP') || firstLine.includes('<UP')
-      const hasLowerUp = firstLine.includes('LOWER_UP')
+      const flags: string[] = Array.isArray(link.flags) ? link.flags : []
 
-      if (hasUp && hasLowerUp) {
-        this.debug.log(`TAP device ${tapName} has carrier (QEMU connected, flags: UP,LOWER_UP)`)
-        return true
+      if (flags.includes('NO-CARRIER')) {
+        this.debug.log(`TAP device ${tapName} has NO-CARRIER (QEMU not connected)`)
+        return false
       }
 
-      // UP but no LOWER_UP and no NO-CARRIER - ambiguous state, treat as no carrier
-      this.debug.log(`TAP device ${tapName} in ambiguous state - no LOWER_UP flag`)
-      return false
+      // Carrier present when the interface is administratively up AND the link layer
+      // is up (LOWER_UP). operstate UP is an additional positive signal.
+      const hasCarrier = flags.includes('UP') && (flags.includes('LOWER_UP') || link.operstate === 'UP')
+      this.debug.log(`TAP device ${tapName} carrier=${hasCarrier} (flags: ${flags.join(',')}, operstate: ${link.operstate ?? 'n/a'})`)
+      return hasCarrier
     } catch (error) {
       // Device doesn't exist or other error - treat as no carrier
       this.debug.log(`Failed to check carrier for ${tapName}: ${error instanceof Error ? error.message : String(error)}`)
       return false
+    }
+  }
+
+  /** Parses `ip -j link show` output and returns the first link object, or null. */
+  private parseFirstLink (output: string): { flags?: string[]; operstate?: string; ifname?: string } | null {
+    try {
+      const parsed = JSON.parse(output)
+      return Array.isArray(parsed) && parsed.length > 0 ? parsed[0] : null
+    } catch {
+      return null
     }
   }
 
@@ -342,24 +384,21 @@ export class TapDeviceManager {
     this.debug.log(`Scanning system for TAP devices with prefix ${TAP_NAME_PREFIX}`)
 
     try {
-      const output = await this.executor.execute('ip', ['link', 'show', 'type', 'tuntap'])
+      // JSON output is robust across iproute2 versions/locales (vs. regex on text).
+      const output = await this.executor.execute('ip', ['-j', 'link', 'show', 'type', 'tuntap'])
 
-      // Parse output to extract device names
-      // Each device line starts with: "index: device_name: <flags>..."
-      const deviceNames: string[] = []
-      const lines = output.split('\n')
-
-      for (const line of lines) {
-        // Match lines like: "12: vnet-abc123: <BROADCAST,MULTICAST,UP>"
-        const match = line.match(/^\d+:\s+([^:@]+)[@:]/)
-        if (match) {
-          const deviceName = match[1].trim()
-          // Only include devices with our prefix
-          if (deviceName.startsWith(TAP_NAME_PREFIX)) {
-            deviceNames.push(deviceName)
-          }
-        }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(output)
+      } catch {
+        this.debug.log('warn', 'Could not parse `ip -j` output for tuntap devices')
+        return []
       }
+
+      const deviceNames = (Array.isArray(parsed) ? parsed : [])
+        .map((link) => (link && typeof link.ifname === 'string' ? link.ifname : null))
+        // Only include devices with our prefix
+        .filter((name): name is string => name !== null && name.startsWith(TAP_NAME_PREFIX))
 
       this.debug.log(`Found ${deviceNames.length} TAP devices: [${deviceNames.join(', ')}]`)
       return deviceNames
@@ -437,6 +476,13 @@ export class TapDeviceManager {
 
     for (const tapName of tapDevices) {
       try {
+        // Never touch a TAP we just created — its VM may still be booting (QEMU not
+        // yet attached => no carrier), which would otherwise look orphaned (B7).
+        if (TapDeviceManager.isWithinGrace(tapName)) {
+          this.debug.log(`Skipping ${tapName}: within post-creation grace window`)
+          continue
+        }
+
         if (await this.isOrphaned(tapName)) {
           this.debug.log(`Cleaning orphaned TAP device: ${tapName}`)
           await this.destroy(tapName)
@@ -469,18 +515,24 @@ export class TapDeviceManager {
 
   /**
    * Generates a TAP device name from a VM ID.
-   * Format: vnet-{first-8-chars-of-vmId}
-   * Ensures name is valid for Linux interface naming (max 15 chars).
+   * Format: `vnet-{N-hex-of-sha256(vmId)}` where N fills the IFNAMSIZ budget.
+   *
+   * Derived from a SHA-256 hash of the FULL vmId rather than a prefix substring of
+   * the UUID. The old `first-10-chars` scheme had low effective entropy (UUIDs share
+   * structure), so two VMs could map to the SAME interface name — and since firewall
+   * jump rules and bridge attachment key on the TAP name, the second VM's create()
+   * would tear down the first VM's live TAP (cutting its network). The hash makes
+   * collisions negligible while staying deterministic and within the 15-char limit.
+   *
    * @param vmId - The VM identifier
    * @returns A valid TAP device name
    */
   private generateTapName (vmId: string): string {
-    // Calculate max length for vmId portion
-    const maxVmIdLength = MAX_TAP_NAME_LENGTH - TAP_NAME_PREFIX.length
+    // Hex chars available for the vmId-derived portion within IFNAMSIZ (15).
+    const hashLength = MAX_TAP_NAME_LENGTH - TAP_NAME_PREFIX.length
 
-    // Take first N characters of vmId (removing any non-alphanumeric characters)
-    const sanitizedVmId = vmId.replace(/[^a-zA-Z0-9]/g, '').substring(0, maxVmIdLength)
+    const digest = createHash('sha256').update(vmId).digest('hex').substring(0, hashLength)
 
-    return `${TAP_NAME_PREFIX}${sanitizedVmId}`
+    return `${TAP_NAME_PREFIX}${digest}`
   }
 }

@@ -3,6 +3,8 @@
  * Used by NftablesService to manage VM firewall rules at Layer 2 using the bridge family.
  */
 
+import { createHash } from 'crypto'
+
 // ============================================================================
 // Enums
 // ============================================================================
@@ -111,24 +113,46 @@ export const MAX_CHAIN_NAME_LENGTH = 31
 export const VM_CHAIN_PREFIX = 'vm_'
 
 /**
+ * Terminal (fall-through) action for a VM chain — the posture applied AFTER all
+ * explicit rules. Mirrors the department firewall policy:
+ *   - 'drop'   => default-deny  (BLOCK_ALL): traffic not explicitly accepted is dropped.
+ *   - 'accept' => default-allow (ALLOW_ALL): traffic not explicitly dropped is accepted.
+ *
+ * Defaults to 'drop' everywhere (fail-closed) when the caller does not specify one.
+ */
+export type FirewallDefaultAction = 'accept' | 'drop'
+
+/**
+ * Number of hex chars of the vmId hash used in a chain name.
+ * 24 hex = 96 bits, giving a collision probability that is effectively zero even at
+ * millions of VMs, while keeping `vm_` + 24 = 27 chars within MAX_CHAIN_NAME_LENGTH (31).
+ */
+export const VM_CHAIN_HASH_LENGTH = 24
+
+/**
  * Generates a chain name from a VM ID.
  * This is the single source of truth for chain naming across the codebase.
- * Format: vm_{first-8-chars-of-vmId-sanitized}
+ * Format: `vm_{first-24-hex-of-sha256(vmId)}`
+ *
+ * The name is derived from a SHA-256 hash of the FULL vmId rather than a substring,
+ * because a substring of the UUID (the old `first-8-chars` scheme) has only ~32 bits
+ * of entropy: two VMs sharing those 8 chars would map to the SAME chain, so applying
+ * rules to one would overwrite the other's and removing one would delete the other's
+ * chain (a silent cross-VM firewall break). The hash makes collisions astronomically
+ * unlikely while staying deterministic — every call site (create/apply/remove) derives
+ * the exact same name from the vmId.
  *
  * @param vmId - The VM identifier (UUID or other ID format)
  * @returns The nftables chain name for this VM
  *
  * @example
- * generateVMChainName('abc-123-def-456') // Returns 'vm_abc123de'
- * generateVMChainName('UPPER-case-ID') // Returns 'vm_uppercase'
+ * generateVMChainName('abc-123-def-456') // Returns 'vm_<24 hex chars>'
  */
 export function generateVMChainName (vmId: string): string {
-  // Remove non-alphanumeric characters and take first 8 chars
-  const sanitizedId = vmId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 8).toLowerCase()
+  const digest = createHash('sha256').update(vmId).digest('hex').substring(0, VM_CHAIN_HASH_LENGTH)
+  const chainName = `${VM_CHAIN_PREFIX}${digest}`
 
-  const chainName = `${VM_CHAIN_PREFIX}${sanitizedId}`
-
-  // Ensure name doesn't exceed max length
+  // Defensive: never exceed the nftables chain-name limit.
   if (chainName.length > MAX_CHAIN_NAME_LENGTH) {
     return chainName.substring(0, MAX_CHAIN_NAME_LENGTH)
   }

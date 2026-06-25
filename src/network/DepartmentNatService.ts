@@ -28,6 +28,11 @@ const NAT_TABLE_FAMILY = 'ip'
 /** Chain name for postrouting NAT rules */
 const NAT_CHAIN_NAME = 'postrouting'
 
+/** Linux interface name: max 15 chars, safe charset. */
+const IFNAME_RE = /^[A-Za-z0-9_.-]{1,15}$/
+/** IPv4 subnet in CIDR notation, e.g. "10.10.100.0/24". */
+const IPV4_CIDR_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
+
 export class DepartmentNatService {
   private executor: CommandExecutor
   private debug: Debugger
@@ -36,6 +41,29 @@ export class DepartmentNatService {
   constructor () {
     this.executor = new CommandExecutor()
     this.debug = new Debugger('dept-nat')
+  }
+
+  /** Validates a bridge/interface name; throws on anything outside the safe charset. */
+  private assertValidBridgeName (bridgeName: string): void {
+    if (!IFNAME_RE.test(bridgeName)) {
+      throw new Error(`Invalid bridge name for NAT: "${bridgeName}"`)
+    }
+  }
+
+  /** Validates an IPv4 subnet (octets 0-255, prefix 0-32, mask required); throws if malformed. */
+  private assertValidSubnet (subnet: string): void {
+    const m = IPV4_CIDR_RE.exec(subnet)
+    const ok = m &&
+      m.slice(1, 5).every((o) => Number(o) >= 0 && Number(o) <= 255) &&
+      Number(m[5]) >= 0 && Number(m[5]) <= 32
+    if (!ok) {
+      throw new Error(`Invalid IPv4 subnet for NAT: "${subnet}" (expected CIDR like 10.10.100.0/24)`)
+    }
+  }
+
+  /** Exact nft comment used to tag a department's masquerade rule. */
+  private natComment (bridgeName: string): string {
+    return `comment "dept-${bridgeName}"`
   }
 
   /**
@@ -71,9 +99,20 @@ export class DepartmentNatService {
    * @param bridgeName - The bridge name for this department
    */
   async addMasquerade (subnet: string, bridgeName: string): Promise<void> {
+    this.assertValidSubnet(subnet)
+    this.assertValidBridgeName(bridgeName)
     this.debug.log(`Adding masquerade for subnet ${subnet} via bridge ${bridgeName}`)
 
     await this.ensureInitialized()
+
+    // Idempotency guard. `nft add rule` does NOT report "File exists" (only add
+    // table/chain/element do), so the old catch-and-ignore below was dead code and
+    // every call — e.g. on each boot-time reconcile — appended ANOTHER identical
+    // masquerade rule, accumulating duplicates indefinitely. Check first instead.
+    if (await this.hasMasquerade(bridgeName)) {
+      this.debug.log(`Masquerade rule for ${bridgeName} already present, skipping`)
+      return
+    }
 
     try {
       // Add masquerade rule with comment for identification
@@ -89,11 +128,6 @@ export class DepartmentNatService {
       this.debug.log(`Masquerade rule added for ${subnet} (bridge: ${bridgeName})`)
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      // Ignore if rule already exists
-      if (errorMessage.includes('File exists')) {
-        this.debug.log(`Masquerade rule for ${bridgeName} already exists`)
-        return
-      }
       throw new Error(`Failed to add masquerade for ${bridgeName}: ${errorMessage}`)
     }
   }
@@ -115,9 +149,11 @@ export class DepartmentNatService {
         '-a', 'list', 'chain', NAT_TABLE_FAMILY, NAT_TABLE_NAME, NAT_CHAIN_NAME
       ])
 
-      // Find rules with comment containing our bridge name
-      // Format: ... handle N ... comment "dept-bridgeName"
-      const commentPattern = `dept-${bridgeName}`
+      // Match the EXACT quoted comment (`comment "dept-<bridge>"`), not a substring.
+      // Substring matching on `dept-<bridge>` would also match another department
+      // whose bridge name has this one as a prefix (e.g. dept-abc vs dept-abc123),
+      // deleting the wrong department's NAT rule.
+      const commentPattern = this.natComment(bridgeName)
       const lines = output.split('\n')
 
       for (const line of lines) {
@@ -160,7 +196,8 @@ export class DepartmentNatService {
         'list', 'chain', NAT_TABLE_FAMILY, NAT_TABLE_NAME, NAT_CHAIN_NAME
       ])
 
-      return output.includes(`dept-${bridgeName}`)
+      // Exact quoted-comment match (avoids prefix collisions between bridge names).
+      return output.includes(this.natComment(bridgeName))
     } catch {
       return false
     }

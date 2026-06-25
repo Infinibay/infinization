@@ -390,6 +390,54 @@ export class PrismaAdapter implements DatabaseAdapter {
   }
 
   /**
+   * Find all VMs whose status is in the given list, including configuration.
+   * Used by startup reconciliation to locate VMs stuck in transient states.
+   */
+  async findMachinesByStatuses (statuses: string[]): Promise<RunningVMRecord[]> {
+    this.debug.log(`findMachinesByStatuses: [${statuses.join(', ')}]`)
+    try {
+      const machines = await this.prisma.machine.findMany({
+        where: { status: { in: statuses } },
+        include: {
+          configuration: {
+            select: {
+              qemuPid: true,
+              tapDeviceName: true,
+              qmpSocketPath: true,
+              guestAgentSocketPath: true,
+              infiniServiceSocketPath: true
+            }
+          }
+        }
+      })
+
+      this.debug.log('info', `Found ${machines.length} VM(s) in statuses [${statuses.join(', ')}]`)
+
+      return machines.map(machine => ({
+        id: machine.id,
+        status: machine.status,
+        MachineConfiguration: machine.configuration
+          ? {
+              qemuPid: machine.configuration.qemuPid,
+              tapDeviceName: machine.configuration.tapDeviceName,
+              qmpSocketPath: machine.configuration.qmpSocketPath,
+              guestAgentSocketPath: machine.configuration.guestAgentSocketPath ?? null,
+              infiniServiceSocketPath: machine.configuration.infiniServiceSocketPath ?? null
+            }
+          : null
+      }))
+    } catch (error) {
+      this.debug.log('error', `findMachinesByStatuses failed: ${String(error)}`)
+      throw new PrismaAdapterError(
+        `Failed to find machines by statuses: ${String(error)}`,
+        PrismaAdapterErrorCode.QUERY_FAILED,
+        undefined,
+        error
+      )
+    }
+  }
+
+  /**
    * Clear machine configuration (qemuPid, tapDeviceName, qmpSocketPath).
    * Used during crash cleanup or full VM deletion.
    *

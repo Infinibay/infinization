@@ -70,6 +70,9 @@ export interface DatabaseAdapter {
   /** Find all VMs with 'running' status including their configuration */
   findRunningVMs (): Promise<RunningVMRecord[]>
 
+  /** Find all VMs whose status is in the given list (used by startup reconciliation) */
+  findMachinesByStatuses (statuses: string[]): Promise<RunningVMRecord[]>
+
   /** Clear machine configuration (qemuPid, tapDeviceName, qmpSocketPath) */
   clearMachineConfiguration (machineId: string): Promise<void>
 
@@ -78,6 +81,31 @@ export interface DatabaseAdapter {
 
   /** Find a machine by internal name (used for orphan detection from pidfile names) */
   findMachineByInternalName (internalName: string): Promise<RunningVMRecord | null>
+}
+
+/**
+ * Outcome of reconciling a single VM stuck in a transient state at startup.
+ */
+export interface ReconcileResult {
+  vmId: string
+  previousStatus: string
+  pid: number | null
+  pidAlive: boolean
+  action: 'promoted_running' | 'reset_off' | 'reset_error' | 'skipped'
+  reason?: string
+}
+
+/**
+ * Summary of a startup transient-state reconciliation pass.
+ */
+export interface ReconcileSummary {
+  totalChecked: number
+  promotedToRunning: string[]
+  resetToOff: string[]
+  resetToError: string[]
+  skipped: string[]
+  timestamp: Date
+  results: ReconcileResult[]
 }
 
 // =============================================================================

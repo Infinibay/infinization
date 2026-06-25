@@ -48,6 +48,7 @@
 
 import { VMLifecycle } from './VMLifecycle'
 import { QMPClient } from './QMPClient'
+import { KeyedMutex } from '../utils/KeyedMutex'
 import { GuestAgentClient } from './GuestAgentClient'
 import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
@@ -70,7 +71,7 @@ import {
   DEFAULT_DISK_DIR,
   DEFAULT_PIDFILE_DIR
 } from '../types/lifecycle.types'
-import { DEFAULT_HEALTH_CHECK_INTERVAL } from '../types/sync.types'
+import { DEFAULT_HEALTH_CHECK_INTERVAL, ReconcileSummary } from '../types/sync.types'
 import { QMPBlockInfo } from '../types/qmp.types'
 
 /**
@@ -101,6 +102,13 @@ export class Infinization {
   private activeVMs: Map<string, ActiveVMResources> = new Map()
   private initialized: boolean = false
   private externalPrisma: boolean = false
+
+  // Per-vmId operation lock. Every state-mutating VM operation (the 8 ops
+  // below) is serialized per VM so concurrent power/lifecycle calls on the same
+  // VM cannot interleave (double SIGKILL, start-while-stopping, destroy-during-
+  // start, ...). Different VMs run concurrently. One instance per singleton =>
+  // process-global serialization. See KeyedMutex for liveness/eviction notes.
+  private readonly vmLock = new KeyedMutex()
 
   // Configuration directories
   private readonly diskDir: string
@@ -259,17 +267,19 @@ export class Infinization {
   async createVM (config: VMCreateConfig): Promise<VMCreateResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    const result = await lifecycle.create(config)
+    return this.vmLock.runExclusive(config.vmId, async () => {
+      const lifecycle = this.createLifecycle()
+      const result = await lifecycle.create(config)
 
-    // Track the VM
-    this.trackVM(result.vmId, {
-      tapDevice: result.tapDevice,
-      createdAt: new Date(),
-      internalName: config.internalName
+      // Track the VM
+      this.trackVM(result.vmId, {
+        tapDevice: result.tapDevice,
+        createdAt: new Date(),
+        internalName: config.internalName
+      })
+
+      return result
     })
-
-    return result
   }
 
   /**
@@ -284,21 +294,23 @@ export class Infinization {
   async startVM (vmId: string, config?: VMStartConfig): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    const result = await lifecycle.start(vmId, config)
+    return this.vmLock.runExclusive(vmId, async () => {
+      const lifecycle = this.createLifecycle()
+      const result = await lifecycle.start(vmId, config)
 
-    if (result.success) {
-      // Get internalName from DB for tracking
-      const internalName = await this.prisma.getMachineInternalName(vmId)
+      if (result.success) {
+        // Get internalName from DB for tracking
+        const internalName = await this.prisma.getMachineInternalName(vmId)
 
-      // Track or update the VM
-      this.trackVM(vmId, {
-        createdAt: new Date(),
-        internalName: internalName ?? vmId
-      })
-    }
+        // Track or update the VM
+        this.trackVM(vmId, {
+          createdAt: new Date(),
+          internalName: internalName ?? vmId
+        })
+      }
 
-    return result
+      return result
+    })
   }
 
   /**
@@ -311,14 +323,16 @@ export class Infinization {
   async stopVM (vmId: string, config?: VMStopConfig): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    const result = await lifecycle.stop(vmId, config)
+    return this.vmLock.runExclusive(vmId, async () => {
+      const lifecycle = this.createLifecycle()
+      const result = await lifecycle.stop(vmId, config)
 
-    if (result.success) {
-      this.untrackVM(vmId)
-    }
+      if (result.success) {
+        this.untrackVM(vmId)
+      }
 
-    return result
+      return result
+    })
   }
 
   /**
@@ -336,14 +350,16 @@ export class Infinization {
   async destroyVM (vmId: string): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    const result = await lifecycle.destroyResources(vmId)
+    return this.vmLock.runExclusive(vmId, async () => {
+      const lifecycle = this.createLifecycle()
+      const result = await lifecycle.destroyResources(vmId)
 
-    if (result.success) {
-      this.untrackVM(vmId)
-    }
+      if (result.success) {
+        this.untrackVM(vmId)
+      }
 
-    return result
+      return result
+    })
   }
 
   /**
@@ -355,8 +371,7 @@ export class Infinization {
   async restartVM (vmId: string): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    return lifecycle.restart(vmId)
+    return this.vmLock.runExclusive(vmId, () => this.createLifecycle().restart(vmId))
   }
 
   /**
@@ -368,8 +383,7 @@ export class Infinization {
   async suspendVM (vmId: string): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    return lifecycle.suspend(vmId)
+    return this.vmLock.runExclusive(vmId, () => this.createLifecycle().suspend(vmId))
   }
 
   /**
@@ -381,8 +395,7 @@ export class Infinization {
   async resumeVM (vmId: string): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    return lifecycle.resume(vmId)
+    return this.vmLock.runExclusive(vmId, () => this.createLifecycle().resume(vmId))
   }
 
   /**
@@ -394,8 +407,7 @@ export class Infinization {
   async resetVM (vmId: string): Promise<VMOperationResult> {
     this.ensureInitialized()
 
-    const lifecycle = this.createLifecycle()
-    return lifecycle.reset(vmId)
+    return this.vmLock.runExclusive(vmId, () => this.createLifecycle().reset(vmId))
   }
 
   /**
@@ -428,6 +440,19 @@ export class Infinization {
   getHealthMonitor (): HealthMonitor {
     this.ensureInitialized()
     return this.healthMonitor
+  }
+
+  /**
+   * Reconciles VMs stuck in transient states ('starting', 'powering_off_update',
+   * 'rebuilding') after a backend/process crash. Call once at startup, AFTER
+   * initialize() and BEFORE re-attaching to running VMs: VMs it promotes to
+   * 'running' are then picked up by the backend's running-VM attach pass.
+   */
+  async reconcileStartupState (statuses?: string[]): Promise<ReconcileSummary> {
+    this.ensureInitialized()
+    return statuses
+      ? this.healthMonitor.reconcileTransientStates(statuses)
+      : this.healthMonitor.reconcileTransientStates()
   }
 
   /**
