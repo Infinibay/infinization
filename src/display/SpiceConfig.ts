@@ -5,6 +5,7 @@
 
 import * as fs from 'fs'
 import { Debugger } from '../utils/debug'
+import { assertSafeOptionValue, assertSafePath } from '../utils/qemuArgSafety'
 import {
   SpiceConfigOptions,
   DisplayValidationResult,
@@ -255,9 +256,12 @@ export class SpiceConfig {
       `addr=${this.addr}`
     ]
 
-    // Authentication
+    // Authentication. Reject a password that could splice extra -spice sub-options
+    // (e.g. 'x,disable-ticketing=on' would turn a protected console into an open
+    // one). The production path delivers the password over QMP instead, but this
+    // legacy/direct path must still be safe.
     if (this.password) {
-      spiceOpts.push(`password=${this.password}`)
+      spiceOpts.push(`password=${assertSafeOptionValue(this.password, 'spice.password')}`)
     } else if (this.disableTicketing) {
       spiceOpts.push('disable-ticketing=on')
     }
@@ -284,7 +288,7 @@ export class SpiceConfig {
     if (this.gl) {
       spiceOpts.push('gl=on')
       if (this.rendernode) {
-        spiceOpts.push(`rendernode=${this.rendernode}`)
+        spiceOpts.push(`rendernode=${assertSafePath(this.rendernode, 'spice.rendernode')}`)
       }
     }
 

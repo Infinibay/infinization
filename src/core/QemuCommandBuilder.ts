@@ -13,6 +13,13 @@ import {
 import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
 import { CpuPinningAdapter, PinningStrategy, CpuPinningResult } from '../cpu/CpuPinningAdapter'
+import { assertSafeOptionValue, assertSafePath, assertInEnum } from '../utils/qemuArgSafety'
+
+/** Whitelists for per-disk enum fields — values that splice into the -drive
+ *  comma-list (e.g. cache='none,readonly=on') must never be free-form. */
+const ALLOWED_DISK_FORMATS: readonly string[] = ['qcow2', 'raw']
+const ALLOWED_DISK_BUSES: readonly string[] = ['virtio', 'sata', 'scsi', 'ide']
+const ALLOWED_DISK_CACHES: readonly string[] = ['none', 'writeback', 'writethrough', 'directsync', 'unsafe']
 
 /**
  * Result of buildCommand() containing the binary and arguments separately
@@ -95,7 +102,11 @@ export class QemuCommandBuilder {
    * @throws Error if path is outside allowed directory
    */
   private static validateRomPath (romfile: string): string {
+    // romfile is interpolated into the comma-delimited -device option, so a comma
+    // would splice extra sub-options. Reject it (in addition to the dir confinement).
+    assertSafePath(romfile, 'gpuRomfile')
     const normalizedPath = path.resolve(romfile)
+    assertSafePath(normalizedPath, 'gpuRomfile')
     if (!normalizedPath.startsWith(QemuCommandBuilder.ALLOWED_ROM_DIR)) {
       throw new Error(
         `ROM file must be in ${QemuCommandBuilder.ALLOWED_ROM_DIR}. ` +
@@ -138,7 +149,9 @@ export class QemuCommandBuilder {
    * @param sockets - Number of sockets (optional)
    */
   setCpu (model: string, cores?: number, threads?: number, sockets?: number): this {
-    this.args.push('-cpu', model)
+    // -cpu is a comma-delimited list (e.g. host,enforce=off,-vmx); reject any
+    // value that could splice extra feature flags / sub-options.
+    this.args.push('-cpu', assertSafeOptionValue(model, 'cpuModel'))
     if (cores !== undefined) {
       let smpArg = `cores=${cores}`
       if (threads !== undefined) {
@@ -162,6 +175,34 @@ export class QemuCommandBuilder {
   }
 
   /**
+   * Enable the QEMU seccomp sandbox (defense-in-depth).
+   *
+   * QEMU runs with broad host privileges and is directly reachable by a
+   * (potentially compromised) guest. The seccomp sandbox blocks dangerous
+   * syscalls so a QEMU exploit cannot trivially pivot to the host:
+   *   - obsolete=deny          : block obsolete syscalls
+   *   - elevateprivileges=deny : block setuid/setgid family
+   *   - spawn=deny             : block fork/exec
+   *   - resourcecontrol=deny   : block scheduler/affinity tampering
+   * This mirrors the hardening libvirt applies by default.
+   */
+  enableSeccompSandbox (): this {
+    this.args.push('-sandbox', 'on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny')
+    return this
+  }
+
+  /**
+   * Drop QEMU's privileges to an unprivileged user after startup (`-runas`).
+   * Only emitted when a user is configured; on-prem deployments that run the
+   * backend as root should set this so a guest escape lands as an unprivileged
+   * uid rather than root.
+   */
+  setRunAs (user: string): this {
+    this.args.push('-runas', assertSafeOptionValue(user, 'runAsUser'))
+    return this
+  }
+
+  /**
    * Add multiple disk drives with proper indexing.
    * Each disk is added as a separate -drive argument with sequential index.
    *
@@ -179,7 +220,16 @@ export class QemuCommandBuilder {
    */
   addDisks (disks: DiskOptions[]): this {
     disks.forEach((disk, index) => {
-      let driveArg = `file=${disk.path},format=${disk.format},if=${disk.bus},cache=${disk.cache},index=${index}`
+      // Validate every interpolated field against the comma/equals-splice attack.
+      // A cache of `none,readonly=on` or bus of `none,snapshot=on` would otherwise
+      // flip drive semantics (read-only / snapshot / unsafe-cache).
+      const file = assertSafePath(disk.path, `disk[${index}].path`)
+      const format = assertInEnum(disk.format, ALLOWED_DISK_FORMATS, `disk[${index}].format`)
+      const bus = assertInEnum(disk.bus, ALLOWED_DISK_BUSES, `disk[${index}].bus`)
+      const cache = assertInEnum(disk.cache, ALLOWED_DISK_CACHES, `disk[${index}].cache`)
+      // file.locking=on makes qemu-img's lock a reliable backstop against a second
+      // process (snapshot/convert) opening the same image while the VM runs.
+      let driveArg = `file=${file},format=${format},if=${bus},cache=${cache},file.locking=on,index=${index}`
       if (disk.discard) {
         driveArg += ',discard=unmap'
       }
@@ -193,13 +243,16 @@ export class QemuCommandBuilder {
    * @param options - Network configuration options
    */
   addNetwork (options: NetworkOptions): this {
-    let netdevArg = `tap,id=net0,ifname=${options.tapName},script=no,downscript=no`
+    const safeTap = assertSafeOptionValue(options.tapName, 'network.tapName')
+    let netdevArg = `tap,id=net0,ifname=${safeTap},script=no,downscript=no`
     if (options.queues !== undefined && options.queues > 1) {
       netdevArg += `,queues=${options.queues},vhost=on`
     }
     this.args.push('-netdev', netdevArg)
 
-    let deviceArg = `${options.model},netdev=net0,mac=${options.mac}`
+    const safeModel = assertSafeOptionValue(options.model, 'network.model')
+    const safeMac = assertSafeOptionValue(options.mac, 'network.mac')
+    let deviceArg = `${safeModel},netdev=net0,mac=${safeMac}`
     if (options.queues !== undefined && options.queues > 1) {
       deviceArg += `,mq=on,vectors=${options.queues * 2 + 2}`
     }
@@ -253,6 +306,12 @@ export class QemuCommandBuilder {
   addSpice (options: SpiceOptions | SpiceConfig, qxlMemoryMB: number = 16): this {
     // Check if options is a SpiceConfig instance
     if (options instanceof SpiceConfig) {
+      // Fail-closed: validate the config before emitting args (port range, addr,
+      // password/ticketing consistency). Previously validate() was never called.
+      const validation = options.validate()
+      if (!validation.valid) {
+        throw new Error(`Invalid SPICE configuration: ${validation.errors.join('; ')}`)
+      }
       const { args } = options.generateArgs()
       this.args.push(...args)
 
@@ -279,9 +338,12 @@ export class QemuCommandBuilder {
     }
 
     // Legacy options object handling
-    let spiceArg = `port=${options.port},addr=${options.addr}`
+    let spiceArg = `port=${options.port},addr=${assertSafeOptionValue(options.addr, 'spice.addr')}`
     if (options.password) {
-      spiceArg += `,password=${options.password}`
+      // Reject a password that could splice sub-options (e.g. 'x,disable-ticketing=on')
+      // which would turn a protected console into an open one. Prefer setting the
+      // password over QMP (set_password) rather than on the command line.
+      spiceArg += `,password=${assertSafeOptionValue(options.password, 'spice.password')}`
     } else if (options.disableTicketing) {
       spiceArg += ',disable-ticketing=on'
     }
@@ -318,7 +380,7 @@ export class QemuCommandBuilder {
     }
 
     // Legacy options object handling
-    let vncArg = `${options.addr}:${options.display}`
+    let vncArg = `${assertSafeOptionValue(options.addr, 'vnc.addr')}:${options.display}`
     if (options.password) {
       vncArg += ',password=on'
     }
@@ -332,7 +394,7 @@ export class QemuCommandBuilder {
    * @param socketPath - Path to Unix socket
    */
   addQmp (socketPath: string): this {
-    this.args.push('-qmp', `unix:${socketPath},server,nowait`)
+    this.args.push('-qmp', `unix:${assertSafePath(socketPath, 'qmpSocketPath')},server,nowait`)
     return this
   }
 
@@ -341,7 +403,9 @@ export class QemuCommandBuilder {
    * @param isoPath - Path to ISO file
    */
   addCdrom (isoPath: string): this {
-    this.args.push('-cdrom', isoPath)
+    // QEMU expands -cdrom into a -drive internally; reject a comma/control char so
+    // a config-supplied ISO path cannot splice drive sub-options.
+    this.args.push('-cdrom', assertSafePath(isoPath, 'cdromIsoPath'))
     return this
   }
 
@@ -615,8 +679,11 @@ export class QemuCommandBuilder {
    * ```
    */
   setFirmware (firmwarePath: string): this {
+    // A firmware path with a comma (e.g. '/x.fd,readonly=off') would flip the
+    // OVMF code drive to writable — reject it.
+    const safe = assertSafePath(firmwarePath, 'firmwarePath')
     // Add OVMF code (read-only firmware)
-    this.args.push('-drive', `if=pflash,format=raw,readonly=on,file=${firmwarePath}`)
+    this.args.push('-drive', `if=pflash,format=raw,readonly=on,file=${safe}`)
 
     // Note: OVMF vars file (per-VM UEFI variables) should be passed via setUefiVars
     // to ensure each VM has its own vars file.
@@ -644,7 +711,7 @@ export class QemuCommandBuilder {
    */
   setUefiVars (varsPath: string): this {
     // Add OVMF vars (read-write per-VM variables)
-    this.args.push('-drive', `if=pflash,format=raw,file=${varsPath}`)
+    this.args.push('-drive', `if=pflash,format=raw,file=${assertSafePath(varsPath, 'uefiVarsPath')}`)
     return this
   }
 
@@ -678,7 +745,7 @@ export class QemuCommandBuilder {
    */
   addTPM (socketPath: string): this {
     // chardev for swtpm socket
-    this.args.push('-chardev', `socket,id=chrtpm,path=${socketPath}`)
+    this.args.push('-chardev', `socket,id=chrtpm,path=${assertSafePath(socketPath, 'tpmSocketPath')}`)
     // TPM device backend
     this.args.push('-tpmdev', 'emulator,id=tpm0,chardev=chrtpm')
     // TPM TIS device
@@ -718,11 +785,15 @@ export class QemuCommandBuilder {
   addVirtioChannel (channelName: string, socketPath: string, chardevId: string): this {
     this.ensureVirtioSerial()
 
+    const safePath = assertSafePath(socketPath, 'virtioChannel.socketPath')
+    const safeId = assertSafeOptionValue(chardevId, 'virtioChannel.chardevId')
+    const safeName = assertSafeOptionValue(channelName, 'virtioChannel.channelName')
+
     // Add chardev for socket communication
-    this.args.push('-chardev', `socket,path=${socketPath},server=on,wait=off,id=${chardevId}`)
+    this.args.push('-chardev', `socket,path=${safePath},server=on,wait=off,id=${safeId}`)
 
     // Add virtio serial port
-    this.args.push('-device', `virtserialport,chardev=${chardevId},name=${channelName}`)
+    this.args.push('-device', `virtserialport,chardev=${safeId},name=${safeName}`)
 
     this.virtioSerialPortCount++
     return this
@@ -803,8 +874,11 @@ export class QemuCommandBuilder {
     // Use SATA/AHCI for q35 machines which is more reliable than IDE index
     // This avoids conflicts with -cdrom which uses a fixed index
     const driveId = `cdrom${this.cdromCount}`
+    // file=${isoPath} is in a comma-delimited -drive option — a comma in the ISO
+    // path would splice sub-options (e.g. flip readonly off). Validate it.
+    const safeIso = assertSafePath(isoPath, 'secondCdromIsoPath')
     this.args.push(
-      '-drive', `file=${isoPath},if=none,media=cdrom,readonly=on,id=${driveId}`,
+      '-drive', `file=${safeIso},if=none,media=cdrom,readonly=on,id=${driveId}`,
       '-device', `ide-cd,drive=${driveId}`
     )
     return this
@@ -877,17 +951,20 @@ export class QemuCommandBuilder {
    * @param options - Process configuration options
    */
   setProcessOptions (options: QemuProcessOptions): this {
-    this.args.push('-name', options.name)
+    // -name is parsed as a comma-delimited option list (guest=...,debug-threads=...);
+    // reject a name that could splice sub-options like 'x,debug-threads=on'.
+    this.args.push('-name', assertSafeOptionValue(options.name, 'name'))
     if (options.uuid) {
-      this.args.push('-uuid', options.uuid)
+      this.args.push('-uuid', assertSafeOptionValue(options.uuid, 'uuid'))
     }
     if (options.daemonize) {
       this.args.push('-daemonize')
       this.daemonizeEnabled = true
     }
     if (options.pidfile) {
-      this.args.push('-pidfile', options.pidfile)
-      this.pidfilePath = options.pidfile
+      const safePidfile = assertSafePath(options.pidfile, 'pidfile')
+      this.args.push('-pidfile', safePidfile)
+      this.pidfilePath = safePidfile
     }
     return this
   }

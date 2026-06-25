@@ -6,6 +6,7 @@
  */
 
 import { UnattendedInstallConfig } from './unattended.types'
+import { FirewallDefaultAction } from './firewall.types'
 
 // =============================================================================
 // Configuration Types
@@ -103,6 +104,25 @@ export interface VMCreateConfig {
   disks: DiskConfig[]
   /** Network bridge name (e.g., 'virbr0') */
   bridge: string
+  /**
+   * Terminal firewall posture for this VM's chain (fail-closed by default).
+   * Derive from the department policy: BLOCK_ALL => 'drop', ALLOW_ALL => 'accept'.
+   * The terminal rule is installed UNCONDITIONALLY (even with zero explicit rules),
+   * so a default-deny department with no allow rules is actually denied. Omit to
+   * default to 'drop'.
+   */
+  firewallDefaultAction?: FirewallDefaultAction
+  /**
+   * Drop QEMU's privileges to this unprivileged user (`-runas`). Strongly
+   * recommended when the backend runs as root, so a guest escape lands as an
+   * unprivileged uid rather than root. Omit to leave QEMU as the backend's uid.
+   */
+  runAsUser?: string
+  /**
+   * Opt out of the QEMU seccomp sandbox (sandbox is ON by default). Only set for
+   * a device that genuinely needs a blocked syscall family.
+   */
+  disableSandbox?: boolean
   /** Optional MAC address (auto-generated if not provided) */
   macAddress?: string
   /** Display type (spice or vnc) */
@@ -416,6 +436,12 @@ export interface VMStartConfig {
   waitForBoot?: boolean
   /** Boot timeout in milliseconds (default: 60000) */
   bootTimeout?: number
+  /**
+   * Terminal firewall posture to (re)install on start (fail-closed by default).
+   * Same semantics as VMCreateConfig.firewallDefaultAction. Omit to default to
+   * 'drop'. The backend should thread the department policy here on every start.
+   */
+  firewallDefaultAction?: FirewallDefaultAction
 }
 
 /**

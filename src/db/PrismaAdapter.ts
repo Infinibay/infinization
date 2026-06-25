@@ -296,8 +296,18 @@ export class PrismaAdapter implements DatabaseAdapter {
           : null
       }
     } catch (error) {
+      // Fail CLOSED: a DB outage must NOT be collapsed into the same `null` that
+      // means "VM not found". The orphan scanner kills processes that map to no DB
+      // record; if a transient DB error returned null here, the scanner would
+      // SIGKILL a live VM's QEMU (as root) on every blip. Re-throw so callers
+      // treat it as "unknown — do not kill" and re-scan next cycle.
       this.debug.log('error', `findMachineByInternalName failed: ${String(error)}`)
-      return null
+      throw new PrismaAdapterError(
+        `Failed to query machine by internalName '${internalName}': ${String(error)}`,
+        PrismaAdapterErrorCode.QUERY_FAILED,
+        undefined,
+        error
+      )
     }
   }
 
@@ -545,7 +555,19 @@ export class PrismaAdapter implements DatabaseAdapter {
               // Hugepages configuration
               hugepages: true,
               // CPU pinning configuration
-              cpuPinning: true
+              cpuPinning: true,
+              // Advanced devices / sockets — previously OMITTED here, which made
+              // mapToExtendedMachineConfiguration read them as null on every
+              // start, silently dropping a VM's TPM (Win11), guest-agent, virtio
+              // drivers, audio, USB tablet and NUMA-pinning config.
+              tpmSocketPath: true,
+              guestAgentSocketPath: true,
+              infiniServiceSocketPath: true,
+              virtioDriversIso: true,
+              enableAudio: true,
+              enableUsbTablet: true,
+              enableNumaCtlPinning: true,
+              cpuPinningStrategy: true
             }
           },
           firewallRuleSet: {
@@ -650,6 +672,8 @@ export class PrismaAdapter implements DatabaseAdapter {
   ): Promise<{ success: boolean; newVersion: number; vmConfig: VMConfigRecord }> {
     this.debug.log(`transitionVMStatus: ${machineId} (${expectedStatus} -> ${newStatus}, version: ${expectedVersion})`)
 
+    const MAX_TX_ATTEMPTS = 3
+    for (let attempt = 1; ; attempt++) {
     try {
       return await this.prisma.$transaction(async (tx) => {
         // Fetch current VM state within the transaction
@@ -683,7 +707,18 @@ export class PrismaAdapter implements DatabaseAdapter {
                 // Hugepages configuration
                 hugepages: true,
                 // CPU pinning configuration
-                cpuPinning: true
+                cpuPinning: true,
+                // Advanced devices / sockets (see findMachineWithConfig) — these
+                // were omitted, so a restart through transitionVMStatus dropped a
+                // Win11 VM's TPM and the guest-agent/virtio/audio/NUMA config.
+                tpmSocketPath: true,
+                guestAgentSocketPath: true,
+                infiniServiceSocketPath: true,
+                virtioDriversIso: true,
+                enableAudio: true,
+                enableUsbTablet: true,
+                enableNumaCtlPinning: true,
+                cpuPinningStrategy: true
               }
             },
             firewallRuleSet: {
@@ -773,14 +808,45 @@ export class PrismaAdapter implements DatabaseAdapter {
       if (error instanceof PrismaAdapterError) {
         throw error
       }
+      // Retry a serialization failure / deadlock (P2034) — it is transient.
+      if (this.isRetryablePrismaError(error) && attempt < MAX_TX_ATTEMPTS) {
+        this.debug.log('warn', `transitionVMStatus serialization/deadlock on attempt ${attempt}/${MAX_TX_ATTEMPTS}; retrying`)
+        continue
+      }
       this.debug.log('error', `transitionVMStatus failed: ${String(error)}`)
-      throw new PrismaAdapterError(
-        `Failed to transition VM status: ${String(error)}`,
-        PrismaAdapterErrorCode.UPDATE_FAILED,
-        machineId,
-        error
-      )
+      throw this.mapPrismaError(error, machineId, 'Failed to transition VM status')
     }
+    }
+  }
+
+  /** True if a Prisma error is a transient, retryable transaction conflict. */
+  private isRetryablePrismaError (error: unknown): boolean {
+    const code = (error as { code?: string })?.code
+    // P2034: "Transaction failed due to a write conflict or a deadlock".
+    return code === 'P2034'
+  }
+
+  /**
+   * Maps a raw Prisma error to a PrismaAdapterError, PRESERVING the original
+   * Prisma code (P2002/P2025/P2034/...) in `details` instead of flattening it to
+   * a string, so callers can classify and retry instead of treating every failure
+   * as a permanent UPDATE_FAILED.
+   */
+  private mapPrismaError (error: unknown, vmId: string, context: string): PrismaAdapterError {
+    const code = (error as { code?: string })?.code
+    let mapped: PrismaAdapterErrorCode
+    switch (code) {
+      case 'P2002': mapped = PrismaAdapterErrorCode.CONSTRAINT_VIOLATION; break
+      case 'P2025': mapped = PrismaAdapterErrorCode.MACHINE_NOT_FOUND; break
+      case 'P2034': mapped = PrismaAdapterErrorCode.UPDATE_FAILED; break
+      default: mapped = PrismaAdapterErrorCode.UPDATE_FAILED
+    }
+    return new PrismaAdapterError(
+      `${context}: ${String(error)}`,
+      mapped,
+      vmId,
+      { prismaCode: code, cause: error }
+    )
   }
 
   // ===========================================================================
@@ -852,6 +918,36 @@ export class PrismaAdapter implements DatabaseAdapter {
       this.debug.log('error', `getFirewallRules failed: ${String(error)}`)
       throw new PrismaAdapterError(
         `Failed to get firewall rules: ${String(error)}`,
+        PrismaAdapterErrorCode.QUERY_FAILED,
+        vmId,
+        error
+      )
+    }
+  }
+
+  /**
+   * Returns the VM's department firewall policy ('ALLOW_ALL' | 'BLOCK_ALL'), or
+   * null if the VM has no department / the field is unavailable. Used to derive
+   * the terminal nft posture: BLOCK_ALL => 'drop' (fail-closed), ALLOW_ALL =>
+   * 'accept'. Without this, an ALLOW_ALL department's VMs would boot with the
+   * fail-closed 'drop' default and be silently over-blocked.
+   *
+   * Fail-closed: on a real DB error this throws (like getFirewallRules) so the
+   * caller aborts rather than guessing a posture.
+   */
+  async getDepartmentFirewallPolicy (vmId: string): Promise<string | null> {
+    this.debug.log(`getDepartmentFirewallPolicy: ${vmId}`)
+    try {
+      const machine = await this.prisma.machine.findUnique({
+        where: { id: vmId },
+        include: { department: { select: { firewallPolicy: true } } }
+      })
+      const policy = (machine?.department as { firewallPolicy?: string } | null | undefined)?.firewallPolicy
+      return policy ?? null
+    } catch (error) {
+      this.debug.log('error', `getDepartmentFirewallPolicy failed: ${String(error)}`)
+      throw new PrismaAdapterError(
+        `Failed to get department firewall policy: ${String(error)}`,
         PrismaAdapterErrorCode.QUERY_FAILED,
         vmId,
         error
@@ -973,8 +1069,8 @@ export class PrismaAdapter implements DatabaseAdapter {
       networkModel: config.networkModel ?? null,
       networkQueues: config.networkQueues ?? null,
       memoryBalloon: config.memoryBalloon ?? null,
-      // Multi-disk support
-      diskPaths: Array.isArray(config.diskPaths) ? config.diskPaths as string[] : null,
+      // Multi-disk support — fail-closed on a corrupt blob (see parseDiskPaths).
+      diskPaths: this.parseDiskPaths(config.diskPaths),
       // UEFI firmware configuration
       uefiFirmware: config.uefiFirmware ?? null,
       // Hugepages configuration
@@ -999,11 +1095,36 @@ export class PrismaAdapter implements DatabaseAdapter {
    * Validates format and returns typed object or null.
    */
   private parseCpuPinning (raw: unknown): { cores: number[] } | null {
-    if (!raw || typeof raw !== 'object') return null
+    if (raw === null || raw === undefined) return null
+    if (typeof raw !== 'object') {
+      // Present but malformed — surface it loudly rather than silently unpinning.
+      this.debug.log('error', `Malformed cpuPinning JSON (not an object): ${String(raw)} — treating as unpinned`)
+      return null
+    }
     const obj = raw as Record<string, unknown>
-    if (!Array.isArray(obj.cores)) return null
-    if (!obj.cores.every(c => typeof c === 'number')) return null
+    if (!Array.isArray(obj.cores) || !obj.cores.every(c => typeof c === 'number')) {
+      this.debug.log('error', `Malformed cpuPinning.cores: ${JSON.stringify(obj.cores)} — treating as unpinned`)
+      return null
+    }
     return { cores: obj.cores as number[] }
+  }
+
+  /**
+   * Parses the persisted diskPaths JSON. Distinguishes a legitimately-absent
+   * value (null) from a PRESENT-BUT-CORRUPT one: the latter throws fail-closed
+   * instead of being silently coerced to null, which would drop a multi-disk VM's
+   * data disks (and the legacy fallback would then overwrite the recoverable blob).
+   */
+  private parseDiskPaths (raw: unknown): string[] | null {
+    if (raw === null || raw === undefined) return null
+    if (Array.isArray(raw) && raw.every(p => typeof p === 'string')) {
+      return raw as string[]
+    }
+    this.debug.log('error', `Corrupt diskPaths JSON (expected string[]): ${JSON.stringify(raw)}`)
+    throw new PrismaAdapterError(
+      `Corrupt diskPaths configuration (expected an array of strings); refusing to silently drop disks`,
+      PrismaAdapterErrorCode.QUERY_FAILED
+    )
   }
 
   /**

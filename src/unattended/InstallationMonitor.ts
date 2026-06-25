@@ -46,7 +46,8 @@ import {
 const DEFAULT_MONITOR_CONFIG: MonitorConfig = {
   timeout: DEFAULT_INSTALLATION_TIMEOUT,
   maxResets: DEFAULT_MAX_RESETS,
-  checkInterval: DEFAULT_CHECK_INTERVAL
+  checkInterval: DEFAULT_CHECK_INTERVAL,
+  minInstallTimeBeforeComplete: 90_000
 }
 
 /**
@@ -88,6 +89,9 @@ export class InstallationMonitor extends EventEmitter {
     this.debug = new Debugger('installation-monitor')
     this.qmpClient = qmpClient
     this.config = { ...DEFAULT_MONITOR_CONFIG, ...config }
+
+    // Default 'error' listener so an unhandled emit cannot crash the backend.
+    this.on('error', (err) => this.debug.log('error', `InstallationMonitor error event: ${err instanceof Error ? err.message : String(err)}`))
   }
 
   /**
@@ -264,12 +268,26 @@ export class InstallationMonitor extends EventEmitter {
    */
   private handleShutdown (_data: unknown, _timestamp: unknown): void {
     this.debug.log('Received SHUTDOWN event')
+    this.handlePowerEvent('SHUTDOWN')
+  }
 
-    // SHUTDOWN during installation typically means installation completed
-    // and the VM is rebooting or shutting down for the first time
-    this.updatePhase('completing', 'Installation completing, system shutting down')
-
-    // Complete the installation successfully
+  /**
+   * Decides whether a SHUTDOWN/POWERDOWN means "installation complete" or is a
+   * PREMATURE power event (e.g. media ejected early). It only counts as success
+   * once the guest has rebooted at least once OR enough time has elapsed; an
+   * early power-off before either condition keeps monitoring instead of falsely
+   * reporting success.
+   */
+  private handlePowerEvent (kind: 'SHUTDOWN' | 'POWERDOWN'): void {
+    const elapsed = this.startTime ? Date.now() - this.startTime : 0
+    const minTime = this.config.minInstallTimeBeforeComplete ?? 90_000
+    const rebootedAtLeastOnce = this.resetCount >= 1
+    if (!rebootedAtLeastOnce && elapsed < minTime) {
+      this.debug.log('warn', `Premature ${kind} ${Math.round(elapsed / 1000)}s into install with no prior reboot — NOT treating as complete; continuing to monitor`)
+      this.updatePhase('installing', `Early ${kind.toLowerCase()} ignored; awaiting real completion`)
+      return
+    }
+    this.updatePhase('completing', `Installation completing (${kind.toLowerCase()})`)
     this.completeInstallation(true)
   }
 
@@ -303,13 +321,7 @@ export class InstallationMonitor extends EventEmitter {
    */
   private handlePowerdown (_data: unknown, _timestamp: unknown): void {
     this.debug.log('Received POWERDOWN event')
-
-    // POWERDOWN during installation typically means installation completed
-    // and the guest OS initiated a graceful shutdown
-    this.updatePhase('completing', 'Installation completing, graceful shutdown')
-
-    // Complete the installation successfully
-    this.completeInstallation(true)
+    this.handlePowerEvent('POWERDOWN')
   }
 
   /**

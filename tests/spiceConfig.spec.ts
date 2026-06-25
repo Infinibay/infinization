@@ -485,9 +485,10 @@ describe('SpiceConfig', () => {
       expect(config.getAddr()).toBe('192.168.1.100')
     })
 
-    it('getAddr() returns default address when not specified', () => {
+    it('getAddr() returns default address when not specified (secure-by-default loopback)', () => {
       const config = new SpiceConfig({ port: 5901 })
-      expect(config.getAddr()).toBe('0.0.0.0')
+      // Default bind is loopback (was '0.0.0.0'); see DEFAULT_SPICE_ADDR.
+      expect(config.getAddr()).toBe('127.0.0.1')
     })
 
     it('hasPassword() returns true when password is set', () => {

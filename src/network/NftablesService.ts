@@ -68,12 +68,17 @@ export class NftablesService {
   /** Whether to persist rules to disk after changes */
   private enablePersistence: boolean
   /**
-   * Serializes mutations to a given VM chain, keyed by chain name. Ensures apply and
-   * remove operations on the same chain run one-at-a-time (no interleaving). Only
-   * effective when callers share a single NftablesService instance — see
-   * getInfinization().getNftablesService(); the backend bridges use that shared one.
+   * Serializes mutations to a given VM chain, keyed by chain name, so apply/
+   * remove/jump-rule operations on the same chain (and the shared forward chain)
+   * never interleave. STATIC (process-wide): the backend constructs several
+   * NftablesService instances (VMLifecycle, HealthMonitor, EventHandler, ...), and
+   * a per-instance lock would not serialize across them — they all mutate the
+   * SAME kernel nft table. A module-level lock makes the serialization global.
    */
-  private chainLock = new KeyedMutex()
+  private static readonly chainLock = new KeyedMutex()
+  private get chainLock (): KeyedMutex {
+    return NftablesService.chainLock
+  }
 
   constructor (config: NftablesServiceConfig = {}) {
     this.executor = new CommandExecutor()

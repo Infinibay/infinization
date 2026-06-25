@@ -32,7 +32,13 @@ import {
 import { NftablesService } from '../network/NftablesService'
 import { TapDeviceManager } from '../network/TapDeviceManager'
 import { Debugger } from '../utils/debug'
+import { isProcessAlive as sharedIsProcessAlive, forceKillProcess } from '../utils/processIdentity'
+import { isPrismaAdapterError } from '../types/db.types'
 import { DEFAULT_PIDFILE_DIR } from '../types/lifecycle.types'
+
+/** DB statuses that the startup reconcile pass owns; the orphan scanner must NOT
+ *  act on a VM in one of these (a still-booting VM looks like an orphan). */
+const TRANSIENT_STATUSES = new Set(['starting', 'powering_off_update', 'rebuilding'])
 
 /**
  * Default configuration for HealthMonitor
@@ -265,6 +271,11 @@ export class HealthMonitor extends EventEmitter {
     this.nftables = new NftablesService()
     this.debug = new Debugger('health-monitor')
     this.pidfileDir = config?.pidfileDir ?? DEFAULT_PIDFILE_DIR
+
+    // Default 'error' listener: an unhandled 'error' emit on an EventEmitter
+    // throws and would crash the privileged backend. A real consumer listener
+    // still fires alongside this one.
+    this.on('error', (err) => this.debug.log('error', `HealthMonitor error event: ${err instanceof Error ? err.message : String(err)}`))
   }
 
   /**
@@ -449,14 +460,35 @@ export class HealthMonitor extends EventEmitter {
           continue
         }
 
-        // Process is alive — check DB status
-        const vmRecord = await this.db.findMachineByInternalName(internalName)
+        // Process is alive — check DB status. A DB OUTAGE must never be treated
+        // as "no record" (which would get this live process killed): findMachine
+        // ByInternalName now throws on error, so skip this pidfile and re-scan
+        // next cycle rather than acting on stale/absent data (fail-closed).
+        let vmRecord: RunningVMRecord | null
+        try {
+          vmRecord = await this.db.findMachineByInternalName(internalName)
+        } catch (dbErr) {
+          if (isPrismaAdapterError(dbErr)) {
+            this.debug.log('warn', `Skipping orphan check for ${internalName} (PID ${pid}): DB query failed (${dbErr.code}) — will not kill an unverified process; retry next cycle`)
+            continue
+          }
+          throw dbErr
+        }
 
         if (!vmRecord) {
-          // No DB record at all — orphan from a deleted VM
-          this.debug.log('warn', `Orphan QEMU process ${pid} has no DB record (internalName: ${internalName}) — killing`)
+          // No DB record at all — orphan from a deleted VM. killOrphan still
+          // verifies /proc identity before signalling, so a recycled PID is safe.
+          this.debug.log('warn', `Orphan QEMU process ${pid} has no DB record (internalName: ${internalName}) — verifying identity before kill`)
           const event = await this.killOrphan(internalName, pid, pidfilePath, 'unknown (no DB record)', detectedAt)
           orphans.push(event)
+          continue
+        }
+
+        // VM is in a transient state (still booting / rebuilding / powering off):
+        // the startup reconcile pass owns these. Acting here would reap a VM that
+        // is legitimately mid-start. Skip and let reconcileTransientStates resolve it.
+        if (TRANSIENT_STATUSES.has(vmRecord.status)) {
+          this.debug.log(`Skipping ${internalName} (PID ${pid}): VM in transient state '${vmRecord.status}', owned by startup reconcile`)
           continue
         }
 
@@ -611,37 +643,22 @@ export class HealthMonitor extends EventEmitter {
   ): Promise<OrphanEvent> {
     let killed = false
 
-    // Try SIGTERM first
+    // IDENTITY-CHECKED kill. forceKillProcess reads /proc/<pid>/cmdline and only
+    // signals if it contains 'qemu-system' AND this VM's internalName. If the PID
+    // was recycled into an unrelated host process, it is NOT signalled (skipped) —
+    // this is the single most dangerous path in the library (root, every 30s).
     try {
-      process.kill(pid, 'SIGTERM')
-      this.debug.log(`Sent SIGTERM to orphan process ${pid} (${internalName})`)
-
-      // Wait up to 5 seconds for graceful shutdown
-      const gracePeriodMs = 5000
-      const startTime = Date.now()
-      while (Date.now() - startTime < gracePeriodMs) {
-        if (!this.isProcessAlive(pid)) {
-          killed = true
-          break
-        }
-        await new Promise(resolve => setTimeout(resolve, 500))
-      }
-
-      // If still alive, SIGKILL
-      if (!killed) {
-        this.debug.log('warn', `Orphan process ${pid} did not exit after SIGTERM — sending SIGKILL`)
-        process.kill(pid, 'SIGKILL')
+      const result = await forceKillProcess(pid, internalName)
+      if (result.skipped) {
+        this.debug.log('warn', `Refused to kill PID ${pid}: not identifiable as ${internalName}'s QEMU (likely a recycled PID) — removing stale pidfile only`)
+      } else if (result.confirmedGone) {
         killed = true
+        this.debug.log(`Orphan process ${pid} (${internalName}) terminated`)
+      } else {
+        this.debug.log('error', `Orphan process ${pid} (${internalName}) survived SIGKILL — manual intervention required`)
       }
     } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code === 'ESRCH') {
-        // Already dead — that's fine
-        killed = true
-        this.debug.log(`Orphan process ${pid} already exited`)
-      } else {
-        this.debug.log('error', `Failed to kill orphan process ${pid}: ${String(err)}`)
-      }
+      this.debug.log('error', `Failed to kill orphan process ${pid}: ${String(err)}`)
     }
 
     // Remove pidfile
@@ -706,53 +723,10 @@ export class HealthMonitor extends EventEmitter {
    * @returns True if the process exists and is not a zombie
    */
   public isProcessAlive (pid: number): boolean {
-    try {
-      // First check: process.kill with signal 0 checks if process exists
-      // without actually sending a signal
-      process.kill(pid, 0)
-
-      // Second check: verify process is not a zombie by reading /proc/{pid}/stat
-      // The third field in /proc/{pid}/stat is the process state:
-      // R = running, S = sleeping, D = disk sleep, Z = zombie, T = stopped
-      const statPath = `/proc/${pid}/stat`
-      if (fs.existsSync(statPath)) {
-        try {
-          const stat = fs.readFileSync(statPath, 'utf8')
-          // Parse the stat file - format: "pid (comm) state ..."
-          // We need to handle cases where comm contains spaces or parentheses
-          const closeParen = stat.lastIndexOf(')')
-          if (closeParen > 0 && stat.length > closeParen + 2) {
-            const state = stat.charAt(closeParen + 2)
-            if (state === 'Z') {
-              this.debug.log('warn', `PID ${pid} is a zombie process - treating as dead`)
-              return false
-            }
-          }
-        } catch {
-          // If we can't read /proc/{pid}/stat, fall through to assume alive
-          this.debug.log('warn', `Could not read /proc/${pid}/stat for zombie check`)
-        }
-      }
-
-      return true
-    } catch (err) {
-      const error = err as NodeJS.ErrnoException
-
-      // ESRCH: No such process - the process is definitely dead
-      if (error.code === 'ESRCH') {
-        return false
-      }
-
-      // EPERM: Permission denied - process exists but we can't signal it (still alive)
-      if (error.code === 'EPERM') {
-        return true
-      }
-
-      // For any other unexpected error, log a warning and assume alive
-      // to avoid false-positive crash detection
-      this.debug.log('error', `Unexpected error checking PID ${pid}: ${error.code} - ${error.message}`)
-      return true
-    }
+    // Delegates to the single shared implementation (kill -0 + /proc zombie check,
+    // EPERM => alive) so liveness semantics are identical in HealthMonitor,
+    // EventHandler and VMLifecycle.
+    return sharedIsProcessAlive(pid)
   }
 
   /**

@@ -65,6 +65,8 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
       findMachine: jest.fn(),
       updateMachineStatus: jest.fn(),
       findRunningVMs: jest.fn(),
+      findMachinesByStatuses: jest.fn().mockResolvedValue([]),
+      findMachineByInternalName: jest.fn().mockResolvedValue(null),
       clearMachineConfiguration: jest.fn(),
       clearVolatileMachineConfiguration: jest.fn()
     }
@@ -318,6 +320,8 @@ describe('StateSync clearVolatileMachineConfiguration', () => {
       findMachine: jest.fn(),
       updateMachineStatus: jest.fn(),
       findRunningVMs: jest.fn(),
+      findMachinesByStatuses: jest.fn().mockResolvedValue([]),
+      findMachineByInternalName: jest.fn().mockResolvedValue(null),
       clearMachineConfiguration: jest.fn(),
       clearVolatileMachineConfiguration: jest.fn().mockResolvedValue(undefined)
     }

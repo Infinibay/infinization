@@ -176,6 +176,13 @@ export interface MonitorConfig {
   maxResets: number
   /** Interval in milliseconds for timeout checks */
   checkInterval: number
+  /**
+   * Minimum elapsed time (ms) before a SHUTDOWN/POWERDOWN may be accepted as
+   * "installation complete" UNLESS the guest has already rebooted at least once.
+   * Guards against a premature shutdown (e.g. installer media ejected seconds in)
+   * being mis-reported as success. Default: 90s.
+   */
+  minInstallTimeBeforeComplete?: number
 }
 
 // =============================================================================

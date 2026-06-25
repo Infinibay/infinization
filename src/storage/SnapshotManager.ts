@@ -54,7 +54,7 @@ export class SnapshotManager {
       await this.executor.execute('qemu-img', [
         'snapshot',
         '-c', name,
-        imagePath
+        '--', imagePath
       ])
       this.debug.log(`Snapshot '${name}' created successfully`)
     } catch (error) {
@@ -110,7 +110,7 @@ export class SnapshotManager {
       const output = await this.executor.execute('qemu-img', [
         'snapshot',
         '-l',
-        imagePath
+        '--', imagePath
       ])
 
       const snapshots = this.parseSnapshotList(output)
@@ -146,13 +146,14 @@ export class SnapshotManager {
    * @throws StorageError if snapshot doesn't exist or revert fails
    */
   async revertSnapshot (imagePath: string, snapshotName: string): Promise<void> {
+    this.validateSnapshotName(snapshotName)
     this.debug.log(`Reverting image ${imagePath} to snapshot '${snapshotName}'`)
 
     try {
       await this.executor.execute('qemu-img', [
         'snapshot',
         '-a', snapshotName,
-        imagePath
+        '--', imagePath
       ])
       this.debug.log(`Image reverted to snapshot '${snapshotName}' successfully`)
     } catch (error) {
@@ -202,13 +203,14 @@ export class SnapshotManager {
    * @throws StorageError if deletion fails (handles non-existent snapshots gracefully)
    */
   async deleteSnapshot (imagePath: string, snapshotName: string): Promise<void> {
+    this.validateSnapshotName(snapshotName)
     this.debug.log(`Deleting snapshot '${snapshotName}' from image: ${imagePath}`)
 
     try {
       await this.executor.execute('qemu-img', [
         'snapshot',
         '-d', snapshotName,
-        imagePath
+        '--', imagePath
       ])
       this.debug.log(`Snapshot '${snapshotName}' deleted successfully`)
     } catch (error) {
@@ -253,10 +255,17 @@ export class SnapshotManager {
       const exists = snapshots.some(snap => snap.name === snapshotName)
       this.debug.log(`Snapshot '${snapshotName}' ${exists ? 'exists' : 'does not exist'}`)
       return exists
-    } catch {
-      // If we can't list snapshots, assume it doesn't exist
-      this.debug.log(`Could not check snapshot existence, assuming not present`)
-      return false
+    } catch (error) {
+      // Only a genuinely missing image legitimately means "snapshot absent". A
+      // lock/permission/parse error must NOT be swallowed into `false` — that
+      // would report a present snapshot as absent (fail-open) and could green-
+      // light a destructive overwrite. Re-throw everything else.
+      if (error instanceof StorageError && error.code === StorageErrorCode.IMAGE_NOT_FOUND) {
+        this.debug.log(`Image ${imagePath} not found; snapshot '${snapshotName}' treated as absent`)
+        return false
+      }
+      this.debug.log('error', `Could not determine snapshot existence for '${snapshotName}' in ${imagePath}: ${error instanceof Error ? error.message : String(error)}`)
+      throw error
     }
   }
 

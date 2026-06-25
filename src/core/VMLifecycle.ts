@@ -41,7 +41,8 @@ import { MacAddressGenerator } from '../network/MacAddressGenerator'
 import { QemuImgService } from '../storage/QemuImgService'
 import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
-import { SPICE_MIN_PORT, SPICE_MAX_PORT } from '../types/display.types'
+import { SPICE_MIN_PORT, SPICE_MAX_PORT, DEFAULT_SPICE_ADDR, DEFAULT_VNC_ADDR, VNC_BASE_PORT, isLoopbackAddr } from '../types/display.types'
+import { assertSafeOptionValue } from '../utils/qemuArgSafety'
 import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { Debugger } from '../utils/debug'
@@ -70,8 +71,14 @@ import {
   PROCESS_EXIT_POLL_INTERVAL,
   RUNTIME_DISK_SIZE_PLACEHOLDER_GB
 } from '../types/lifecycle.types'
-import { FirewallRuleInput } from '../types/firewall.types'
-import { PrismaAdapterError, PrismaAdapterErrorCode } from '../types/db.types'
+import { FirewallRuleInput, FirewallDefaultAction } from '../types/firewall.types'
+import { PrismaAdapterError, PrismaAdapterErrorCode, isPrismaAdapterError } from '../types/db.types'
+import {
+  pidBelongsToVM as sharedPidBelongsToVM,
+  forceKillProcess as sharedForceKillProcess,
+  waitForProcessExit as sharedWaitForProcessExit,
+  isProcessAlive as sharedIsProcessAlive
+} from '../utils/processIdentity'
 import { UnattendedInstaller } from '../unattended/UnattendedInstaller'
 import { CgroupsManager } from '../system/CgroupsManager'
 import { detectOSType, getDriverPreset } from '../config/DriverPresets'
@@ -94,6 +101,13 @@ const DISPLAY_PORT_LOCK_KEY = 'display-port'
 interface CleanupResources {
   tapDevice?: string
   vmId?: string
+  /** VM internal name — required to identity-verify a pidfile PID before killing. */
+  internalName?: string
+  /** Which operation owns this cleanup. 'start' must be NON-destructive: a soft
+   *  start failure must not de-provision an otherwise-healthy persistent VM. */
+  origin?: 'create' | 'start'
+  /** True when start() reused a persistent TAP (do NOT destroy it on failure). */
+  tapWasReused?: boolean
   diskPaths?: string[]
   qmpSocketPath?: string
   pidFilePath?: string
@@ -230,6 +244,8 @@ export class VMLifecycle {
     // Track resources for cleanup on failure
     const resources: CleanupResources = {
       vmId,
+      origin: 'create',
+      internalName: config.internalName,
       diskPaths: paths.diskPaths,
       qmpSocketPath: paths.qmpSocketPath,
       pidFilePath: paths.pidFilePath,
@@ -343,18 +359,24 @@ export class VMLifecycle {
       await this.tapManager.configure(tapDevice, config.bridge)
       this.debug.log(`TAP device ${tapDevice} configured successfully for VM: ${vmId}`)
 
-      // 5. Fetch and apply firewall rules
+      // 5. Fetch and apply firewall rules.
+      // ALWAYS apply (even with zero rules) so the terminal posture (fail-closed
+      // 'drop' by default, or the department's policy) is installed. The previous
+      // `if (rules.length > 0)` guard meant a default-deny department with no
+      // explicit allow rules — or any transient fetch result — booted with NO
+      // terminal drop, i.e. unrestricted L3 on the shared bridge.
       this.debug.log(`Configuring firewall for VM: ${vmId}`)
       await this.nftables.createVMChain(vmId, tapDevice)
       const firewallRules = await this.fetchFirewallRules(vmId)
-      if (firewallRules.department.length > 0 || firewallRules.vm.length > 0) {
-        await this.nftables.applyRules(
-          vmId,
-          tapDevice,
-          firewallRules.department,
-          firewallRules.vm
-        )
-      }
+      // Explicit config wins; otherwise use the department-policy-derived posture.
+      const firewallDefaultAction: FirewallDefaultAction = config.firewallDefaultAction ?? firewallRules.defaultAction
+      await this.nftables.applyRules(
+        vmId,
+        tapDevice,
+        firewallRules.department,
+        firewallRules.vm,
+        firewallDefaultAction
+      )
 
       // 6. Handle unattended installation ISO generation (if configured)
       let installationIsoPath: string | undefined
@@ -461,7 +483,10 @@ export class VMLifecycle {
             hugepages: effectiveHugepages,
             displayPort: effectiveDisplayPort,
             enableNumaCtlPinning: config.enableNumaCtlPinning,
-            cpuPinningStrategy: config.cpuPinningStrategy
+            cpuPinningStrategy: config.cpuPinningStrategy,
+            // Host-hardening knobs (now reachable from the public create config).
+            runAsUser: config.runAsUser,
+            disableSandbox: config.disableSandbox
           }
 
           const commandBuilder = this.buildQemuCommand(
@@ -510,7 +535,12 @@ export class VMLifecycle {
       // 8b. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
       if (config.cpuPinning && config.cpuPinning.length > 0) {
         this.debug.log(`Applying CPU pinning for VM ${vmId}: cores ${config.cpuPinning.join(',')}`)
-        await this.cgroupsManager.applyCpuPinning(pid, config.cpuPinning)
+        const pinResult = await this.cgroupsManager.applyCpuPinning(pid, config.cpuPinning)
+        if (!pinResult.applied) {
+          // Surface the divergence loudly (warn is unconditional) instead of
+          // silently recording the requested cores as if honored.
+          this.debug.log('warn', `CPU pinning REQUESTED but NOT applied for VM ${vmId} (cores ${config.cpuPinning.join(',')}): ${pinResult.reason ?? 'unknown'}`)
+        }
       }
 
       // 9. Wait for QMP socket and connect
@@ -524,6 +554,9 @@ export class VMLifecycle {
       resources.qmpClient = qmpClient
       await qmpClient.connect()
 
+      // 9a. Deliver the display password over QMP (never on the QEMU command line).
+      await this.applyDisplayPassword(qmpClient, config.displayType, config.displayPassword)
+
       // 9. Verify VM status via QMP
       const status = await qmpClient.queryStatus()
       this.debug.log(`QMP status: ${status.status}`)
@@ -536,7 +569,9 @@ export class VMLifecycle {
         graphicProtocol: config.displayType,
         graphicPort: effectiveDisplayPort,
         graphicPassword: config.displayPassword ?? null,
-        graphicHost: config.displayAddr ?? '0.0.0.0',
+        // Persist the effective (secure-by-default loopback) bind address so a
+        // later start() reconstructs the same binding rather than '0.0.0.0'.
+        graphicHost: config.displayAddr ?? DEFAULT_SPICE_ADDR,
         // Store effective QEMU driver configuration (validated values, matching runtime behavior)
         bridge: config.bridge,
         machineType: effectiveMachineType,
@@ -637,8 +672,9 @@ export class VMLifecycle {
     this.debug.log(`Starting VM: ${vmId}`)
     const timestamp = new Date()
 
-    // Track resources for cleanup on failure
-    const resources: CleanupResources = { vmId }
+    // Track resources for cleanup on failure. origin='start' makes cleanup
+    // NON-destructive (preserve the persistent TAP + config, reset to 'off').
+    const resources: CleanupResources = { vmId, origin: 'start' }
 
     try {
       // 1. Fetch VM configuration from database (initial check)
@@ -731,6 +767,9 @@ export class VMLifecycle {
           { cpuCores: vmConfig.cpuCores, ramGB: vmConfig.ramGB, internalName: vmConfig.internalName }
         )
       }
+      // Record internalName so start()'s failure cleanup can identity-verify the
+      // pidfile PID before signalling it.
+      resources.internalName = vmConfig.internalName
 
       // 5. Get disk paths from database or generate from internalName (backward compatibility)
       let diskPaths: string[]
@@ -859,16 +898,15 @@ export class VMLifecycle {
       // 8. Get display configuration
       const displayProtocol = (vmConfig.configuration?.graphicProtocol as 'spice' | 'vnc') ?? 'spice'
       const displayPassword = vmConfig.configuration?.graphicPassword ?? undefined
-      const displayAddr = vmConfig.configuration?.graphicHost ?? '0.0.0.0'
+      // Default to loopback (secure) when no bind address was persisted.
+      const displayAddr = vmConfig.configuration?.graphicHost ?? DEFAULT_SPICE_ADDR
 
-      // 8a. Find an available display port (always start from SPICE_MIN_PORT)
-      // NOTE: the same probe->bind TOCTOU race as create() exists here, but the
-      // allocation is far from the QEMU spawn (TAP/firewall setup in between), so
-      // wrapping it in displayPortLock would over-serialize starts. A tight fix
-      // needs relocating allocation to just before the spawn (or an EADDRINUSE
-      // retry) — tracked as a follow-up. Concurrent starts are far rarer than the
-      // pool's concurrent creates, which create() already guards.
-      const displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
+      // 8a. Find an available display port (always start from SPICE_MIN_PORT).
+      // This is an initial pick; the actual spawn re-probes the port UNDER the
+      // displayPortLock and retries on EADDRINUSE (see step 14), closing the
+      // probe->bind TOCTOU race that previously produced spurious START_FAILEDs
+      // when many VMs in a pool started at once.
+      let displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
 
       // 8b. Update database with allocated port (for UI display)
       this.debug.log('info', `Allocated display port: ${displayPort}`)
@@ -897,6 +935,7 @@ export class VMLifecycle {
         }
 
         tapDevice = existingTapDevice
+        resources.tapWasReused = true // never destroy a persistent reused TAP on failure
         await this.tapManager.attachToBridge(tapDevice, bridge)
         this.debug.log(`TAP device ${tapDevice} reattached to bridge ${bridge}`)
       } else {
@@ -918,18 +957,21 @@ export class VMLifecycle {
       await this.nftables.ensureVMChain(vmId) // Idempotent - creates chain if not exists
       await this.nftables.attachJumpRules(vmId, tapDevice) // Connect TAP to persistent chain
 
+      // ALWAYS (re)install the terminal posture on start, even with zero rules,
+      // so a VM never boots without its fail-closed drop. applyRulesIfChanged
+      // still skips the kernel write when nothing changed (the hash includes the
+      // terminal action), so this stays cheap on a no-op restart.
       const firewallRules = await this.fetchFirewallRules(vmId)
-      if (firewallRules.department.length > 0 || firewallRules.vm.length > 0) {
-        // Use applyRulesIfChanged for optimization - skips re-apply if rules unchanged
-        const { changed } = await this.nftables.applyRulesIfChanged(
-          vmId,
-          tapDevice,
-          firewallRules.department,
-          firewallRules.vm
-        )
-        if (!changed) {
-          this.debug.log(`Firewall rules unchanged for VM ${vmId}, skipped re-apply`)
-        }
+      const startDefaultAction: FirewallDefaultAction = _config?.firewallDefaultAction ?? firewallRules.defaultAction
+      const { changed } = await this.nftables.applyRulesIfChanged(
+        vmId,
+        tapDevice,
+        firewallRules.department,
+        firewallRules.vm,
+        startDefaultAction
+      )
+      if (!changed) {
+        this.debug.log(`Firewall rules unchanged for VM ${vmId}, skipped re-apply`)
       }
 
       // 13. Build QEMU command from stored configuration
@@ -969,45 +1011,65 @@ export class VMLifecycle {
       const effectiveNetworkModel = this.validateNetworkModel(vmConfig.configuration?.networkModel)
       const effectiveMemoryBalloon = vmConfig.configuration?.memoryBalloon ?? false
 
-      const commandBuilder = this.buildQemuCommand(
-        createConfig,
-        diskPaths,
-        qmpSocketPath,
-        pidFilePath,
-        tapDevice,
-        macAddress,
-        {
-          machineType: effectiveMachineType,
-          cpuModel: effectiveCpuModel,
-          diskBus: effectiveDiskBus,
-          diskCacheMode: effectiveDiskCacheMode,
-          networkModel: effectiveNetworkModel,
-          networkQueues: vmConfig.configuration?.networkQueues,
-          memoryBalloon: effectiveMemoryBalloon,
-          uefiFirmware: vmConfig.configuration?.uefiFirmware,
-          hugepages: vmConfig.configuration?.hugepages,
-          displayPort, // Already validated above
-          // Advanced device configuration from database
-          tpmSocketPath: vmConfig.configuration?.tpmSocketPath,
-          guestAgentSocketPath: vmConfig.configuration?.guestAgentSocketPath,
-          // Use locally generated/stored infiniServiceSocketPath (includes fallback generation)
-          infiniServiceSocketPath,
-          virtioDriversIso: vmConfig.configuration?.virtioDriversIso,
-          enableAudio: vmConfig.configuration?.enableAudio,
-          enableUsbTablet: vmConfig.configuration?.enableUsbTablet,
-          // CPU pinning configuration
-          enableNumaCtlPinning: vmConfig.configuration?.enableNumaCtlPinning,
-          cpuPinningStrategy: this.validateCpuPinningStrategy(vmConfig.configuration?.cpuPinningStrategy)
-        }
-      )
+      // Base QEMU build options shared across spawn attempts (displayPort varies).
+      const qemuBuildConfig = {
+        machineType: effectiveMachineType,
+        cpuModel: effectiveCpuModel,
+        diskBus: effectiveDiskBus,
+        diskCacheMode: effectiveDiskCacheMode,
+        networkModel: effectiveNetworkModel,
+        networkQueues: vmConfig.configuration?.networkQueues,
+        memoryBalloon: effectiveMemoryBalloon,
+        uefiFirmware: vmConfig.configuration?.uefiFirmware,
+        hugepages: vmConfig.configuration?.hugepages,
+        // Advanced device configuration from database
+        tpmSocketPath: vmConfig.configuration?.tpmSocketPath,
+        guestAgentSocketPath: vmConfig.configuration?.guestAgentSocketPath,
+        // Use locally generated/stored infiniServiceSocketPath (includes fallback generation)
+        infiniServiceSocketPath,
+        virtioDriversIso: vmConfig.configuration?.virtioDriversIso,
+        enableAudio: vmConfig.configuration?.enableAudio,
+        enableUsbTablet: vmConfig.configuration?.enableUsbTablet,
+        // CPU pinning configuration
+        enableNumaCtlPinning: vmConfig.configuration?.enableNumaCtlPinning,
+        cpuPinningStrategy: this.validateCpuPinningStrategy(vmConfig.configuration?.cpuPinningStrategy)
+      }
 
-      // 14. Create and start QEMU process
+      // 14. Create and start QEMU process. Serialize the port re-probe + spawn
+      // through displayPortLock so two concurrent starts cannot both bind the same
+      // SPICE/VNC port; retry on EADDRINUSE with a freshly-allocated port.
       this.debug.log(`Starting QEMU process for VM: ${vmId}`)
-      const qemuProcess = new QemuProcess(vmId, commandBuilder)
-      qemuProcess.setQmpSocketPath(qmpSocketPath)
-      qemuProcess.setPidFilePath(pidFilePath)
-      resources.qemuProcess = qemuProcess
-      await qemuProcess.start()
+      const qemuProcess = await displayPortLock.runExclusive(DISPLAY_PORT_LOCK_KEY, async () => {
+        const MAX_PORT_ATTEMPTS = 5
+        for (let attempt = 1; ; attempt++) {
+          // Re-probe under the lock; the earlier pick may have been taken since.
+          if (!(await this.isPortAvailable(displayPort))) {
+            displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
+          }
+          createConfig.displayPort = displayPort
+          const commandBuilder = this.buildQemuCommand(
+            createConfig, diskPaths, qmpSocketPath, pidFilePath, tapDevice, macAddress,
+            { ...qemuBuildConfig, displayPort }
+          )
+          const proc = new QemuProcess(vmId, commandBuilder)
+          proc.setQmpSocketPath(qmpSocketPath)
+          proc.setPidFilePath(pidFilePath)
+          resources.qemuProcess = proc
+          try {
+            await proc.start()
+            return proc
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error)
+            const portConflict = /address already in use|failed to bind|bind\(\)|could not set up host forwarding/i.test(msg)
+            if (portConflict && attempt < MAX_PORT_ATTEMPTS) {
+              this.debug.log('warn', `Display port ${displayPort} conflict on spawn (attempt ${attempt}); re-allocating`)
+              displayPort = await this.findAvailableDisplayPort(displayPort + 1)
+              continue
+            }
+            throw error
+          }
+        }
+      })
 
       const pid = qemuProcess.getPid()
       if (!pid) {
@@ -1026,8 +1088,12 @@ export class VMLifecycle {
 
       // 14b. Apply CPU pinning if configured (best-effort, applyCpuPinning handles errors internally)
       if (vmConfig.configuration?.cpuPinning?.cores && vmConfig.configuration.cpuPinning.cores.length > 0) {
-        this.debug.log(`Applying CPU pinning for VM ${vmId}: cores ${vmConfig.configuration.cpuPinning.cores.join(',')}`)
-        await this.cgroupsManager.applyCpuPinning(pid, vmConfig.configuration.cpuPinning.cores)
+        const cores = vmConfig.configuration.cpuPinning.cores
+        this.debug.log(`Applying CPU pinning for VM ${vmId}: cores ${cores.join(',')}`)
+        const pinResult = await this.cgroupsManager.applyCpuPinning(pid, cores)
+        if (!pinResult.applied) {
+          this.debug.log('warn', `CPU pinning REQUESTED but NOT applied for VM ${vmId} (cores ${cores.join(',')}): ${pinResult.reason ?? 'unknown'}`)
+        }
       }
 
       // 15. Wait for QMP socket and connect
@@ -1040,6 +1106,9 @@ export class VMLifecycle {
       })
       resources.qmpClient = qmpClient
       await qmpClient.connect()
+
+      // 15a. Deliver the display password over QMP (never on the QEMU command line).
+      await this.applyDisplayPassword(qmpClient, displayProtocol, displayPassword)
 
       // 16. Verify VM status via QMP
       const status = await qmpClient.queryStatus()
@@ -1971,19 +2040,37 @@ export class VMLifecycle {
   private async fetchFirewallRules (vmId: string): Promise<{
     department: FirewallRuleInput[]
     vm: FirewallRuleInput[]
+    /** Terminal posture derived from the department policy (fail-closed 'drop'). */
+    defaultAction: FirewallDefaultAction
   }> {
     try {
       const rules = await this.prisma.getFirewallRules(vmId)
+      // Derive the terminal posture from the department's policy so an ALLOW_ALL
+      // department is not over-blocked by the fail-closed 'drop' default. Anything
+      // other than an explicit ALLOW_ALL maps to 'drop' (fail-closed).
+      const policy = await this.prisma.getDepartmentFirewallPolicy(vmId)
+      const defaultAction: FirewallDefaultAction = policy === 'ALLOW_ALL' ? 'accept' : 'drop'
       // Split rules into department and VM rules based on source
       // For now, return all rules as department rules
       // TODO: Properly split once we have source information
       return {
         department: rules,
-        vm: []
+        vm: [],
+        defaultAction
       }
-    } catch {
-      // No rules or error - return empty
-      return { department: [], vm: [] }
+    } catch (error) {
+      // FAIL-CLOSED: only a genuine "this machine has no firewall config" is a
+      // safe empty result. A real DB error (outage, deadlock) must NOT be
+      // swallowed into empty rules — that previously let the VM boot with NO
+      // terminal drop (unrestricted L3). Re-throw so create()/start() abort and
+      // the VM is never brought up unfiltered. The terminal drop is still
+      // installed unconditionally for the legitimately-empty case (see callers).
+      if (isPrismaAdapterError(error) && error.code === PrismaAdapterErrorCode.MACHINE_NOT_FOUND) {
+        this.debug.log('warn', `No firewall config found for VM ${vmId}; applying default-deny terminal posture only`)
+        return { department: [], vm: [], defaultAction: 'drop' }
+      }
+      this.debug.log('error', `Failed to fetch firewall rules for VM ${vmId} (failing closed): ${error instanceof Error ? error.message : String(error)}`)
+      throw error
     }
   }
 
@@ -2381,6 +2468,31 @@ export class VMLifecycle {
   }
 
   /**
+   * Delivers the display (SPICE/VNC) password to QEMU over QMP after connect,
+   * instead of placing it on the command line where it would be visible in `ps`
+   * and /proc/<pid>/cmdline to every local user. The display was started with
+   * authentication required (ticketing on / password=on); this call provisions
+   * the secret. Without it a password-protected console rejects every client.
+   *
+   * Fail-closed: if the password cannot be set, the launch fails rather than
+   * leaving an unreachable or (worse) unintentionally-open console.
+   */
+  private async applyDisplayPassword (
+    qmpClient: QMPClient,
+    displayType: string,
+    password?: string
+  ): Promise<void> {
+    if (!password) return
+    const protocol = displayType === 'vnc' ? 'vnc' : 'spice'
+    try {
+      await qmpClient.execute('set_password', { protocol, password, connected: 'keep' })
+      this.debug.log('info', `Display password provisioned over QMP (${protocol})`)
+    } catch (error) {
+      throw new Error(`Failed to set ${protocol} display password via QMP: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
    * Builds QEMU command line
    *
    * @param config - VM creation configuration
@@ -2417,9 +2529,24 @@ export class VMLifecycle {
       enableUsbTablet?: boolean | null
       enableNumaCtlPinning?: boolean | null
       cpuPinningStrategy?: 'basic' | 'hybrid' | null
+      /** Opt out of the seccomp sandbox (default: sandbox enabled). */
+      disableSandbox?: boolean | null
+      /** Unprivileged user to drop QEMU privileges to via -runas. */
+      runAsUser?: string | null
     }
   ): QemuCommandBuilder {
     const builder = new QemuCommandBuilder()
+
+    // Defense-in-depth: enable the QEMU seccomp sandbox by default so a guest that
+    // compromises QEMU cannot trivially pivot to the (root) host. Opt-out via
+    // qemuConfig.disableSandbox for the rare device that genuinely needs spawn.
+    if (qemuConfig?.disableSandbox !== true) {
+      builder.enableSeccompSandbox()
+    }
+    // If an unprivileged QEMU user is configured, drop privileges to it.
+    if (qemuConfig?.runAsUser) {
+      builder.setRunAs(qemuConfig.runAsUser)
+    }
 
     // Validate and get effective configuration values
     const effectiveMachineType = this.validateMachineType(qemuConfig?.machineType)
@@ -2502,12 +2629,35 @@ export class VMLifecycle {
     // Use validated display port from qemuConfig if available, otherwise validate from config
     const effectiveDisplayPort = this.validateDisplayPort(qemuConfig?.displayPort ?? config.displayPort)
 
+    // Secure-by-default display binding.
+    const effectiveDisplayAddr = config.displayAddr ?? (config.displayType === 'spice' ? DEFAULT_SPICE_ADDR : DEFAULT_VNC_ADDR)
+    const hasDisplayPassword = !!config.displayPassword
+    if (hasDisplayPassword) {
+      // The password is delivered over QMP (set_password) after connect, never on
+      // the QEMU command line. Still validate it so it cannot break QMP/argv.
+      assertSafeOptionValue(config.displayPassword as string, 'displayPassword')
+    }
+    // FAIL-CLOSED: never expose an unauthenticated console off-host. A non-loopback
+    // bind with no password would have been an open remote desktop for any host
+    // that can route to the hypervisor.
+    if (!isLoopbackAddr(effectiveDisplayAddr) && !hasDisplayPassword) {
+      throw new LifecycleError(
+        LifecycleErrorCode.INVALID_CONFIG,
+        `Refusing to start an unauthenticated ${config.displayType} display on non-loopback address '${effectiveDisplayAddr}'. Set a displayPassword or bind to loopback.`,
+        config.vmId
+      )
+    }
+
     if (config.displayType === 'spice') {
       const spiceConfig = new SpiceConfig({
         port: effectiveDisplayPort,
-        addr: config.displayAddr ?? '0.0.0.0',
-        password: config.displayPassword,
-        disableTicketing: !config.displayPassword,
+        addr: effectiveDisplayAddr,
+        // Password is NEVER placed on the command line (it would leak via ps /
+        // /proc/<pid>/cmdline). When a password is configured we require a ticket
+        // and set it over QMP after connect; otherwise (loopback-only) we allow
+        // ticketing to be disabled so a local console still works.
+        password: undefined,
+        disableTicketing: !hasDisplayPassword,
         enableAgent: !hasGuestAgent,
 
         // ===== Performance Optimizations =====
@@ -2539,10 +2689,24 @@ export class VMLifecycle {
       builder.addSpice(spiceConfig, qxlMemoryMB)
       this.debug.log(`SPICE display configured with optimizations: compression=auto_glz, streaming=filter, qxl_mem=${qxlMemoryMB}MB`)
     } else {
+      // VncConfig expects a DISPLAY NUMBER (0-99), not a TCP port. effectiveDisplay
+      // Port is a real port (5900-65535); convert it. Previously the raw port was
+      // passed straight through and VncConfig rejected it (>99) — so VNC could
+      // never launch a single VM.
+      const vncDisplayNumber = effectiveDisplayPort - VNC_BASE_PORT
+      if (vncDisplayNumber < 0 || vncDisplayNumber > 99) {
+        throw new LifecycleError(
+          LifecycleErrorCode.INVALID_CONFIG,
+          `VNC display port ${effectiveDisplayPort} maps to display number ${vncDisplayNumber}, outside the valid 0-99 range`,
+          config.vmId
+        )
+      }
       const vncConfig = new VncConfig({
-        display: effectiveDisplayPort,
-        addr: config.displayAddr ?? '0.0.0.0',
-        password: !!config.displayPassword
+        display: vncDisplayNumber,
+        addr: effectiveDisplayAddr,
+        // password=on tells QEMU to require auth; the secret itself is delivered
+        // over QMP (set_password) after connect — see applyDisplayPassword().
+        password: hasDisplayPassword
       })
       builder.addVnc(vncConfig)
     }
@@ -2680,28 +2844,15 @@ export class VMLifecycle {
    * Waits for a process to exit
    */
   private async waitForProcessExit (pid: number, timeout: number): Promise<boolean> {
-    const startTime = Date.now()
-
-    while (Date.now() - startTime < timeout) {
-      if (!this.isProcessAlive(pid)) {
-        return true
-      }
-      await this.sleep(PROCESS_EXIT_POLL_INTERVAL)
-    }
-
-    return false
+    return sharedWaitForProcessExit(pid, timeout, PROCESS_EXIT_POLL_INTERVAL)
   }
 
   /**
-   * Checks if a process is alive
+   * Checks if a process is alive (delegates to the shared zombie-aware,
+   * EPERM=>alive implementation so liveness is identical everywhere).
    */
   private isProcessAlive (pid: number): boolean {
-    try {
-      process.kill(pid, 0)
-      return true
-    } catch {
-      return false
-    }
+    return sharedIsProcessAlive(pid)
   }
 
   /**
@@ -2733,35 +2884,10 @@ export class VMLifecycle {
    * SIGKILL a PID we could not positively identify).
    */
   private pidBelongsToVM (pid: number, token: string): boolean {
-    if (process.platform !== 'linux') {
-      // No /proc to inspect; cannot verify. Preserve prior behavior.
-      return true
-    }
-    if (!token) {
-      this.debug.log('warn', `pidBelongsToVM: empty identifying token for PID ${pid}, cannot verify ownership`)
-      return false
-    }
-    try {
-      const raw = fs.readFileSync(`/proc/${pid}/cmdline`)
-      // /proc/<pid>/cmdline is NUL-delimited; normalize to spaces for matching.
-      const cmdline = raw.toString('utf8').replace(/\0/g, ' ')
-      const looksLikeQemu = cmdline.includes('qemu-system')
-      const matchesVM = cmdline.includes(token)
-      if (!looksLikeQemu || !matchesVM) {
-        this.debug.log('warn', `pidBelongsToVM: PID ${pid} does not match this VM (qemu=${looksLikeQemu}, token='${token}' matched=${matchesVM}) - refusing to signal it`)
-        return false
-      }
-      return true
-    } catch (error) {
-      const err = error as NodeJS.ErrnoException
-      if (err && err.code === 'ENOENT') {
-        // Process already gone (or no /proc entry); nothing to verify or kill.
-        this.debug.log('info', `pidBelongsToVM: PID ${pid} has no /proc entry (already exited)`)
-        return false
-      }
-      this.debug.log('warn', `pidBelongsToVM: failed to read /proc/${pid}/cmdline: ${err?.message ?? String(error)} - refusing to signal PID ${pid}`)
-      return false
-    }
+    // Delegates to the single shared implementation (see utils/processIdentity)
+    // so identity semantics are identical across VMLifecycle, HealthMonitor and
+    // EventHandler.
+    return sharedPidBelongsToVM(pid, token)
   }
 
   /**
@@ -2774,20 +2900,16 @@ export class VMLifecycle {
    * @returns true if a kill was actually attempted, false if it was skipped
    */
   private async forceKillProcess (pid: number, token: string): Promise<boolean> {
-    if (!this.pidBelongsToVM(pid, token)) {
+    // Delegates to the shared identity-checked SIGTERM->SIGKILL escalation.
+    // Returns whether a signal was actually sent (identity verified), preserving
+    // this method's prior boolean contract for existing callers.
+    const result = await sharedForceKillProcess(pid, token)
+    if (result.skipped) {
       this.debug.log('warn', `Skipping force kill of PID ${pid}: not confirmed to be this VM's QEMU process (token='${token}')`)
-      return false
+    } else if (!result.confirmedGone) {
+      this.debug.log('warn', `Force kill of PID ${pid} did not confirm exit`)
     }
-    try {
-      process.kill(pid, 'SIGKILL')
-      // Wait a bit for the process to terminate
-      await this.waitForProcessExit(pid, 5000)
-      return true
-    } catch (error) {
-      // Process might already be dead
-      this.debug.log('warn', `Force kill failed: ${error instanceof Error ? error.message : String(error)}`)
-      return false
-    }
+    return result.signalled
   }
 
   /**
@@ -2824,7 +2946,7 @@ export class VMLifecycle {
       }
     }
 
-    // Step 2: Force kill QEMU process
+    // Step 2: Force kill QEMU process.
     if (resources.qemuProcess) {
       try {
         this.debug.log('Force killing QEMU process')
@@ -2832,6 +2954,32 @@ export class VMLifecycle {
         this.debug.log('QEMU process killed')
       } catch (error) {
         this.debug.log('warn', `Failed to kill QEMU process: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+
+    // Step 2b: BACKSTOP for the daemonized case. On a failed create, the daemon
+    // PID may never have been adopted by the QemuProcess object (it is read in
+    // completeStart, which only runs on QMP success), so forceKill() above can
+    // target the already-exited fork PID and leave a live qemu-system holding the
+    // TAP + display port. Read the real daemon PID from the pidfile and kill it
+    // with /proc identity verification (never SIGKILL a recycled PID).
+    if (resources.pidFilePath && resources.internalName) {
+      try {
+        let pidContent: string | null = null
+        try {
+          pidContent = fs.readFileSync(resources.pidFilePath, 'utf8').trim()
+        } catch { /* pidfile already gone — nothing to reap */ }
+        const daemonPid = pidContent ? parseInt(pidContent, 10) : NaN
+        if (!isNaN(daemonPid) && daemonPid > 0) {
+          const result = await sharedForceKillProcess(daemonPid, resources.internalName)
+          if (result.signalled && result.confirmedGone) {
+            this.debug.log(`Cleanup: reaped daemonized QEMU PID ${daemonPid} via pidfile`)
+          } else if (result.skipped) {
+            this.debug.log('info', `Cleanup: pidfile PID ${daemonPid} is not this VM's QEMU (already gone / recycled) — not signalled`)
+          }
+        }
+      } catch (error) {
+        this.debug.log('warn', `Cleanup: failed to reap daemon PID from pidfile: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 
@@ -2875,8 +3023,10 @@ export class VMLifecycle {
     this.debug.log('Waiting 200ms for nftables resource release')
     await sleep(200)
 
-    // Step 8: Destroy TAP device (now safe to delete)
-    if (resources.tapDevice) {
+    // Step 8: Destroy TAP device (now safe to delete) — but NEVER destroy a
+    // persistent TAP that start() merely reused. Destroying it would break the
+    // stop/start persistence invariant and force a recreate on the next start.
+    if (resources.tapDevice && !resources.tapWasReused) {
       try {
         this.debug.log(`Destroying TAP device: ${resources.tapDevice}`)
         await this.tapManager.destroy(resources.tapDevice)
@@ -2884,17 +3034,30 @@ export class VMLifecycle {
       } catch (error) {
         this.debug.log('warn', `Failed to destroy TAP device: ${error instanceof Error ? error.message : String(error)}`)
       }
+    } else if (resources.tapWasReused) {
+      this.debug.log(`Preserving reused persistent TAP device: ${resources.tapDevice}`)
     }
 
-    // Step 9: Clear DB configuration
+    // Step 9: Clear DB configuration.
+    // For a START failure, prefer a RECOVERABLE outcome: keep the persistent
+    // config (tapDeviceName etc.) by clearing only volatile runtime fields, and
+    // reset the row to 'off' (re-startable) instead of 'error' (a soft/transient
+    // start failure must not strand an otherwise-healthy VM). For a CREATE
+    // failure the row was never a valid VM, so wipe it and mark 'error'.
     if (resources.vmId) {
       try {
-        this.debug.log(`Clearing DB configuration for VM: ${resources.vmId}`)
-        await this.prisma.clearMachineConfiguration(resources.vmId)
-        await this.prisma.updateMachineStatus(resources.vmId, 'error')
-        this.debug.log(`DB configuration cleared for VM: ${resources.vmId}`)
+        if (resources.origin === 'start') {
+          this.debug.log(`Resetting VM ${resources.vmId} to recoverable 'off' after start failure (config preserved)`)
+          await this.prisma.clearVolatileMachineConfiguration(resources.vmId)
+          await this.prisma.updateMachineStatus(resources.vmId, 'off')
+        } else {
+          this.debug.log(`Clearing DB configuration for VM: ${resources.vmId}`)
+          await this.prisma.clearMachineConfiguration(resources.vmId)
+          await this.prisma.updateMachineStatus(resources.vmId, 'error')
+        }
+        this.debug.log(`DB configuration finalized for VM: ${resources.vmId}`)
       } catch (error) {
-        this.debug.log('warn', `Failed to clear DB configuration: ${error instanceof Error ? error.message : String(error)}`)
+        this.debug.log('warn', `Failed to finalize DB configuration: ${error instanceof Error ? error.message : String(error)}`)
       }
     }
 

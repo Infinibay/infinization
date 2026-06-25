@@ -42,6 +42,8 @@ const DEFAULT_OPTIONS: Required<GuestAgentClientOptions> = {
  * `qmpSocketPath`.
  */
 export class GuestAgentClient {
+  /** Max time to wait for a graceful socket close before forcing teardown. */
+  private static readonly DISCONNECT_TIMEOUT_MS = 3000
   private socket: net.Socket | null = null
   private connected = false
   private socketPath: string
@@ -99,15 +101,25 @@ export class GuestAgentClient {
     }
 
     return new Promise((resolve) => {
-      if (this.socket) {
-        this.socket.once('close', () => {
-          this.cleanup()
-          resolve()
-        })
-        this.socket.end()
-      } else {
+      if (!this.socket) {
+        resolve()
+        return
+      }
+      // Bound the wait: if the remote never sends 'close' (hung guest), force a
+      // local teardown after a short timeout so disconnect() always settles and
+      // cannot hang the facade's finally block indefinitely.
+      let settled = false
+      const finish = (): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        this.cleanup()
         resolve()
       }
+      const timer = setTimeout(finish, GuestAgentClient.DISCONNECT_TIMEOUT_MS)
+      timer.unref?.()
+      this.socket.once('close', finish)
+      this.socket.end()
     })
   }
 

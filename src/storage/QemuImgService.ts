@@ -85,7 +85,10 @@ export class QemuImgService {
     }
 
     try {
-      await this.executor.execute('qemu-img', args)
+      // Disk-sized op (create with preallocation / full convert): no timeout, or
+      // the 10-min CommandExecutor default would SIGKILL it mid-write on a large
+      // image and leave a corrupt partial.
+      await this.executor.execute('qemu-img', args, { timeoutMs: 0 })
       this.debug.log(`Image created successfully: ${path}`)
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
@@ -224,7 +227,7 @@ export class QemuImgService {
         '--',
         path,
         `${newSizeGB}G`
-      ])
+      ], { timeoutMs: 0 })
       this.debug.log(`Image resized successfully: ${path} to ${newSizeGB}GB`)
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
@@ -284,7 +287,10 @@ export class QemuImgService {
 
       args.push('--', sourcePath, destPath)
 
-      await this.executor.execute('qemu-img', args)
+      // Disk-sized op (create with preallocation / full convert): no timeout, or
+      // the 10-min CommandExecutor default would SIGKILL it mid-write on a large
+      // image and leave a corrupt partial.
+      await this.executor.execute('qemu-img', args, { timeoutMs: 0 })
       this.debug.log(`Image converted successfully: ${sourcePath} -> ${destPath}`)
     } catch (error) {
       // Re-throw StorageErrors as-is
@@ -313,12 +319,14 @@ export class QemuImgService {
     this.debug.log(`Checking image: ${path}`)
 
     try {
+      // check scans the whole image — no timeout (a large/corrupt image can take
+      // a while) and a generous buffer for the JSON report.
       const output = await this.executor.execute('qemu-img', [
         'check',
         '--output=json',
         '--',
         path
-      ])
+      ], { timeoutMs: 0 })
 
       const checkResult = JSON.parse(output)
       const imageCheckResult: ImageCheckResult = {
@@ -334,12 +342,19 @@ export class QemuImgService {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
 
-      // qemu-img check returns non-zero exit code if errors found, but still outputs JSON to stdout
-      // Extract stdout section from error message (format: "stdout: <content>\nstderr: <content>")
+      // qemu-img check exits non-zero when it finds errors but still writes the
+      // JSON report to stdout. Prefer the FULL structured stdout off the
+      // CommandExecutionError (the message is now tail-truncated to 8KB, which
+      // could clip a large report and break JSON.parse). Fall back to the legacy
+      // message-scraping only if the structured field is unavailable.
+      const structuredStdout = (error as { stdout?: string })?.stdout
       const stdoutMatch = errorMessage.match(/stdout:\s*([\s\S]*?)\nstderr:/)
-      if (stdoutMatch && stdoutMatch[1].trim()) {
+      const jsonText = (structuredStdout && structuredStdout.trim())
+        ? structuredStdout.trim()
+        : (stdoutMatch && stdoutMatch[1].trim() ? stdoutMatch[1].trim() : '')
+      if (jsonText) {
         try {
-          const checkResult = JSON.parse(stdoutMatch[1].trim())
+          const checkResult = JSON.parse(jsonText)
           const result: ImageCheckResult = {
             errors: checkResult['check-errors'] || 0,
             leaks: checkResult.leaks || 0,

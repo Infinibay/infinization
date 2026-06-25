@@ -16,12 +16,12 @@
  */
 
 import { EventEmitter } from 'events'
-import { readFile, writeFile, mkdir, stat } from 'fs/promises'
+import { readFile, writeFile, mkdir, stat, rename } from 'fs/promises'
 import { randomUUID } from 'crypto'
 import { join } from 'path'
 
 import { BackupService } from './BackupService'
-import { BackupScheduler, ScheduleAdapter } from './BackupScheduler'
+import { BackupScheduler, ScheduleAdapter, DiskPathResolver } from './BackupScheduler'
 import { Debugger } from '../utils/debug'
 
 import {
@@ -43,12 +43,23 @@ import {
 export interface BackupScheduleServiceOptions {
   /** Root directory for backups and schedule persistence (default: DEFAULT_BACKUP_DIR) */
   backupRootDir?: string
+  /**
+   * Resolves a VM's disk image paths at backup time. REQUIRED for schedules that
+   * do not carry their own `diskPaths` — otherwise every scheduled run fails loud
+   * (a backup needs disks). Forwarded to the underlying BackupScheduler.
+   */
+  diskPathResolver?: DiskPathResolver
 }
 
 /** Input type for creating a new schedule. Omits auto-generated fields. */
 export interface CreateScheduleInput {
   /** VM identifier this schedule applies to */
   vmId: string
+  /**
+   * Disk image paths to back up. Optional only if the service was constructed
+   * with a diskPathResolver; otherwise required or the scheduled run will fail.
+   */
+  diskPaths?: string[]
   /** Type of backup this schedule creates */
   type: BackupType
   /** Cron expression (e.g. '0 2 * * 0' = Sundays at 2 AM) */
@@ -134,7 +145,13 @@ export class BackupScheduleService extends EventEmitter {
   ) {
     super()
     this.backupService = backupService
-    this.scheduler = new BackupScheduler(backupService, adapter, options?.backupRootDir)
+    // Forward the resolver so scheduled backups without explicit diskPaths can
+    // resolve them at fire time (a bare backupRootDir would leave the resolver
+    // undefined and every scheduled run would fail).
+    this.scheduler = new BackupScheduler(backupService, adapter, {
+      backupRootDir: options?.backupRootDir,
+      diskPathResolver: options?.diskPathResolver
+    })
     this.debug = new Debugger('backup-schedule-service')
     this.backupRootDir = options?.backupRootDir ?? DEFAULT_BACKUP_DIR
     this.storePath = join(this.backupRootDir, SCHEDULES_FILENAME)
@@ -157,6 +174,7 @@ export class BackupScheduleService extends EventEmitter {
     const schedule: BackupSchedule = {
       id: randomUUID(),
       vmId: input.vmId,
+      diskPaths: input.diskPaths,
       type: input.type,
       cronExpression: input.cronExpression,
       retentionCount: input.retentionCount ?? DEFAULT_RETENTION_COUNT,
@@ -367,15 +385,22 @@ export class BackupScheduleService extends EventEmitter {
     try {
       store = JSON.parse(raw) as ScheduleStore
     } catch {
-      this.debug.log('error', `Corrupt schedules file at ${this.storePath} — starting fresh`)
-      this.emit('loaded', 0)
-      return
+      // FAIL-CLOSED: do NOT "start fresh" — that silently drops EVERY schedule
+      // and stops all backups platform-wide after one bad write/restart. Preserve
+      // the corrupt file for forensics and refuse to start so the operator notices.
+      await this.quarantineCorruptStore()
+      throw new BackupError(
+        BackupErrorCode.INVALID_CONFIG,
+        `Corrupt schedules store at ${this.storePath}; quarantined to ${this.storePath}.corrupt. Refusing to start with zero schedules — restore the file or remove the quarantine to start fresh.`
+      )
     }
 
     if (store.version !== 1 || !Array.isArray(store.schedules)) {
-      this.debug.log('error', `Unsupported schedules store version: ${store.version}`)
-      this.emit('loaded', 0)
-      return
+      await this.quarantineCorruptStore()
+      throw new BackupError(
+        BackupErrorCode.INVALID_CONFIG,
+        `Unsupported/invalid schedules store (version=${store.version}) at ${this.storePath}; quarantined. Refusing to start with zero schedules.`
+      )
     }
 
     // Load into memory and register with scheduler
@@ -409,10 +434,24 @@ export class BackupScheduleService extends EventEmitter {
     // Ensure directory exists
     await mkdir(this.backupRootDir, { recursive: true })
 
-    await writeFile(this.storePath, JSON.stringify(store, null, 2), 'utf-8')
+    // Atomic write: write to a temp file then rename over the real one, so a crash
+    // mid-write never leaves a half-written (corrupt) schedules store.
+    const tmpPath = `${this.storePath}.tmp`
+    await writeFile(tmpPath, JSON.stringify(store, null, 2), 'utf-8')
+    await rename(tmpPath, this.storePath)
 
     this.debug.log(`Persisted ${store.schedules.length} schedule(s) to ${this.storePath}`)
     this.emit('persisted', store.schedules.length)
+  }
+
+  /** Moves a corrupt schedules store aside for forensics (best-effort). */
+  private async quarantineCorruptStore (): Promise<void> {
+    try {
+      await rename(this.storePath, `${this.storePath}.corrupt`)
+      this.debug.log('error', `Quarantined corrupt schedules store to ${this.storePath}.corrupt`)
+    } catch (error) {
+      this.debug.log('error', `Failed to quarantine corrupt schedules store: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   // ===========================================================================

@@ -160,6 +160,13 @@ export interface BackupSchedule {
   id: string
   /** VM identifier this schedule applies to */
   vmId: string
+  /**
+   * Disk image paths to back up. If omitted, the scheduler resolves them via the
+   * `diskPathResolver` it was constructed with. One of the two MUST yield a
+   * non-empty list or the scheduled run fails loudly (a backup of zero disks is
+   * never what the operator intended).
+   */
+  diskPaths?: string[]
   /** Type of backup this schedule creates */
   type: BackupType
   /** Cron expression for scheduling (e.g. '0 2 * * 0' = Sundays at 2 AM) */

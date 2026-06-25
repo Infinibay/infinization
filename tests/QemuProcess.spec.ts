@@ -15,8 +15,12 @@ jest.mock('child_process', () => ({
   spawn: jest.fn()
 }))
 
-// Mock fs.promises
+// Mock fs (sync + promises). processIdentity (used by QemuProcess.isAlive /
+// waitForProcessExit) reads /proc via the sync API, so existsSync/readFileSync
+// must exist; default them to "no /proc entry" so the zombie check is skipped.
 jest.mock('fs', () => ({
+  existsSync: jest.fn().mockReturnValue(false),
+  readFileSync: jest.fn().mockReturnValue(''),
   promises: {
     readFile: jest.fn(),
     access: jest.fn(),
@@ -61,6 +65,7 @@ describe('QemuProcess', () => {
     // Create mock child process
     mockProcess = {
       pid: testPid,
+      killed: false,
       stdout: {
         on: jest.fn()
       },
@@ -68,13 +73,31 @@ describe('QemuProcess', () => {
         on: jest.fn()
       },
       on: jest.fn(),
-      kill: jest.fn()
-    }
+      once: jest.fn(),
+      kill: jest.fn(),
+      removeAllListeners: jest.fn(),
+      unref: jest.fn()
+    } as any
 
     // Setup spawn to return mock process
     MockedSpawn.mockReturnValue(mockProcess as any)
 
+    // processIdentity.isProcessAlive uses the REAL global process.kill; mock it so
+    // a fake test PID reads as "alive" (signal 0) unless a test overrides it.
+    jest.spyOn(process, 'kill').mockImplementation(() => true as never)
+
+    // Daemonized start now REQUIRES adopting the daemon PID from the pidfile and
+    // FAILS otherwise; provide a valid default pidfile read + socket access so the
+    // happy-path start tests resolve.
+    MockedReadFile.mockResolvedValue('12345')
+    MockedAccess.mockResolvedValue(undefined)
+    MockedUnlink.mockResolvedValue(undefined)
+
     qemuProcess = new QemuProcess(testVmId, mockCommandBuilder)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
   })
 
   describe('constructor', () => {
@@ -113,7 +136,7 @@ describe('QemuProcess', () => {
 
     it('spawns QEMU process with correct command', async () => {
       // Setup process exit callback to resolve start promise
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => {
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => {
         if (event === 'exit') {
           // Don't call exit callback for successful start
         }
@@ -130,7 +153,7 @@ describe('QemuProcess', () => {
     })
 
     it('sets PID from spawned process', async () => {
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => mockProcess)
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
 
       await qemuProcess.start()
 
@@ -141,7 +164,7 @@ describe('QemuProcess', () => {
       mockCommandBuilder.isDaemonizeEnabled.mockReturnValue(true)
       MockedReadFile.mockResolvedValue('54321')
 
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => {
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => {
         if (event === 'exit') {
           // Simulate daemon parent exit with code 0
           setTimeout(() => callback(0, null), 10)
@@ -169,7 +192,7 @@ describe('QemuProcess', () => {
         numaNodes: [0]
       })
 
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => mockProcess)
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
 
       await qemuProcess.start()
 
@@ -180,22 +203,20 @@ describe('QemuProcess', () => {
       )
     })
 
-    it('rejects if process exits during startup', async () => {
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => {
-        if (event === 'exit') {
-          // Simulate immediate failure
-          setTimeout(() => callback(1, null), 10)
-        }
-        return mockProcess
-      })
+    it('rejects a daemonized start when the daemon PID cannot be read (I06 fix)', async () => {
+      // No QMP socket configured -> daemonized start waits on the pidfile. If the
+      // pidfile never yields a valid PID, start() must REJECT (not resolve with a
+      // stale fork PID).
+      MockedReadFile.mockRejectedValue(new Error('ENOENT'))
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
 
-      await expect(qemuProcess.start()).rejects.toThrow(/exited during startup/)
+      await expect(qemuProcess.start()).rejects.toThrow(/daemon PID/i)
     })
 
     it('rejects if QMP socket never appears', async () => {
       MockedAccess.mockRejectedValue(new Error('ENOENT'))
 
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => mockProcess)
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
 
       await expect(qemuProcess.start()).rejects.toThrow(/QMP socket.*not available/)
     })
@@ -209,74 +230,57 @@ describe('QemuProcess', () => {
     })
   })
 
+  // Liveness helper: make process.kill(pid, 0) report dead/alive on demand while
+  // recording SIGTERM/SIGKILL. (this.process is nulled for daemonized VMs, so stop
+  // now signals the daemon PID via the global process.kill — the I05 fix.)
+  function mockKill (opts: { aliveForSig0: boolean }): jest.SpyInstance {
+    return jest.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+      if (sig === 0) {
+        if (opts.aliveForSig0) return true
+        const err = new Error('ESRCH') as NodeJS.ErrnoException
+        err.code = 'ESRCH'
+        throw err
+      }
+      return true
+    }) as never)
+  }
+
   describe('stop', () => {
     beforeEach(() => {
-      // Set PID manually for stop tests
       qemuProcess.setPidFilePath('/var/run/qemu/test.pid')
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
     })
 
-    it('sends SIGTERM to process', async () => {
-      // Mock process exit after SIGTERM
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => {
-        if (event === 'exit') {
-          setTimeout(callback, 10)
-        }
-        return mockProcess
-      })
-
-      // Set PID by starting first
+    it('signals the DAEMON PID via process.kill (not the dead fork handle)', async () => {
       MockedAccess.mockResolvedValue(undefined)
-      mockProcess.on.mockImplementationOnce((event: string, callback: () => void) => mockProcess)
-      await qemuProcess.start()
+      await qemuProcess.start() // adopts daemon PID 12345, nulls this.process
+      const killSpy = mockKill({ aliveForSig0: false }) // process exits promptly
 
       await qemuProcess.stop(1000)
 
-      expect(mockProcess.kill).toHaveBeenCalledWith('SIGTERM')
+      // Daemonized stop must target the real daemon PID, not the fork-parent handle.
+      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGTERM')
     })
 
-    it('force kills after timeout', async () => {
-      // Mock process that doesn't exit
-      mockProcess.on.mockImplementation(() => mockProcess)
+    it('escalates to SIGKILL after the graceful timeout', async () => {
+      MockedAccess.mockResolvedValue(undefined)
+      await qemuProcess.start()
+      const killSpy = mockKill({ aliveForSig0: true }) // never exits gracefully
 
-      // Set PID manually
-      jest.spyOn(qemuProcess, 'getPid').mockReturnValue(testPid)
+      await qemuProcess.stop(50).catch(() => { /* forceKill may throw if unreaped */ })
 
-      // Mock process.kill for forceKill
-      const originalKill = process.kill
-      process.kill = jest.fn()
-
-      try {
-        await qemuProcess.stop(50) // Short timeout for test
-      } catch (error) {
-        // Timeout is expected
-      }
-
-      expect(process.kill).toHaveBeenCalledWith(testPid, 'SIGKILL')
-
-      // Restore
-      process.kill = originalKill
+      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGKILL')
     })
 
     it('does nothing if process is not running', async () => {
-      // Don't start process, just call stop
       await qemuProcess.stop()
-
       expect(mockProcess.kill).not.toHaveBeenCalled()
     })
 
-    it('cleans up PID file after stop', async () => {
-      mockProcess.on.mockImplementation((event: string, callback: () => void) => {
-        if (event === 'exit') {
-          setTimeout(callback, 10)
-        }
-        return mockProcess
-      })
-
+    it('cleans up the PID file after a successful stop', async () => {
       MockedAccess.mockResolvedValue(undefined)
-      mockProcess.on.mockImplementationOnce((event: string, callback: () => void) => mockProcess)
       await qemuProcess.start()
-
-      MockedUnlink.mockResolvedValue()
+      mockKill({ aliveForSig0: false })
 
       await qemuProcess.stop(1000)
 
@@ -285,58 +289,38 @@ describe('QemuProcess', () => {
   })
 
   describe('forceKill', () => {
-    it('sends SIGKILL to process', async () => {
-      const originalKill = process.kill
-      process.kill = jest.fn()
-
-      try {
-        // Set PID by starting first
-        MockedAccess.mockResolvedValue(undefined)
-        mockProcess.on.mockImplementation((event: string, callback: () => void) => mockProcess)
-        await qemuProcess.start()
-
-        await qemuProcess.forceKill()
-
-        expect(process.kill).toHaveBeenCalledWith(testPid, 'SIGKILL')
-      } finally {
-        process.kill = originalKill
-      }
+    beforeEach(() => {
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
     })
 
-    it('handles process already dead', async () => {
-      const originalKill = process.kill
-      process.kill = jest.fn().mockImplementation(() => {
-        throw new Error('ESRCH')
-      })
+    it('sends SIGKILL to the daemon PID and confirms it is gone', async () => {
+      MockedAccess.mockResolvedValue(undefined)
+      await qemuProcess.start()
+      const killSpy = mockKill({ aliveForSig0: false })
 
-      try {
-        MockedAccess.mockResolvedValue(undefined)
-        mockProcess.on.mockImplementation((event: string, callback: () => void) => mockProcess)
-        await qemuProcess.start()
+      await qemuProcess.forceKill()
 
-        await qemuProcess.forceKill()
+      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGKILL')
+    })
 
-        // Should not throw
-        expect(process.kill).toHaveBeenCalled()
-      } finally {
-        process.kill = originalKill
-      }
+    it('handles an already-dead process without throwing', async () => {
+      MockedAccess.mockResolvedValue(undefined)
+      await qemuProcess.start()
+      mockKill({ aliveForSig0: false })
+
+      await expect(qemuProcess.forceKill()).resolves.toBeUndefined()
     })
   })
 
   describe('isAlive', () => {
-    it('returns true if process is alive', () => {
-      const originalKill = process.kill
-      process.kill = jest.fn()
+    it('returns true if process is alive', async () => {
+      // isAlive reads the real this.pid; start() to set it (daemon PID 12345).
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
+      MockedAccess.mockResolvedValue(undefined)
+      await qemuProcess.start()
+      mockKill({ aliveForSig0: true })
 
-      try {
-        // Set PID manually
-        jest.spyOn(qemuProcess, 'getPid').mockReturnValue(testPid)
-
-        expect(qemuProcess.isAlive()).toBe(true)
-      } finally {
-        process.kill = originalKill
-      }
+      expect(qemuProcess.isAlive()).toBe(true)
     })
 
     it('returns false if process is dead', () => {
@@ -373,15 +357,12 @@ describe('QemuProcess', () => {
     })
   })
 
-  describe('getCpuPinningInfo', () => {
-    it('returns CPU pinning information', () => {
-      const info = qemuProcess.getCpuPinningInfo()
-
-      expect(info).toEqual({
-        cpuPinningApplied: false,
-        pinnedCores: [],
-        numaNodes: []
-      })
+  describe('CPU pinning info getters', () => {
+    it('reports no pinning before start via the individual getters', () => {
+      // getCpuPinningInfo() was removed in favor of discrete getters.
+      expect(qemuProcess.isCpuPinningApplied()).toBe(false)
+      expect(qemuProcess.getPinnedCores()).toEqual([])
+      expect(qemuProcess.getNumaNodes()).toEqual([])
     })
   })
 })

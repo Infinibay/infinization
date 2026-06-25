@@ -32,6 +32,13 @@ const CGROUPS_V2_CONTROLLERS = '/sys/fs/cgroup/cgroup.controllers'
 /** Path for Infinization's cgroup slice */
 const INFINIZATION_SLICE = '/sys/fs/cgroup/infinization.slice'
 
+/** Outcome of an applyCpuPinning() attempt. `applied` reflects REALITY so the
+ *  caller never records requested-but-unhonored cores as if they were honored. */
+export interface CpuPinningApplyResult {
+  applied: boolean
+  reason?: string
+}
+
 /**
  * CgroupsManager manages cgroup operations for VM CPU pinning.
  * Uses cgroups v2 API to create scopes and apply CPU affinity.
@@ -56,21 +63,22 @@ export class CgroupsManager {
    * @param pid - Process ID to pin
    * @param cores - Array of CPU core indices (0-based)
    */
-  async applyCpuPinning (pid: number, cores: number[]): Promise<void> {
+  async applyCpuPinning (pid: number, cores: number[]): Promise<CpuPinningApplyResult> {
     this.debug.log(`Applying CPU pinning for PID ${pid} to cores: ${cores.join(',')}`)
 
     // Check if cgroups v2 is available first
     if (!await this.isCgroupsV2Available()) {
       this.debug.log('warn', 'Cgroups v2 not available, skipping CPU pinning')
-      return
+      return { applied: false, reason: 'cgroups v2 unavailable' }
     }
 
     // Validate cores - if invalid, log warning and skip (best-effort)
     try {
       await this.validateCores(cores)
     } catch (error) {
-      this.debug.log('warn', `Invalid CPU cores, skipping pinning: ${error instanceof Error ? error.message : String(error)}`)
-      return
+      const reason = error instanceof Error ? error.message : String(error)
+      this.debug.log('warn', `Invalid CPU cores, skipping pinning: ${reason}`)
+      return { applied: false, reason }
     }
 
     // Create unique scope name for this VM process
@@ -94,14 +102,19 @@ export class CgroupsManager {
       await this.movePidToCgroup(scopePath, pid)
 
       this.debug.log(`CPU pinning applied successfully: PID ${pid} -> cores ${cores.join(',')}`)
+      return { applied: true }
     } catch (error) {
-      // Clean up on failure, but don't throw - CPU pinning is best-effort
+      // Clean up on failure, but don't throw - CPU pinning is best-effort. The
+      // caller gets applied=false so it can surface the divergence instead of
+      // recording the requested cores as if they were honored.
       try {
         await this.removeCgroupScope(scopePath)
       } catch {
         // Ignore cleanup errors
       }
-      this.debug.log('warn', `Failed to apply CPU pinning: ${error instanceof Error ? error.message : String(error)}`)
+      const reason = error instanceof Error ? error.message : String(error)
+      this.debug.log('warn', `Failed to apply CPU pinning: ${reason}`)
+      return { applied: false, reason }
     }
   }
 
@@ -203,17 +216,87 @@ export class CgroupsManager {
       throw new Error(`Invalid negative CPU core indices: ${negativeCores.join(',')}`)
     }
 
-    // Get host CPU count
-    const hostCpuCount = await this.getHostCpuCount()
-
-    // Check all cores are within valid range
-    const invalidCores = uniqueCores.filter(c => c >= hostCpuCount)
-    if (invalidCores.length > 0) {
-      throw new Error(
-        `Invalid CPU cores for pinning: ${invalidCores.join(',')}. ` +
-        `Host has ${hostCpuCount} cores (valid range: 0-${hostCpuCount - 1})`
-      )
+    // Validate against the ONLINE CPU id set, not a bare count. On hosts with
+    // offline or sparse CPUs (e.g. ids 0-3,8-11), a count-based check wrongly
+    // accepts/rejects ids. Fall back to a 0..count-1 range only if the online set
+    // can't be read.
+    const onlineCpus = await this.getOnlineCpus()
+    if (onlineCpus) {
+      const invalidCores = uniqueCores.filter(c => !onlineCpus.has(c))
+      if (invalidCores.length > 0) {
+        throw new Error(
+          `Invalid CPU cores for pinning: ${invalidCores.join(',')}. ` +
+          `Online CPUs: ${Array.from(onlineCpus).sort((a, b) => a - b).join(',')}`
+        )
+      }
+    } else {
+      const hostCpuCount = await this.getHostCpuCount()
+      const invalidCores = uniqueCores.filter(c => c >= hostCpuCount)
+      if (invalidCores.length > 0) {
+        throw new Error(
+          `Invalid CPU cores for pinning: ${invalidCores.join(',')}. ` +
+          `Host has ${hostCpuCount} cores (valid range: 0-${hostCpuCount - 1})`
+        )
+      }
     }
+  }
+
+  /**
+   * Reads the set of ONLINE CPU ids from /sys/devices/system/cpu/online
+   * (e.g. "0-3,8-11" -> {0,1,2,3,8,9,10,11}). Returns null if unreadable.
+   */
+  private async getOnlineCpus (): Promise<Set<number> | null> {
+    try {
+      const raw = await fs.readFile('/sys/devices/system/cpu/online', 'utf8')
+      return this.parseCpuList(raw.trim())
+    } catch {
+      return null
+    }
+  }
+
+  /** Parses a Linux CPU-list string ("0-3,8,10-11") into a Set of ids. */
+  private parseCpuList (list: string): Set<number> {
+    const result = new Set<number>()
+    for (const part of list.split(',')) {
+      const trimmed = part.trim()
+      if (!trimmed) continue
+      if (trimmed.includes('-')) {
+        const [start, end] = trimmed.split('-').map(n => parseInt(n, 10))
+        if (!isNaN(start) && !isNaN(end) && start <= end) {
+          for (let i = start; i <= end; i++) result.add(i)
+        }
+      } else {
+        const n = parseInt(trimmed, 10)
+        if (!isNaN(n)) result.add(n)
+      }
+    }
+    return result
+  }
+
+  /**
+   * Returns the NUMA memory node ids that own the given cores, by scanning each
+   * node's cpulist under /sys/devices/system/node. Used to set cpuset.mems
+   * correctly instead of hardcoding node 0 (which forces all-remote memory for
+   * cores on other nodes). Returns ['0'] as a safe fallback when unreadable.
+   */
+  private async getMemoryNodesForCores (cores: number[]): Promise<string[]> {
+    try {
+      const nodeDirs = (await fs.readdir('/sys/devices/system/node'))
+        .filter(d => /^node\d+$/.test(d))
+      const nodes = new Set<number>()
+      for (const dir of nodeDirs) {
+        const nodeId = parseInt(dir.replace('node', ''), 10)
+        try {
+          const cpulist = await fs.readFile(`/sys/devices/system/node/${dir}/cpulist`, 'utf8')
+          const nodeCpus = this.parseCpuList(cpulist.trim())
+          if (cores.some(c => nodeCpus.has(c))) nodes.add(nodeId)
+        } catch { /* skip unreadable node */ }
+      }
+      if (nodes.size > 0) {
+        return Array.from(nodes).sort((a, b) => a - b).map(String)
+      }
+    } catch { /* fall through to fallback */ }
+    return ['0']
   }
 
   /**
@@ -374,14 +457,21 @@ export class CgroupsManager {
       throw new Error(`Failed to set CPU affinity: ${error instanceof Error ? error.message : String(error)}`)
     }
 
-    // Also need to set cpuset.mems (required when cpuset is enabled)
+    // cpuset.mems is REQUIRED whenever cpuset.cpus is set. Derive the correct
+    // NUMA node(s) for the pinned cores instead of hardcoding '0' — otherwise a
+    // VM pinned to non-node-0 cores is forced onto all-remote memory. If the file
+    // exists, a failure to write it is fatal for this scope (not swallowed).
     const memsPath = path.join(scopePath, 'cpuset.mems')
-    try {
-      // Set to all NUMA nodes (0 for single-node systems)
-      await fs.writeFile(memsPath, '0')
-    } catch {
-      // cpuset.mems may not exist or may be read-only, that's okay
-      this.debug.log('info', 'cpuset.mems not writable, may not be required')
+    if (await this.pathExists(memsPath)) {
+      const mems = (await this.getMemoryNodesForCores(uniqueCores)).join(',')
+      try {
+        await fs.writeFile(memsPath, mems)
+        this.debug.log(`Set cpuset.mems=${mems} for ${scopePath}`)
+      } catch (error) {
+        throw new Error(`Failed to set cpuset.mems=${mems} (required with cpuset.cpus): ${error instanceof Error ? error.message : String(error)}`)
+      }
+    } else {
+      this.debug.log('info', 'cpuset.mems not present in this cgroup; skipping')
     }
   }
 

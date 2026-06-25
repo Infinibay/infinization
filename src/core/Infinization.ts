@@ -194,6 +194,20 @@ export class Infinization {
       await this.nftables.initialize()
       this.debug.log('Nftables infrastructure initialized')
 
+      // Reconcile VMs stuck in transient states (starting/rebuilding/powering_off)
+      // BEFORE the health monitor begins scanning. Otherwise the very first orphan
+      // scan sees a still-booting VM's live QEMU as an orphan and reaps it. The
+      // reconcile pass takes ownership of those rows (promote to running / reset to
+      // off) so the scanner skips them. Enforced here in code, not by a doc contract.
+      try {
+        const reconcile = await this.healthMonitor.reconcileTransientStates()
+        if (reconcile.totalChecked > 0) {
+          this.debug.log('info', `Startup reconcile: ${reconcile.promotedToRunning.length} promoted, ${reconcile.resetToOff.length} reset to off, ${reconcile.resetToError.length} to error`)
+        }
+      } catch (error) {
+        this.debug.log('error', `Startup reconcile failed (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+
       // Start health monitoring if enabled
       const autoStart = this.config.autoStartHealthMonitor ?? true
       if (autoStart) {

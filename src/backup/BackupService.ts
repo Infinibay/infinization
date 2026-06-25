@@ -13,13 +13,14 @@
  */
 
 import { EventEmitter } from 'events'
-import { mkdir, readFile, writeFile, rm, stat, readdir } from 'fs/promises'
+import { mkdir, readFile, writeFile, rm, stat, readdir, rename, unlink, copyFile } from 'fs/promises'
 import { randomUUID } from 'crypto'
 import { join, dirname } from 'path'
 
 import { QemuImgService } from '../storage/QemuImgService'
 import { SnapshotManager } from '../storage/SnapshotManager'
 import { CommandExecutor } from '../utils/commandExecutor'
+import { KeyedMutex } from '../utils/KeyedMutex'
 import { Debugger } from '../utils/debug'
 
 import {
@@ -37,7 +38,8 @@ import {
   BackupErrorCode,
   BACKUP_MANIFEST_FILENAME,
   DEFAULT_BACKUP_COMPRESSION,
-  DEFAULT_BACKUP_DIR
+  DEFAULT_BACKUP_DIR,
+  MAX_CONCURRENT_BACKUPS
 } from '../types/backup.types'
 
 // ---------------------------------------------------------------------------
@@ -74,6 +76,10 @@ export class BackupService extends EventEmitter {
   /** Tracks in-progress backups to enforce concurrency limits. */
   private readonly activeBackups: Map<string, BackupMetadata> = new Map()
 
+  /** Serializes operations that touch the same image path (canonical path key),
+   *  so a backup/restore/snapshot can never run concurrently against one image. */
+  private readonly imageLock = new KeyedMutex()
+
   constructor (options?: BackupServiceOptions) {
     super()
     this.qemuImg = new QemuImgService()
@@ -96,6 +102,17 @@ export class BackupService extends EventEmitter {
    */
   async createBackup (config: BackupConfig): Promise<BackupResult> {
     this.validateConfig(config)
+
+    // Enforce the concurrency limit (previously declared but never checked) so a
+    // burst of scheduled backups cannot saturate host IO / open the same images
+    // more times than intended.
+    if (this.activeBackups.size >= MAX_CONCURRENT_BACKUPS) {
+      throw new BackupError(
+        BackupErrorCode.OPERATION_FAILED,
+        `Too many concurrent backups (${this.activeBackups.size}/${MAX_CONCURRENT_BACKUPS}); try again later`,
+        { vmId: config.vmId }
+      )
+    }
 
     const backupId = randomUUID()
     const startTime = Date.now()
@@ -153,7 +170,10 @@ export class BackupService extends EventEmitter {
       this.activeBackups.delete(backupId)
     }
 
-    // Persist manifest
+    // Persist manifest. The failure path above may have removed destDir, so
+    // re-create it first — otherwise writeManifest would throw ENOENT and MASK
+    // the real backup error. A FAILED backup thus leaves a discoverable manifest.
+    await mkdir(destDir, { recursive: true })
     await this.writeManifest(destDir, metadata)
     this.emit('completed', metadata)
 
@@ -422,12 +442,16 @@ export class BackupService extends EventEmitter {
         compress: compression === BackupCompression.QCOW2
       })
 
-      // Apply gzip on top if requested
+      // Apply gzip on top if requested. gzip -f RENAMES the file to <path>.gz, so
+      // the effective backup file (and its size) must track that new path —
+      // otherwise the manifest points at a deleted file and the backup is
+      // unrestorable (it reported size 0 and restore had no gunzip).
+      let effectiveBackupPath = backupPath
       if (compression === BackupCompression.GZIP) {
-        await this.gzipFile(backupPath)
+        effectiveBackupPath = await this.gzipFile(backupPath)
       }
 
-      const diskInfo = await this.buildDiskInfo(sourcePath, backupPath, sourceInfo.actualSize, 'qcow2')
+      const diskInfo = await this.buildDiskInfo(sourcePath, effectiveBackupPath, sourceInfo.actualSize, 'qcow2')
       metadata.disks.push(diskInfo)
       metadata.totalSize += diskInfo.backupSize
       metadata.totalOriginalSize += diskInfo.originalSize
@@ -487,7 +511,7 @@ export class BackupService extends EventEmitter {
 
       // Create a qcow2 overlay with the parent backup as the backing file
       const args = ['create', '-f', 'qcow2', '-b', parentDiskBackupPath, '-F', 'qcow2', '--', backupPath]
-      await this.executor.execute('qemu-img', args)
+      await this.executor.execute('qemu-img', args, { timeoutMs: 0 })
 
       // Optionally apply compression to the overlay
       if (compression === BackupCompression.QCOW2) {
@@ -498,7 +522,7 @@ export class BackupService extends EventEmitter {
           compress: true
         })
         // Replace original with compressed version
-        await this.executor.execute('mv', [backupPath + '.tmp', backupPath])
+        await this.executor.execute('mv', [backupPath + '.tmp', backupPath], { timeoutMs: 0 })
       }
 
       const diskInfo = await this.buildDiskInfo(sourcePath, backupPath, sourceInfo.actualSize, 'qcow2')
@@ -619,21 +643,93 @@ export class BackupService extends EventEmitter {
     }
   }
 
-  /** Restores a single disk file by copying backup → target. */
+  /**
+   * Restores a single disk file backup → target ATOMICALLY.
+   *
+   * Converts into a temp file then renames over the target only on success, so a
+   * mid-convert failure (ENOSPC, crash, corrupt source) never truncates the
+   * existing target — which may be the only good copy. A gzip-compressed backup
+   * (.gz) is decompressed to a temp first. Serialized per target image.
+   */
   private async restoreDiskFile (sourceBackupPath: string, targetPath: string): Promise<void> {
-    // Use qemu-img convert to ensure a clean, standalone image
-    await this.qemuImg.convertImage({
-      sourcePath: sourceBackupPath,
-      destPath: targetPath,
-      destFormat: 'qcow2',
-      compress: false
+    await this.imageLock.runExclusive(targetPath, async () => {
+      const tmpPath = `${targetPath}.restore.tmp`
+      let gunzipTmp: string | null = null
+      try {
+        // If the backup is gzip-compressed, decompress to a temp file first.
+        let convertSource = sourceBackupPath
+        if (sourceBackupPath.endsWith('.gz')) {
+          gunzipTmp = `${targetPath}.gunzip.tmp`
+          // gunzip -c writes to stdout; redirect via our executor into the temp.
+          await this.gunzipTo(sourceBackupPath, gunzipTmp)
+          convertSource = gunzipTmp
+        }
+
+        await this.qemuImg.convertImage({
+          sourcePath: convertSource,
+          destPath: tmpPath,
+          destFormat: 'qcow2',
+          compress: false
+        })
+
+        // Atomic swap: only replace the target once the new image is fully written.
+        await rename(tmpPath, targetPath)
+      } catch (error) {
+        // Never leave a partial temp behind; the original target is untouched.
+        await this.safeUnlink(tmpPath)
+        const msg = error instanceof Error ? error.message : String(error)
+        if (/no space left on device|enospc/i.test(msg)) {
+          throw new BackupError(
+            BackupErrorCode.OPERATION_FAILED,
+            `Restore aborted: out of disk space writing ${targetPath} (original left intact)`,
+            { diskPath: targetPath }
+          )
+        }
+        throw error
+      } finally {
+        if (gunzipTmp) await this.safeUnlink(gunzipTmp)
+      }
     })
   }
 
-  /** Compresses a file with gzip via OS-level gzip command. */
-  private async gzipFile (filePath: string): Promise<void> {
-    await this.executor.execute('gzip', ['-f', filePath])
-    this.debug.log(`Gzipped: ${filePath}`)
+  /**
+   * Decompresses a .gz backup to destPath WITHOUT piping binary through stdout
+   * (the command executor buffers stdout as a UTF-8 string, which would corrupt a
+   * binary qcow2). Instead copy the .gz next to the destination and gunzip it in
+   * place: `gunzip -f <destPath>.gz` yields <destPath> and removes the .gz copy.
+   */
+  private async gunzipTo (gzPath: string, destPath: string): Promise<void> {
+    const tmpGz = `${destPath}.gz`
+    await copyFile(gzPath, tmpGz)
+    try {
+      // Disk-sized decompression — no timeout (would otherwise be killed on a
+      // multi-GB image, aborting the restore).
+      await this.executor.execute('gunzip', ['-f', tmpGz], { timeoutMs: 0 })
+    } catch (error) {
+      await this.safeUnlink(tmpGz)
+      throw error
+    }
+  }
+
+  /** Best-effort unlink that swallows ENOENT. */
+  private async safeUnlink (filePath: string): Promise<void> {
+    try {
+      await unlink(filePath)
+    } catch {
+      /* file may not exist — fine */
+    }
+  }
+
+  /**
+   * Compresses a file with gzip. `gzip -f` RENAMES the input to `<path>.gz` and
+   * removes the original, so we return the new path for the caller to record.
+   */
+  private async gzipFile (filePath: string): Promise<string> {
+    // Disk-sized compression — no timeout (a multi-GB image takes minutes).
+    await this.executor.execute('gzip', ['-f', filePath], { timeoutMs: 0 })
+    const gzPath = `${filePath}.gz`
+    this.debug.log(`Gzipped: ${filePath} -> ${gzPath}`)
+    return gzPath
   }
 
   /** Emits a progress event. */

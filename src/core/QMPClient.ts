@@ -70,6 +70,10 @@ export class QMPClient extends EventEmitter {
   private buffer: string = ''
   private greeting: QMPGreeting | null = null
   private reconnectAttempts: number = 0
+  /** Pending reconnect timer so disconnect()/cleanup() can cancel an in-flight retry. */
+  private reconnectTimer: NodeJS.Timeout | null = null
+  /** Set by disconnect(): suppresses any further (re)connect attempts. */
+  private intentionallyClosed: boolean = false
 
   /**
    * Creates a new QMPClient instance
@@ -93,11 +97,34 @@ export class QMPClient extends EventEmitter {
       this.debug.log('Already connected')
       return
     }
+    if (this.intentionallyClosed) {
+      // A disconnect() was requested; never resurrect the client behind its back.
+      throw new Error('QMP client has been disconnected')
+    }
 
     this.debug.log(`Connecting to ${this.socketPath}`)
 
     return new Promise((resolve, reject) => {
+      // Named greeting handler so it can be removed on EVERY exit path (it is a
+      // once-listener, but a failed connect/reconnect that never fires the
+      // greeting would otherwise leak the handler + its captured closure on the
+      // long-lived client, eventually tripping MaxListenersExceededWarning).
+      const onGreeting = async (): Promise<void> => {
+        clearTimeout(timeout)
+        try {
+          await this.performHandshake()
+          this.connected = true
+          this.reconnectAttempts = 0
+          this.debug.log('Connected and ready')
+          resolve()
+        } catch (err) {
+          this.cleanup()
+          reject(err)
+        }
+      }
+
       const timeout = setTimeout(() => {
+        this.off('_greeting', onGreeting)
         this.cleanup()
         reject(new Error(`Connection timeout after ${this.options.connectTimeout}ms`))
       }, this.options.connectTimeout)
@@ -106,6 +133,7 @@ export class QMPClient extends EventEmitter {
 
       this.socket.once('error', (err: NodeJS.ErrnoException) => {
         clearTimeout(timeout)
+        this.off('_greeting', onGreeting)
         this.cleanup()
         const message = this.getErrorMessage(err)
         this.debug.log('error', message)
@@ -127,19 +155,7 @@ export class QMPClient extends EventEmitter {
       })
 
       // Wait for greeting and perform handshake
-      this.once('_greeting', async () => {
-        clearTimeout(timeout)
-        try {
-          await this.performHandshake()
-          this.connected = true
-          this.reconnectAttempts = 0
-          this.debug.log('Connected and ready')
-          resolve()
-        } catch (err) {
-          this.cleanup()
-          reject(err)
-        }
-      })
+      this.once('_greeting', onGreeting)
     })
   }
 
@@ -147,6 +163,14 @@ export class QMPClient extends EventEmitter {
    * Disconnects from the QMP socket gracefully
    */
   public async disconnect (): Promise<void> {
+    // Mark closed FIRST and cancel any in-flight reconnect so a pending retry
+    // cannot resurrect a live socket/listeners after teardown.
+    this.intentionallyClosed = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
     if (!this.socket) {
       return
     }
@@ -689,14 +713,18 @@ export class QMPClient extends EventEmitter {
    * Attempts to reconnect to the QMP socket
    */
   private attemptReconnect (): void {
+    if (this.intentionallyClosed) return
     this.reconnectAttempts++
     this.debug.log(`Reconnection attempt ${this.reconnectAttempts}/${this.options.maxReconnectAttempts}`)
 
-    setTimeout(async () => {
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null
+      if (this.intentionallyClosed) return
       try {
         await this.connect()
         this.emit('reconnect')
       } catch (err) {
+        if (this.intentionallyClosed) return
         if (this.reconnectAttempts < this.options.maxReconnectAttempts) {
           this.attemptReconnect()
         } else {
@@ -705,6 +733,8 @@ export class QMPClient extends EventEmitter {
         }
       }
     }, this.options.reconnectDelay)
+    // Don't let a pending reconnect keep the process alive on its own.
+    this.reconnectTimer.unref?.()
   }
 
   /**
@@ -714,6 +744,11 @@ export class QMPClient extends EventEmitter {
     this.connected = false
     this.buffer = ''
     this.greeting = null
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
 
     if (this.socket) {
       this.socket.removeAllListeners()

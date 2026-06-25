@@ -210,6 +210,7 @@ export class UnattendedInstaller {
       this.debug.log(`Installation progress: ${progress.phase} - ${progress.message}`)
     })
 
+    let cleanedUp = false
     try {
       // Start monitoring
       const result = await monitor.start()
@@ -217,10 +218,10 @@ export class UnattendedInstaller {
       // Update the ISO path in the result
       result.isoPath = isoPath
 
-      // If successful, perform cleanup
-      if (result.success) {
-        await this.cleanupInstallationMedia(qmpClient, isoPath)
-      }
+      // Clean up installation media on completion (eject is best-effort;
+      // the temp ISO is always unlinked — see cleanupInstallationMedia).
+      await this.cleanupInstallationMedia(qmpClient, isoPath)
+      cleanedUp = true
 
       return result
     } catch (error) {
@@ -240,6 +241,16 @@ export class UnattendedInstaller {
         error instanceof Error ? error : undefined,
         this.config.vmId
       )
+    } finally {
+      // ALWAYS reclaim the temp ISO (hundreds of MB), even on timeout / reset-
+      // limit / monitoring error — previously it leaked on every non-success path.
+      if (!cleanedUp) {
+        try {
+          await this.cleanupInstallationMedia(qmpClient, isoPath)
+        } catch (cleanupError) {
+          this.debug.log('warn', `Failed to clean up installation media on failure path: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`)
+        }
+      }
     }
   }
 
@@ -305,10 +316,23 @@ export class UnattendedInstaller {
 
     if (!this.config.username || this.config.username.trim().length === 0) {
       errors.push('Username is required')
+    } else if (!/^[A-Za-z0-9._-]{1,64}$/.test(this.config.username)) {
+      // The username is written verbatim into an autounattend.xml / preseed file;
+      // restrict it to a safe charset so it cannot inject XML/preseed control
+      // characters or markup into the generated answer file.
+      errors.push('Username contains invalid characters (allowed: letters, digits, . _ -)')
     }
 
     if (!this.config.password || this.config.password.length === 0) {
       errors.push('Password is required')
+    } else if (/[<>&"\r\n\x00]/.test(this.config.password)) {
+      // Reject XML-significant / control characters that could break out of the
+      // answer-file field (the manager does not escape them).
+      errors.push('Password contains characters that are unsafe for the answer file (<, >, &, ", newlines)')
+    }
+
+    if (this.config.hostname && !/^[A-Za-z0-9-]{1,63}$/.test(this.config.hostname)) {
+      errors.push('Hostname contains invalid characters (allowed: letters, digits, -)')
     }
 
     // OS-specific validation

@@ -1,6 +1,7 @@
 import { ChildProcess, spawn } from 'child_process'
 import { promises as fsPromises } from 'fs'
 import { Debugger } from '../utils/debug'
+import { isProcessAlive as sharedIsProcessAlive, waitForProcessExit as sharedWaitForProcessExit } from '../utils/processIdentity'
 import { QemuCommandBuilder, QemuCommandWithPinning } from './QemuCommandBuilder'
 
 /**
@@ -200,23 +201,45 @@ export class QemuProcess {
 
       const completeStart = async () => {
         if (startCompleted) return
-        startCompleted = true
 
-        // For daemonized processes with pidfile, read the actual daemon PID
+        // For daemonized processes the fork-parent (this.process) has already
+        // exited; we must adopt the REAL daemon PID from the pidfile. If we cannot,
+        // FAIL the start rather than resolving with a stale/recyclable fork PID —
+        // otherwise stop()/forceKill()/isAlive() would later target the wrong PID.
         if (isDaemonized && pidfilePath) {
+          let daemonPid = NaN
           try {
             await this.waitForPidFile(pidfilePath)
             const pidContent = await fsPromises.readFile(pidfilePath, 'utf-8')
-            const daemonPid = parseInt(pidContent.trim(), 10)
-            if (!isNaN(daemonPid)) {
-              this.pid = daemonPid
-              this.debug.log(`VM ${this.vmId} daemonized with PID ${this.pid}`)
-            }
+            daemonPid = parseInt(pidContent.trim(), 10)
           } catch (error) {
-            this.debug.log('warn', `Failed to read daemon PID from ${pidfilePath}: ${(error as Error).message}`)
+            if (startCompleted) return
+            startCompleted = true
+            this.killSpawnedChild()
+            reject(new Error(`Failed to read daemon PID for VM ${this.vmId} from ${pidfilePath}: ${(error as Error).message}`))
+            return
           }
+          if (isNaN(daemonPid) || daemonPid <= 0) {
+            if (startCompleted) return
+            startCompleted = true
+            this.killSpawnedChild()
+            reject(new Error(`Daemon pidfile for VM ${this.vmId} did not contain a valid PID`))
+            return
+          }
+          this.pid = daemonPid
+          // Drop the dead fork-parent handle so stop() signals the daemon PID
+          // (process.kill branch) instead of the exited parent, and release its
+          // listeners + unref it so it cannot pin the event loop or leak.
+          if (this.process) {
+            this.process.removeAllListeners()
+            this.process.unref()
+            this.process = null
+          }
+          this.debug.log(`VM ${this.vmId} daemonized with PID ${this.pid}`)
         }
 
+        if (startCompleted) return
+        startCompleted = true
         this.debug.log(`VM ${this.vmId} ready`)
         resolve()
       }
@@ -224,6 +247,8 @@ export class QemuProcess {
       const handleStartupError = (error: Error) => {
         if (startCompleted) return
         startCompleted = true
+        // Never leak the child we spawned if startup failed.
+        this.killSpawnedChild()
         reject(error)
       }
 
@@ -304,9 +329,11 @@ export class QemuProcess {
             this.debug.log('warn', `Failed to send SIGTERM: ${(error as Error).message}`)
           }
 
-          // Poll for process exit
+          // Poll for process exit. Only resolve if it actually exited; otherwise
+          // do nothing and let the outer timeout escalate to forceKill().
           this.waitForProcessExit(timeoutMs)
-            .then(async () => {
+            .then(async (exited) => {
+              if (!exited) return // outer setTimeout will force kill
               clearTimeout(timeout)
               await this.cleanupPidFile()
               this.debug.log(`VM ${this.vmId} stopped`)
@@ -323,7 +350,29 @@ export class QemuProcess {
   }
 
   /**
-   * Force kill the QEMU process
+   * Kill and release the child we spawned (the fork-parent for daemonized mode,
+   * or the QEMU process for non-daemonized mode). Best-effort; used on startup
+   * failure so a failed start() never leaks the spawned process or its listeners.
+   */
+  private killSpawnedChild (): void {
+    if (this.process) {
+      try {
+        this.process.removeAllListeners()
+        if (this.process.pid && !this.process.killed) {
+          this.process.kill('SIGKILL')
+        }
+        this.process.unref()
+      } catch {
+        /* best effort */
+      }
+      this.process = null
+    }
+  }
+
+  /**
+   * Force kill the QEMU process. Throws if the process is still alive after
+   * SIGKILL + timeout, so the caller can alarm/retry instead of treating a live
+   * process (still holding TAP/disk/display) as stopped.
    */
   async forceKill (): Promise<void> {
     if (!this.pid) {
@@ -335,33 +384,34 @@ export class QemuProcess {
     try {
       process.kill(this.pid, 'SIGKILL')
     } catch (error) {
-      // Process might already be dead
-      this.debug.log('warn', `Failed to kill process: ${(error as Error).message}`)
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'ESRCH') {
+        // ESRCH = already gone (fine). Anything else is a real failure.
+        this.debug.log('warn', `Failed to kill process ${this.pid}: ${(error as Error).message}`)
+      }
     }
 
-    // Wait for process to actually exit
-    await this.waitForProcessExit(5000)
+    const gone = await sharedWaitForProcessExit(this.pid, 5000)
     await this.cleanupPidFile()
+
+    if (!gone) {
+      // Do NOT clear pid/process: the process is still alive and the caller must
+      // know it was not reaped (it still holds the TAP/disk/display).
+      throw new Error(`VM ${this.vmId} process ${this.pid} is still alive after SIGKILL`)
+    }
 
     this.process = null
     this.pid = null
   }
 
   /**
-   * Check if the process is alive
+   * Check if the process is alive (delegates to the shared zombie-aware check).
    */
   isAlive (): boolean {
     if (!this.pid) {
       return false
     }
-
-    try {
-      // Signal 0 doesn't kill, just checks if process exists
-      process.kill(this.pid, 0)
-      return true
-    } catch {
-      return false
-    }
+    return sharedIsProcessAlive(this.pid)
   }
 
   /**
@@ -452,18 +502,12 @@ export class QemuProcess {
   }
 
   /**
-   * Wait for process to exit
+   * Wait for the process to exit. Resolves true if it exited within the timeout,
+   * false otherwise (delegates to the shared zombie-aware liveness check).
    */
-  private async waitForProcessExit (timeoutMs: number): Promise<void> {
-    const startTime = Date.now()
-    const pollInterval = 100
-
-    while (Date.now() - startTime < timeoutMs) {
-      if (!this.isAlive()) {
-        return
-      }
-      await this.sleep(pollInterval)
-    }
+  private async waitForProcessExit (timeoutMs: number): Promise<boolean> {
+    if (!this.pid) return true
+    return sharedWaitForProcessExit(this.pid, timeoutMs)
   }
 
   /**

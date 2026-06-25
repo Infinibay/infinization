@@ -87,11 +87,22 @@ export interface BackupSchedulerEvents {
 // BackupScheduler
 // ---------------------------------------------------------------------------
 
+/** Resolves the disk image paths for a VM at backup time (vmId -> paths). */
+export type DiskPathResolver = (vmId: string) => Promise<string[]> | string[]
+
+/** Options for the BackupScheduler. */
+export interface BackupSchedulerOptions {
+  backupRootDir?: string
+  /** Resolves disk paths for a schedule that does not carry its own. */
+  diskPathResolver?: DiskPathResolver
+}
+
 export class BackupScheduler extends EventEmitter {
   private readonly backupService: BackupService
   private readonly debug: Debugger
   private readonly backupRootDir: string
   private readonly adapter: ScheduleAdapter
+  private readonly diskPathResolver?: DiskPathResolver
 
   /** Active scheduled jobs keyed by schedule ID. */
   private readonly jobs: Map<string, ScheduledJob> = new Map()
@@ -102,14 +113,21 @@ export class BackupScheduler extends EventEmitter {
   /**
    * @param backupService - The BackupService instance to trigger backups on.
    * @param adapter - The ScheduleAdapter that provides actual cron scheduling.
-   * @param backupRootDir - Root directory for backups (default: DEFAULT_BACKUP_DIR).
+   * @param options - Root dir + an optional disk-path resolver. (A bare string is
+   *   accepted for backwards compatibility and treated as backupRootDir.)
    */
-  constructor (backupService: BackupService, adapter: ScheduleAdapter, backupRootDir?: string) {
+  constructor (
+    backupService: BackupService,
+    adapter: ScheduleAdapter,
+    options?: string | BackupSchedulerOptions
+  ) {
     super()
     this.backupService = backupService
     this.adapter = adapter
     this.debug = new Debugger('backup-scheduler')
-    this.backupRootDir = backupRootDir ?? DEFAULT_BACKUP_DIR
+    const opts: BackupSchedulerOptions = typeof options === 'string' ? { backupRootDir: options } : (options ?? {})
+    this.backupRootDir = opts.backupRootDir ?? DEFAULT_BACKUP_DIR
+    this.diskPathResolver = opts.diskPathResolver
   }
 
   // =========================================================================
@@ -263,9 +281,24 @@ export class BackupScheduler extends EventEmitter {
     try {
       const destDir = join(schedule.destinationDir ?? this.backupRootDir, schedule.vmId)
 
+      // Resolve the real disk paths. Previously hardcoded to [], which made every
+      // scheduled run fail validateConfig BEFORE any qemu-img ran — silent total
+      // backup loss. Now: use the schedule's own paths, else the injected
+      // resolver, and fail LOUDLY (not into a debug log) if none are available.
+      const diskPaths = schedule.diskPaths?.length
+        ? schedule.diskPaths
+        : (this.diskPathResolver ? await this.diskPathResolver(schedule.vmId) : [])
+      if (!diskPaths.length) {
+        throw new BackupError(
+          BackupErrorCode.INVALID_CONFIG,
+          `No disk paths for scheduled backup of VM ${schedule.vmId} (schedule ${schedule.id}); set schedule.diskPaths or provide a diskPathResolver`,
+          { vmId: schedule.vmId }
+        )
+      }
+
       const result = await this.backupService.createBackup({
         vmId: schedule.vmId,
-        diskPaths: [], // Disk paths resolved by the caller/service layer
+        diskPaths,
         destinationDir: destDir,
         type: schedule.type,
         compression: schedule.compression ?? DEFAULT_BACKUP_COMPRESSION,

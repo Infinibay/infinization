@@ -23,11 +23,28 @@ export const SPICE_MIN_PORT = 5900
 /** Maximum valid SPICE port */
 export const SPICE_MAX_PORT = 65535
 
-/** Default listen address for SPICE */
-export const DEFAULT_SPICE_ADDR = '0.0.0.0'
+/**
+ * Default listen address for SPICE — LOOPBACK, not 0.0.0.0.
+ *
+ * A display server bound to 0.0.0.0 is reachable from any host that can route to
+ * the hypervisor; combined with passwordless auto-`disable-ticketing` that was an
+ * unauthenticated remote framebuffer/keyboard/clipboard for every VM. We default
+ * to loopback so the backend must opt in (and authenticate) to expose a console
+ * off-host. Callers that need remote access should bind a management interface and
+ * set a per-VM password (delivered over QMP, not the cmdline).
+ */
+export const DEFAULT_SPICE_ADDR = '127.0.0.1'
 
-/** Default listen address for VNC */
-export const DEFAULT_VNC_ADDR = '0.0.0.0'
+/** Default listen address for VNC — loopback (see DEFAULT_SPICE_ADDR). */
+export const DEFAULT_VNC_ADDR = '127.0.0.1'
+
+/** Loopback addresses considered "not reachable off-host" for fail-closed checks. */
+export const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', 'localhost'])
+
+/** True if `addr` is a loopback bind (safe to run unauthenticated). */
+export function isLoopbackAddr (addr: string): boolean {
+  return LOOPBACK_ADDRS.has(addr.trim().toLowerCase())
+}
 
 // ============================================================================
 // Enums

@@ -5,80 +5,83 @@
  * Unix socket connections during testing.
  */
 
-import { EventEmitter } from 'events'
 import { QMPClient } from '../src/core/QMPClient'
+import * as net from 'net'
 
-// Mock net.Socket
-class MockSocket extends EventEmitter {
-  private connected: boolean = false
-  private destroyed: boolean = false
-  private buffer: Buffer = Buffer.alloc(0)
+// Mock the net module. The MockSocket class is defined INSIDE the factory because
+// jest.mock() is hoisted above all module-level declarations — referencing an
+// outer class here would hit its temporal dead zone (ReferenceError).
+jest.mock('net', () => {
+  const { EventEmitter } = require('events')
+  class MockSocket extends EventEmitter {
+    private connected = false
+    private destroyed = false
 
-  connect (path: string): void {
-    this.connected = true
-    setImmediate(() => {
-      this.emit('connect')
-      // Send QMP greeting after connection
-      this.emit('data', Buffer.from('{"QMP": {"version": {"qemu": {"micro": 0, "minor": 0, "major": 4}, "package": ""}, "capabilities": []}}\r\n'))
-    })
-  }
-
-  write (data: string | Buffer, callback?: (err?: Error) => void): boolean {
-    if (this.destroyed) {
-      if (callback) callback(new Error('Socket destroyed'))
-      return false
-    }
-    // Simulate command response
-    const cmd = JSON.parse(data.toString())
-    if (cmd.execute === 'query-status') {
+    connect (path: string): void {
+      this.connected = true
       setImmediate(() => {
-        this.emit('data', Buffer.from(`{"return": {"status": "running", "singlestep": false, "running": true}, "id": "${cmd.id}"}\r\n`))
-      })
-    } else if (cmd.execute === 'system_powerdown') {
-      setImmediate(() => {
-        this.emit('data', Buffer.from(`{"return": {}, "id": "${cmd.id}"}\r\n`))
-      })
-    } else if (cmd.execute === 'quit') {
-      setImmediate(() => {
-        this.emit('data', Buffer.from(`{"return": {}, "id": "${cmd.id}"}\r\n`))
-        this.destroy()
-      })
-    } else {
-      setImmediate(() => {
-        this.emit('data', Buffer.from(`{"return": {}, "id": "${cmd.id}"}\r\n`))
+        this.emit('connect')
+        this.emit('data', Buffer.from('{"QMP": {"version": {"qemu": {"micro": 0, "minor": 0, "major": 4}, "package": ""}, "capabilities": []}}\r\n'))
       })
     }
-    if (callback) callback()
-    return true
+
+    write (data: string | Buffer, callback?: (err?: Error) => void): boolean {
+      if (this.destroyed) {
+        if (callback) callback(new Error('Socket destroyed'))
+        return false
+      }
+      const cmd = JSON.parse(data.toString())
+      const reply = (ret: string): void => {
+        setImmediate(() => this.emit('data', Buffer.from(`{"return": ${ret}, "id": "${cmd.id}"}\r\n`)))
+      }
+      if (cmd.execute === 'query-status') {
+        reply('{"status": "running", "singlestep": false, "running": true}')
+      } else if (cmd.execute === 'query-cpus' || cmd.execute === 'query-cpus-fast') {
+        reply('[]')
+      } else if (cmd.execute === 'query-block') {
+        reply('[]')
+      } else if (cmd.execute === 'quit') {
+        setImmediate(() => {
+          this.emit('data', Buffer.from(`{"return": {}, "id": "${cmd.id}"}\r\n`))
+          // Close synchronously after the reply so isConnected() is false as soon
+          // as quit() resolves (QEMU drops the socket on quit).
+          this.destroyed = true
+          this.connected = false
+          this.emit('close')
+        })
+      } else {
+        reply('{}')
+      }
+      if (callback) callback()
+      return true
+    }
+
+    end (): void {
+      this.connected = false
+      setImmediate(() => this.emit('close'))
+    }
+
+    destroy (): void {
+      this.destroyed = true
+      this.connected = false
+      setImmediate(() => this.emit('close'))
+    }
+
+    setNoDelay (): void {}
   }
 
-  end (): void {
-    this.connected = false
-    setImmediate(() => {
-      this.emit('close')
-    })
+  return {
+    Socket: MockSocket,
+    createConnection: (path: string) => {
+      const socket = new MockSocket()
+      socket.connect(path)
+      return socket
+    }
   }
+})
 
-  destroy (): void {
-    this.destroyed = true
-    this.connected = false
-    setImmediate(() => {
-      this.emit('close')
-    })
-  }
-
-  setNoDelay (): void {}
-}
-
-// Mock the net module
-jest.mock('net', () => ({
-  Socket: MockSocket,
-  createConnection: (path: string) => {
-    const socket = new MockSocket()
-    socket.connect(path)
-    return socket
-  }
-}))
+// Obtain the mocked Socket class for tests that construct one directly.
+const MockSocket = (net as unknown as { Socket: new () => any }).Socket
 
 describe('QMPClient', () => {
   let qmpClient: QMPClient

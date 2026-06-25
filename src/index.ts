@@ -443,8 +443,8 @@ export {
   isBackupError
 } from './types/backup.types'
 // Backup classes
-export { BackupScheduler, ScheduledJob, ScheduleAdapter } from './backup/BackupScheduler'
-export { BackupScheduleService, CreateScheduleInput, UpdateScheduleInput } from './backup/BackupScheduleService'
+export { BackupScheduler, ScheduledJob, ScheduleAdapter, DiskPathResolver, BackupSchedulerOptions } from './backup/BackupScheduler'
+export { BackupScheduleService, CreateScheduleInput, UpdateScheduleInput, BackupScheduleServiceOptions } from './backup/BackupScheduleService'
 export { BackupService, BackupServiceOptions, BackupServiceEvents } from './backup/BackupService'
 
 // System classes

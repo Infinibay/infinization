@@ -146,6 +146,11 @@ export class EventHandler extends EventEmitter {
     this.tapManager = new TapDeviceManager()
     this.nftables = new NftablesService()
     this.cgroupsManager = new CgroupsManager()
+
+    // Default 'error' listener so a consumer that forgets to subscribe cannot
+    // crash the whole (privileged) backend on the first transient emit. A real
+    // consumer listener still fires alongside this one.
+    this.on('error', (err) => this.debug.log('error', `EventHandler error event: ${err instanceof Error ? err.message : String(err)}`))
   }
 
   /**
@@ -181,6 +186,18 @@ export class EventHandler extends EventEmitter {
     listeners.set('disconnect', disconnectListener)
     qmpClient.on('disconnect', disconnectListener)
 
+    // Track reconnect_failed: when the QMP client exhausts its reconnect attempts
+    // it goes permanently dead and stops syncing VM state. Previously NOTHING
+    // subscribed, so the VM silently drifted (DB 'running' forever after QEMU
+    // died, or vice-versa). Surface it as an actionable event the backend can
+    // alarm on, and mark the VM as needing reconciliation.
+    const reconnectFailedListener = () => {
+      this.debug.log('error', `QMP reconnect failed for VM ${vmId}; client is dead, state sync stopped — needs re-attach/reconcile`)
+      this.emit('vm:stale', { vmId, reason: 'qmp_reconnect_failed' })
+    }
+    listeners.set('reconnect_failed', reconnectFailedListener)
+    qmpClient.on('reconnect_failed', reconnectFailedListener)
+
     this.attachedVMs.set(vmId, { qmpClient, listeners })
 
     this.debug.log(`Attached to VM ${vmId}, listening for ${STATE_CHANGE_EVENTS.length} events`)
@@ -191,7 +208,7 @@ export class EventHandler extends EventEmitter {
    *
    * @param vmId The VM identifier to detach
    */
-  public async detachFromVM (vmId: string): Promise<void> {
+  public async detachFromVM (vmId: string, disconnectClient = false): Promise<void> {
     const attached = this.attachedVMs.get(vmId)
     if (!attached) {
       this.debug.log(`VM ${vmId} not attached, skipping detach`)
@@ -202,6 +219,16 @@ export class EventHandler extends EventEmitter {
 
     this.removeListeners(attached)
     this.attachedVMs.delete(vmId)
+
+    // On teardown, also disconnect the QMP client so its unix socket + reconnect
+    // timer don't leak (used by shutdown()/detachAll).
+    if (disconnectClient) {
+      try {
+        await attached.qmpClient.disconnect()
+      } catch (error) {
+        this.debug.log('warn', `Failed to disconnect QMP client for VM ${vmId}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
 
     this.debug.log(`Detached from VM ${vmId}`)
   }
@@ -223,7 +250,8 @@ export class EventHandler extends EventEmitter {
 
     const vmIds = Array.from(this.attachedVMs.keys())
     for (const vmId of vmIds) {
-      await this.detachFromVM(vmId)
+      // Disconnect each QMP client on full teardown so sockets/timers don't leak.
+      await this.detachFromVM(vmId, true)
     }
   }
 
@@ -289,9 +317,18 @@ export class EventHandler extends EventEmitter {
         // status first, we won't be able to retrieve the PID for process monitoring.
         // This ensures we can track QEMU termination even after DB status changes.
         let qemuPid: number | null = null
+        let tapDeviceName: string | null = null
         if (newStatus === 'off' && (event === 'SHUTDOWN' || event === 'POWERDOWN')) {
           qemuPid = await this.stateSync.getVMPid(vmId)
-          this.debug.log('debug', `Retrieved PID ${qemuPid} for VM ${vmId} before status update`)
+          // Capture the TAP name NOW too: getVMInfo()/findRunningVMs filter by
+          // status='running', so once we flip to 'off' below it becomes
+          // unrecoverable and the TAP would never be detached from the bridge
+          // (a leak on every ACPI shutdown).
+          try {
+            const info = await this.stateSync.getVMInfo(vmId)
+            tapDeviceName = info?.tapDeviceName ?? null
+          } catch { /* best-effort capture */ }
+          this.debug.log('debug', `Retrieved PID ${qemuPid}, TAP ${tapDeviceName ?? 'none'} for VM ${vmId} before status update`)
         }
 
         // Update database
@@ -318,7 +355,7 @@ export class EventHandler extends EventEmitter {
           const isHostQmpQuit = shutdownData?.reason === 'host-qmp-quit'
 
           this.debug.log('info', `Shutdown event - isHostQmpQuit: ${isHostQmpQuit}, reason: ${shutdownData?.reason ?? 'unknown'}`)
-          await this.terminateQEMUProcess(vmId, isHostQmpQuit, qemuPid)
+          await this.terminateQEMUProcess(vmId, isHostQmpQuit, qemuPid, tapDeviceName)
         }
       } else if (event === 'RESET') {
         // RESET doesn't change status, just log it
@@ -426,7 +463,7 @@ export class EventHandler extends EventEmitter {
    * @see VMLifecycle.stop() for host-initiated shutdown flow
    * @see QMPClient.powerdown() for ACPI shutdown command
    */
-  private async terminateQEMUProcess (vmId: string, isHostQmpQuit: boolean, pid: number | null): Promise<void> {
+  private async terminateQEMUProcess (vmId: string, isHostQmpQuit: boolean, pid: number | null, tapDeviceName: string | null = null): Promise<void> {
     const attached = this.attachedVMs.get(vmId)
     if (!attached) {
       this.debug.log(`Cannot terminate QEMU for VM ${vmId}: not attached`)
@@ -467,7 +504,7 @@ export class EventHandler extends EventEmitter {
     // Perform resource cleanup for guest-initiated shutdowns
     // This mirrors the cleanup logic in VMLifecycle.stop() to ensure
     // consistent state regardless of shutdown source (host vs guest)
-    await this.cleanupVMResources(vmId)
+    await this.cleanupVMResources(vmId, tapDeviceName)
   }
 
   /**
@@ -488,18 +525,20 @@ export class EventHandler extends EventEmitter {
    *
    * @param vmId The VM identifier
    */
-  private async cleanupVMResources (vmId: string): Promise<void> {
+  private async cleanupVMResources (vmId: string, preCapturedTapName: string | null = null): Promise<void> {
     this.debug.log('info', `Cleaning up resources for VM ${vmId} after guest-initiated shutdown`)
 
-    // 1. Get TAP device name before clearing volatile config
-    let tapDeviceName: string | null = null
-    let hasCpuPinning = false
-    try {
-      const vmInfo = await this.stateSync.getVMInfo(vmId)
-      tapDeviceName = vmInfo?.tapDeviceName ?? null
-      hasCpuPinning = vmInfo?.hasCpuPinning ?? false
-    } catch (error) {
-      this.debug.log('warn', `Failed to retrieve VM info for cleanup: ${error instanceof Error ? error.message : String(error)}`)
+    // 1. Prefer the TAP name captured BEFORE the status flip (the caller passes it
+    // in). Only fall back to getVMInfo() — which filters by status='running' and
+    // would now return null — when no pre-captured value is available.
+    let tapDeviceName: string | null = preCapturedTapName
+    if (!tapDeviceName) {
+      try {
+        const vmInfo = await this.stateSync.getVMInfo(vmId)
+        tapDeviceName = vmInfo?.tapDeviceName ?? null
+      } catch (error) {
+        this.debug.log('warn', `Failed to retrieve VM info for cleanup: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
 
     // 2. Clear volatile configuration (qmpSocketPath, qemuPid)
@@ -531,17 +570,18 @@ export class EventHandler extends EventEmitter {
       this.debug.log('warn', `Failed to detach firewall jump rules: ${error instanceof Error ? error.message : String(error)}`)
     }
 
-    // 5. Cleanup empty cgroup scopes if CPU pinning was used (best-effort)
-    // Since scopes are named by PID, we do opportunistic cleanup of any empty scopes
-    if (hasCpuPinning) {
-      try {
-        const cleanedCount = await this.cgroupsManager.cleanupEmptyScopes()
-        if (cleanedCount > 0) {
-          this.debug.log('info', `Cleaned up ${cleanedCount} empty cgroup scope(s)`)
-        }
-      } catch (error) {
-        this.debug.log('warn', `Failed to cleanup cgroup scopes: ${error instanceof Error ? error.message : String(error)}`)
+    // 5. Cleanup empty cgroup scopes (best-effort). ALWAYS run this scan: it only
+    // removes scopes that are already empty, and the previous `hasCpuPinning` gate
+    // was hardcoded false at the source (getVMInfo), so a pinned VM's scope leaked
+    // on every guest shutdown. cleanupEmptyScopes() is cheap and safe to run
+    // unconditionally.
+    try {
+      const cleanedCount = await this.cgroupsManager.cleanupEmptyScopes()
+      if (cleanedCount > 0) {
+        this.debug.log('info', `Cleaned up ${cleanedCount} empty cgroup scope(s)`)
       }
+    } catch (error) {
+      this.debug.log('warn', `Failed to cleanup cgroup scopes: ${error instanceof Error ? error.message : String(error)}`)
     }
 
     this.debug.log('info', `Completed resource cleanup for VM ${vmId} after guest-initiated shutdown`)
