@@ -24,6 +24,14 @@ export interface CommandOptions {
   maxBuffer?: number
   /** Grace period between SIGTERM and SIGKILL on timeout/overflow. */
   killGraceMs?: number
+  /**
+   * Caller EXPECTS a non-zero exit as a possible NORMAL outcome (e.g. an nft
+   * existence probe where "No such file or directory" just means the object is
+   * absent). When true, a non-zero exit is logged at DEBUG instead of ERROR; the
+   * structured CommandExecutionError is STILL thrown so the caller classifies and
+   * decides. Does NOT affect timeout/overflow handling (still WARN). Default false.
+   */
+  expectNonZeroExit?: boolean
 }
 
 /**
@@ -67,7 +75,8 @@ export class CommandExecutor {
       stdin,
       timeoutMs = DEFAULT_TIMEOUT_MS,
       maxBuffer = DEFAULT_MAX_BUFFER,
-      killGraceMs = DEFAULT_KILL_GRACE_MS
+      killGraceMs = DEFAULT_KILL_GRACE_MS,
+      expectNonZeroExit = false
     } = options
 
     return new Promise((resolve, reject) => {
@@ -161,7 +170,10 @@ export class CommandExecutor {
             resolve(stdout)
           } else {
             const errorMsg = `Command failed with exit code ${code}: ${fullCommand}\nstdout: ${tail(stdout)}\nstderr: ${tail(redactSecrets(stderr))}`
-            this.debug.log('error', errorMsg)
+            // A caller that expects a non-zero exit (existence probe) classifies the
+            // rejection itself; demote this line to debug so an EXPECTED absence is not
+            // boot-time ERROR noise. The structured error is still thrown either way.
+            this.debug.log(expectNonZeroExit ? 'debug' : 'error', errorMsg)
             reject(new CommandExecutionError(errorMsg, code, signal, stdout, stderr, false))
           }
         })

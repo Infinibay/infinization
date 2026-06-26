@@ -1,4 +1,5 @@
 import { CommandExecutor, CommandExecutionError } from '../src/utils/commandExecutor'
+import { setLogSink, LogEntry } from '../src/utils/debug'
 
 describe('CommandExecutor (hardened)', () => {
   const exec = new CommandExecutor()
@@ -45,5 +46,44 @@ describe('CommandExecutor (hardened)', () => {
     } catch (err) {
       expect(err).toBeInstanceOf(CommandExecutionError)
     }
+  })
+
+  // ===========================================================================
+  // expectNonZeroExit — a caller that EXPECTS a non-zero exit (e.g. an nft
+  // existence probe) can demote the executor's own "Command failed" log from
+  // ERROR to DEBUG while STILL receiving the thrown CommandExecutionError. This
+  // is the lever the NftablesService quiet-probe uses to keep cold-boot logs
+  // clean without hiding the failure. Proven here against a REAL spawn so the
+  // demotion is verified end-to-end (not just at the call site).
+  // ===========================================================================
+  describe('expectNonZeroExit log demotion', () => {
+    afterEach(() => setLogSink(null))
+
+    const failLines = (entries: LogEntry[]): LogEntry[] =>
+      entries.filter(e => /Command failed with exit code/.test(e.message))
+
+    it('demotes the non-zero-exit log to DEBUG yet STILL throws when set', async () => {
+      const entries: LogEntry[] = []
+      setLogSink(e => entries.push(e))
+      // `ls` of a missing path exits non-zero with "No such file or directory" (LC_ALL=C).
+      await expect(exec.execute('ls', ['/no/such/path/xyz'], { expectNonZeroExit: true }))
+        .rejects.toBeInstanceOf(CommandExecutionError)
+
+      const lines = failLines(entries)
+      expect(lines).toHaveLength(1)
+      expect(lines[0].level).toBe('debug')
+      expect(entries.some(e => e.level === 'error')).toBe(false)
+    })
+
+    it('logs the SAME failure at ERROR without the flag (control)', async () => {
+      const entries: LogEntry[] = []
+      setLogSink(e => entries.push(e))
+      await expect(exec.execute('ls', ['/no/such/path/xyz']))
+        .rejects.toBeInstanceOf(CommandExecutionError)
+
+      const lines = failLines(entries)
+      expect(lines).toHaveLength(1)
+      expect(lines[0].level).toBe('error')
+    })
   })
 })

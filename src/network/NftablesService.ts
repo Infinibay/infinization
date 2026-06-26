@@ -766,18 +766,17 @@ export class NftablesService {
   async chainExists (chainName: string): Promise<boolean> {
     this.debug.log(`Checking if chain exists: ${chainName}`)
 
-    try {
-      await this.exec([
-        'list', 'chain',
-        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
-        chainName
-      ])
-      this.debug.log(`Chain ${chainName} exists`)
-      return true
-    } catch {
-      this.debug.log(`Chain ${chainName} does not exist`)
-      return false
-    }
+    // Quiet probe: absence is EXPECTED (boot, and the VM-start path before the chain
+    // is created). execProbe never throws, so a real fault returns null here too —
+    // identical to the previous catch-returns-false behavior — but is logged at ERROR.
+    const output = await this.execProbe([
+      'list', 'chain',
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
+      chainName
+    ])
+    const exists = output !== null
+    this.debug.log(`Chain ${chainName} ${exists ? 'exists' : 'does not exist'}`)
+    return exists
   }
 
   // ============================================================================
@@ -1015,19 +1014,21 @@ export class NftablesService {
    * Creates the infinization table if it doesn't already exist.
    */
   private async createTableIfNotExists (): Promise<void> {
-    try {
-      // Try to list the table - if it exists, we're done
-      await this.exec(['list', 'table', INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME])
+    // Quiet probe: a missing table is EXPECTED on first boot and must not log at ERROR
+    // (the add below creates it). A real probe fault stays at ERROR inside execProbe.
+    const existing = await this.execProbe(['list', 'table', INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME])
+    if (existing !== null) {
       this.debug.log(`Table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} already exists`)
-    } catch {
-      // Table doesn't exist, create it
-      this.debug.log(`Creating table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
-      await this.exec([
-        'add', 'table',
-        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
-      ])
-      this.debug.log(`Table created: ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
+      return
     }
+    // Table doesn't exist, create it. The `add` still goes through exec() and fails
+    // loudly on a real error.
+    this.debug.log(`Creating table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
+    await this.exec([
+      'add', 'table',
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME
+    ])
+    this.debug.log(`Table created: ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`)
   }
 
   /**
@@ -1089,22 +1090,20 @@ export class NftablesService {
 
     // Check if DHCP rules already exist by listing the chain (idempotent — these are
     // inserted at base-chain creation AND re-asserted when the chain already exists).
-    try {
-      const chainOutput = await this.exec([
-        'list', 'chain',
-        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
-        BASE_FORWARD_CHAIN
-      ])
-
-      // Match on our scoped comment markers so a partial/legacy rule set is replaced
-      // rather than left in place.
-      if (chainOutput.includes('infinization-dhcp-client-to-server') &&
-          chainOutput.includes('infinization-dhcp-server-to-client')) {
-        this.debug.log('Scoped DHCP allow rules already exist, skipping')
-        return
-      }
-    } catch {
-      // Chain might not exist yet, continue with adding rules
+    // Quiet probe: on the cold-boot path the forward chain may not exist yet, which is
+    // EXPECTED and must not log at ERROR; null => fall through and (re)insert the rules.
+    const chainOutput = await this.execProbe([
+      'list', 'chain',
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
+      BASE_FORWARD_CHAIN
+    ])
+    // Match on our scoped comment markers so a partial/legacy rule set is replaced
+    // rather than left in place.
+    if (chainOutput !== null &&
+        chainOutput.includes('infinization-dhcp-client-to-server') &&
+        chainOutput.includes('infinization-dhcp-server-to-client')) {
+      this.debug.log('Scoped DHCP allow rules already exist, skipping')
+      return
     }
 
     try {
@@ -1191,15 +1190,13 @@ export class NftablesService {
    * cannot be listed (e.g. not yet created) so the caller proceeds to add rules.
    */
   private async listForwardChainText (): Promise<string> {
-    try {
-      return await this.exec([
-        'list', 'chain',
-        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
-        BASE_FORWARD_CHAIN
-      ])
-    } catch {
-      return ''
-    }
+    // Quiet probe: absence (chain not yet created) is EXPECTED and yields '' exactly as
+    // before; a real fault is logged at ERROR inside execProbe and still yields ''.
+    return (await this.execProbe([
+      'list', 'chain',
+      INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
+      BASE_FORWARD_CHAIN
+    ])) ?? ''
   }
 
   /**
@@ -1378,6 +1375,57 @@ export class NftablesService {
       const message = error instanceof Error ? error.message : String(error)
       this.debug.log('error', `nft command failed: ${message}`)
       throw error
+    }
+  }
+
+  /**
+   * True when an executor failure is the benign "table/chain does not exist yet"
+   * negative of an EXISTENCE probe: nft exits non-zero and writes "No such file or
+   * directory" to stderr. This is the ONLY nft failure treated as expected absence;
+   * permission denied, syntax errors, 'Device or resource busy' and timeouts are REAL
+   * faults that must stay at ERROR. Classifies on the structured stderr of
+   * CommandExecutionError, falling back to the message (covers non-CommandExecutionError
+   * throws and the bounded stderr tail the executor embeds in the message). English
+   * phrasing is guaranteed because CommandExecutor forces LC_ALL=C/LANG=C, and nft emits
+   * "No such file or directory" at the START of stderr (before the 8 KB message tail),
+   * so truncation cannot hide it. If a future nft reworded this, the phrase would simply
+   * not match and the fault would be reported at ERROR (fail-loud), never silenced.
+   */
+  private isMissingObjectError (error: unknown): boolean {
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === 'string'
+      ? (error as { stderr: string }).stderr
+      : ''
+    const message = error instanceof Error ? error.message : String(error)
+    return /No such file or directory/i.test(stderr) ||
+      /No such file or directory/i.test(message)
+  }
+
+  /**
+   * Runs an nft EXISTENCE probe (`list table` / `list chain`) WITHOUT the ERROR-level
+   * noise exec() emits on non-zero exit. A missing object is EXPECTED on boot (the
+   * table/chain is created lazily right after this probe), so it is logged at DEBUG and
+   * reported as absent (null). `expectNonZeroExit` also demotes the executor's own
+   * non-zero-exit log to debug, so an expected absence produces ZERO ERROR lines.
+   *
+   * A genuinely real failure (permission denied, syntax error, resource busy, timeout)
+   * is logged at ERROR — never hidden — and still reported as absent to preserve the
+   * existing best-effort control flow of the call sites (which already handle a missing
+   * object and fail loudly on the subsequent add/insert if the fault persists).
+   *
+   * @returns command stdout when the object exists, or null when it is absent.
+   */
+  private async execProbe (args: string[]): Promise<string | null> {
+    this.debug.log(`Probing: nft ${args.join(' ')}`)
+    try {
+      return await this.executor.execute('nft', args, { expectNonZeroExit: true })
+    } catch (error) {
+      if (this.isMissingObjectError(error)) {
+        this.debug.log(`Probe negative — object absent: nft ${args.join(' ')}`)
+        return null
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      this.debug.log('error', `nft existence probe failed: nft ${args.join(' ')}: ${message}`)
+      return null
     }
   }
 
