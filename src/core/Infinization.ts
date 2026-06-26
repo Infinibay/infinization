@@ -54,6 +54,7 @@ import { PrismaAdapter } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { HealthMonitor } from '../sync/HealthMonitor'
 import { NftablesService } from '../network/NftablesService'
+import { CgroupsManager } from '../system/CgroupsManager'
 import { Debugger } from '../utils/debug'
 import {
   InfinizationConfig,
@@ -98,6 +99,7 @@ export class Infinization {
   private eventHandler!: EventHandler
   private healthMonitor!: HealthMonitor
   private nftables!: NftablesService
+  private cgroupsManager!: CgroupsManager
   private eventManager?: EventManagerLike
   private activeVMs: Map<string, ActiveVMResources> = new Map()
   private initialized: boolean = false
@@ -166,18 +168,24 @@ export class Infinization {
       this.externalPrisma = true
       this.debug.log('Using external Prisma client')
 
-      // Initialize EventHandler
+      // Initialize EventHandler — share the facade vmLock so its destructive
+      // guest-shutdown cleanup is serialized against locked lifecycle ops on the
+      // same VM (prevents the reaper racing a concurrent start/stop/destroy).
       this.eventHandler = new EventHandler(this.prisma, {
         enableLogging: true,
-        emitCustomEvents: true
+        emitCustomEvents: true,
+        vmLock: this.vmLock
       })
       this.debug.log('EventHandler initialized')
 
-      // Initialize HealthMonitor
+      // Initialize HealthMonitor — share the facade vmLock so its per-VM crash/
+      // orphan/reconcile cleanup is serialized against locked lifecycle ops on the
+      // same VM. The periodic scan defers (non-blocking) to in-flight operator ops.
       const healthInterval = this.config.healthMonitorInterval ?? DEFAULT_HEALTH_CHECK_INTERVAL
       this.healthMonitor = new HealthMonitor(this.prisma, {
         checkIntervalMs: healthInterval,
         enableCleanup: true,
+        vmLock: this.vmLock,
         onCrashDetected: async (vmId: string) => {
           this.debug.log(`Crash detected for VM: ${vmId}`)
           this.activeVMs.delete(vmId)
@@ -189,8 +197,18 @@ export class Infinization {
       })
       this.debug.log('HealthMonitor initialized')
 
-      // Initialize nftables infrastructure
-      this.nftables = new NftablesService()
+      // CgroupsManager for startup scope reclaim (reclaims qemu-<pid>.scope leaked
+      // by VM crashes during the PREVIOUS run). Self-scanning, removes only empty
+      // scopes, idempotent — safe to call unconditionally.
+      this.cgroupsManager = new CgroupsManager()
+
+      // Initialize nftables infrastructure. bridgeConntrackMode is operator-
+      // configurable: default 'fail' (recommended fail-loud-at-init — initialize()
+      // throws a clear error on a host lacking br_netfilter/nf_conntrack_bridge);
+      // set INFINIZATION_BRIDGE_CONNTRACK_MODE=degrade to run stateless instead.
+      this.nftables = new NftablesService({
+        bridgeConntrackMode: process.env.INFINIZATION_BRIDGE_CONNTRACK_MODE === 'degrade' ? 'degrade' : 'fail'
+      })
       await this.nftables.initialize()
       this.debug.log('Nftables infrastructure initialized')
 
@@ -206,6 +224,18 @@ export class Infinization {
         }
       } catch (error) {
         this.debug.log('error', `Startup reconcile failed (continuing): ${error instanceof Error ? error.message : String(error)}`)
+      }
+
+      // Reclaim cgroup scopes leaked by crashes in the previous run. Best-effort:
+      // cleanupEmptyScopes is self-scanning and removes only already-empty scopes,
+      // so it can never disturb a live VM. A failure must not block startup.
+      try {
+        const reclaimed = await this.cgroupsManager.cleanupEmptyScopes()
+        if (reclaimed > 0) {
+          this.debug.log('info', `Startup cgroup reclaim: removed ${reclaimed} empty scope(s) from prior crashes`)
+        }
+      } catch (error) {
+        this.debug.log('warn', `Startup cgroup reclaim failed (continuing): ${error instanceof Error ? error.message : String(error)}`)
       }
 
       // Start health monitoring if enabled
@@ -498,12 +528,20 @@ export class Infinization {
 
     this.debug.log(`Attaching to running VM ${vmId} via ${qmpSocketPath}`)
 
+    const qmpClient = new QMPClient(qmpSocketPath)
     try {
-      const qmpClient = new QMPClient(qmpSocketPath)
       await qmpClient.connect()
 
-      // Attach event listeners
-      await this.eventHandler.attachToVM(vmId, qmpClient)
+      // Attach event listeners. If this throws AFTER connect() (e.g. listener
+      // setup fails), the QMPClient holds a live socket + reconnect timer that
+      // EventHandler never took ownership of — disconnect it so we don't leak a
+      // dangling connection/timer on every failed attach.
+      try {
+        await this.eventHandler.attachToVM(vmId, qmpClient)
+      } catch (attachError) {
+        await qmpClient.disconnect().catch(() => { /* best-effort: already failing */ })
+        throw attachError
+      }
 
       // Track this VM (minimal resources - QMP client is managed by EventHandler)
       // We need internalName for proper tracking, but we only have vmId here

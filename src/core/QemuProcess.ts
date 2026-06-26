@@ -1,7 +1,13 @@
 import { ChildProcess, spawn } from 'child_process'
 import { promises as fsPromises } from 'fs'
 import { Debugger } from '../utils/debug'
-import { isProcessAlive as sharedIsProcessAlive, waitForProcessExit as sharedWaitForProcessExit } from '../utils/processIdentity'
+import {
+  isProcessAlive as sharedIsProcessAlive,
+  waitForProcessExit as sharedWaitForProcessExit,
+  pidBelongsToVM,
+  forceKillProcess
+} from '../utils/processIdentity'
+import { redactSecrets } from '../utils/qemuArgSafety'
 import { QemuCommandBuilder, QemuCommandWithPinning } from './QemuCommandBuilder'
 
 /**
@@ -19,6 +25,12 @@ export class QemuProcess {
   private pidFilePath: string | null = null
   private debug: Debugger
   private stopping: boolean = false
+  /**
+   * Explicit identity token override. Normally null — getIdentityToken() derives the
+   * token from the pidfile/QMP-socket paths the command builder already embeds in the
+   * QEMU cmdline. Set only if a caller needs to supply the VM's internalName directly.
+   */
+  private identityToken: string | null = null
 
   // CPU pinning information (populated after start)
   private cpuPinningApplied: boolean = false
@@ -51,6 +63,40 @@ export class QemuProcess {
    */
   setPidFilePath (path: string): void {
     this.pidFilePath = path
+  }
+
+  /**
+   * Optionally override the identity token used to verify PID ownership before any
+   * destructive signal. By default the token is self-derived from the pidfile / QMP
+   * socket paths (see {@link getIdentityToken}); both are guaranteed substrings of the
+   * QEMU cmdline, so a caller normally does NOT need to call this. Provide the VM's
+   * internalName here only if those paths are unavailable or you want a stricter token.
+   * @param token - A string the VM's QEMU cmdline is guaranteed to contain.
+   */
+  setIdentityToken (token: string): void {
+    this.identityToken = token
+  }
+
+  /**
+   * Derive the token that {@link pidBelongsToVM} matches against the QEMU cmdline.
+   *
+   * The token MUST be a substring of the QEMU process's `/proc/<pid>/cmdline`.
+   * The command builder embeds the VM's internalName in BOTH the `-pidfile <path>`
+   * and `-qmp unix:<path>,...` arguments, so either path is a reliable, self-derivable
+   * token — no external wiring (and no VMLifecycle signature change) is required.
+   *
+   * Returns null only if NONE of those are known, in which case destructive signals
+   * MUST fail closed (refuse to signal) rather than blindly SIGKILL a possibly-recycled
+   * PID.
+   */
+  private getIdentityToken (): string | null {
+    return (
+      this.identityToken ||
+      this.pidFilePath ||
+      this.commandBuilder.getPidfilePath() ||
+      this.qmpSocketPath ||
+      null
+    )
   }
 
   /**
@@ -104,7 +150,18 @@ export class QemuProcess {
     const isDaemonized = this.commandBuilder.isDaemonizeEnabled()
     const pidfilePath = this.pidFilePath || this.commandBuilder.getPidfilePath()
 
-    // Log command in a readable format
+    // L157: a stale pidfile from a crashed/previous run can hold a PID the kernel has
+    // since recycled. Best-effort remove it before spawn, but ONLY after confirming any
+    // PID it holds is dead — never unlink a pidfile whose PID is still a live process
+    // (that would mask a still-running VM and let QEMU's own -pidfile write race a live
+    // owner). Done here (outside the Promise executor) so it can be awaited.
+    if (pidfilePath) {
+      await this.removeStalePidFile(pidfilePath)
+    }
+
+    // Log command in a readable format. L165: argv may carry a display password
+    // (legacy SpiceConfig path puts `password=...` into a -spice arg), so every line
+    // that echoes args is passed through redactSecrets() to avoid leaking it to logs.
     this.debug.log(`Starting VM ${this.vmId}`)
     if (commandResult.wrapperCommand) {
       this.debug.log(`Wrapper: ${commandResult.wrapperCommand} ${commandResult.wrapperArgs.join(' ')}`)
@@ -115,13 +172,13 @@ export class QemuProcess {
       const arg = commandResult.args[i]
       const value = commandResult.args[i + 1]
       if (value && !value.startsWith('-')) {
-        this.debug.log(`  ${arg} ${value}`)
+        this.debug.log(`  ${redactSecrets(`${arg} ${value}`)}`)
       } else {
-        this.debug.log(`  ${arg}`)
+        this.debug.log(`  ${redactSecrets(arg)}`)
         if (value) i-- // Reprocess value as next arg
       }
     }
-    this.debug.log(`Full command: ${actualCommand} ${actualArgs.join(' ')}`)
+    this.debug.log(`Full command: ${redactSecrets(`${actualCommand} ${actualArgs.join(' ')}`)}`)
 
     return new Promise((resolve, reject) => {
       let stderrBuffer = ''
@@ -226,6 +283,18 @@ export class QemuProcess {
             reject(new Error(`Daemon pidfile for VM ${this.vmId} did not contain a valid PID`))
             return
           }
+          // L157: verify the pidfile PID actually IS this VM's QEMU before adopting it.
+          // A stale pidfile (left by a crashed/old run) may hold a PID the kernel has
+          // since recycled to an unrelated host process; adopting it would later target
+          // the wrong PID for stop()/forceKill()/isAlive(). Fail the start instead.
+          const token = this.getIdentityToken()
+          if (token && !pidBelongsToVM(daemonPid, token)) {
+            if (startCompleted) return
+            startCompleted = true
+            this.killSpawnedChild()
+            reject(new Error(`Daemon pidfile for VM ${this.vmId} holds PID ${daemonPid} which is not this VM's QEMU (stale/foreign daemon PID) — refusing to adopt`))
+            return
+          }
           this.pid = daemonPid
           // Drop the dead fork-parent handle so stop() signals the daemon PID
           // (process.kill branch) instead of the exited parent, and release its
@@ -321,12 +390,21 @@ export class QemuProcess {
           // Send SIGTERM for graceful shutdown
           this.process.kill('SIGTERM')
         } else {
-          // Process handle not available (daemonized), use kill directly
-          try {
-            process.kill(this.pid!, 'SIGTERM')
-          } catch (error) {
-            clearTimeout(timeout)
-            this.debug.log('warn', `Failed to send SIGTERM: ${(error as Error).message}`)
+          // Process handle not available (daemonized, re-parented to init): we must
+          // signal the bare PID. H2: gate the SIGTERM on a /proc identity check so a
+          // recycled PID (now an unrelated host process) is never signalled. If it does
+          // not verify, skip the SIGTERM — the outer timeout still escalates to
+          // forceKill(), which fails closed on the same check.
+          const token = this.getIdentityToken()
+          if (token && pidBelongsToVM(this.pid!, token)) {
+            try {
+              process.kill(this.pid!, 'SIGTERM')
+            } catch (error) {
+              clearTimeout(timeout)
+              this.debug.log('warn', `Failed to send SIGTERM: ${(error as Error).message}`)
+            }
+          } else {
+            this.debug.log('warn', `VM ${this.vmId}: skipping SIGTERM to PID ${this.pid} — could not verify it is this VM's QEMU (PID-reuse guard); deferring to forceKill()`)
           }
 
           // Poll for process exit. Only resolve if it actually exited; otherwise
@@ -370,31 +448,48 @@ export class QemuProcess {
   }
 
   /**
-   * Force kill the QEMU process. Throws if the process is still alive after
-   * SIGKILL + timeout, so the caller can alarm/retry instead of treating a live
-   * process (still holding TAP/disk/display) as stopped.
+   * Force kill the QEMU process.
+   *
+   * H2 (PID-reuse guard): QEMU is `-daemonize`d (re-parented to init) and its PID may
+   * have been recycled by the kernel between when we recorded it and now. Sending a raw
+   * SIGKILL to a recycled PID could kill an unrelated host process (we run as root).
+   * The kill is therefore routed through the identity-checked escalation in
+   * processIdentity, which verifies via /proc that the PID is still THIS VM's QEMU
+   * before signalling.
+   *
+   * Fails closed: if the identity token cannot be derived, we refuse to signal, log an
+   * alarm, and DO NOT clear this.pid so the caller can alarm/retry. Likewise throws if
+   * the process is still alive after SIGKILL + timeout (it still holds the
+   * TAP/disk/display) instead of treating a live process as stopped.
    */
   async forceKill (): Promise<void> {
     if (!this.pid) {
       return
     }
 
-    this.debug.log(`Force killing VM ${this.vmId} (PID ${this.pid})`)
-
-    try {
-      process.kill(this.pid, 'SIGKILL')
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code
-      if (code !== 'ESRCH') {
-        // ESRCH = already gone (fine). Anything else is a real failure.
-        this.debug.log('warn', `Failed to kill process ${this.pid}: ${(error as Error).message}`)
-      }
+    const token = this.getIdentityToken()
+    if (!token) {
+      // FAIL CLOSED: with no token we cannot prove this PID is ours, so we must not
+      // SIGKILL it. Keep this.pid so the caller knows the VM was NOT reaped.
+      this.debug.log('error', `Refusing to force kill VM ${this.vmId} (PID ${this.pid}): no identity token to verify PID ownership — possible PID-reuse, manual intervention required`)
+      throw new Error(`VM ${this.vmId} cannot be force killed: identity token unknown (fail-closed, PID ${this.pid} left intact)`)
     }
 
-    const gone = await sharedWaitForProcessExit(this.pid, 5000)
+    this.debug.log(`Force killing VM ${this.vmId} (PID ${this.pid})`)
+
+    // Identity-checked SIGTERM -> SIGKILL escalation (re-verifies ownership across the
+    // grace window in case the PID is recycled mid-kill).
+    const result = await forceKillProcess(this.pid, token)
     await this.cleanupPidFile()
 
-    if (!gone) {
+    if (result.skipped) {
+      // Identity could not be confirmed — the live PID is NOT this VM's QEMU. Do not
+      // clear this.pid; surface it so the caller can alarm instead of assuming success.
+      this.debug.log('error', `Force kill of VM ${this.vmId} skipped: PID ${this.pid} is not confirmed to be this VM's QEMU (PID-reuse guard)`)
+      throw new Error(`VM ${this.vmId} not force killed: PID ${this.pid} failed identity verification (fail-closed)`)
+    }
+
+    if (!result.confirmedGone) {
       // Do NOT clear pid/process: the process is still alive and the caller must
       // know it was not reaped (it still holds the TAP/disk/display).
       throw new Error(`VM ${this.vmId} process ${this.pid} is still alive after SIGKILL`)
@@ -508,6 +603,39 @@ export class QemuProcess {
   private async waitForProcessExit (timeoutMs: number): Promise<boolean> {
     if (!this.pid) return true
     return sharedWaitForProcessExit(this.pid, timeoutMs)
+  }
+
+  /**
+   * Best-effort removal of a STALE pidfile before spawning a fresh QEMU.
+   *
+   * Only unlinks the file if it is absent, malformed, or holds a PID that is confirmed
+   * dead (and, when a token is derivable, not a live process matching this VM). A
+   * pidfile whose PID is still a LIVE process is left intact and logged loudly — that
+   * indicates a still-running VM and we must not clobber its pidfile.
+   */
+  private async removeStalePidFile (pidfilePath: string): Promise<void> {
+    let content: string
+    try {
+      content = await fsPromises.readFile(pidfilePath, 'utf-8')
+    } catch {
+      // No pidfile (the normal case) — nothing to clean up.
+      return
+    }
+
+    const existingPid = parseInt(content.trim(), 10)
+    if (!isNaN(existingPid) && existingPid > 0 && sharedIsProcessAlive(existingPid)) {
+      // A live process still owns this PID. Refuse to remove — do NOT mask a possibly
+      // still-running VM. The startup wait/identity checks will surface the conflict.
+      this.debug.log('warn', `VM ${this.vmId}: pidfile ${pidfilePath} holds live PID ${existingPid}; not removing it before spawn`)
+      return
+    }
+
+    try {
+      await fsPromises.unlink(pidfilePath)
+      this.debug.log(`Removed stale PID file ${pidfilePath} (held dead/invalid PID)`)
+    } catch (error) {
+      this.debug.log('warn', `Failed to remove stale PID file ${pidfilePath}: ${(error as Error).message}`)
+    }
   }
 
   /**

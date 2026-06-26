@@ -19,6 +19,24 @@ import { TapDeviceManager } from '../network/TapDeviceManager'
 import { NftablesService } from '../network/NftablesService'
 import { CgroupsManager } from '../system/CgroupsManager'
 import { Debugger } from '../utils/debug'
+import { KeyedMutex } from '../utils/KeyedMutex'
+import { waitForProcessExit as sharedWaitForProcessExit } from '../utils/processIdentity'
+
+/**
+ * EventHandler configuration, extended with the optional facade vmLock.
+ *
+ * CROSS-UNIT CONTRACT (CORE3): the wiring agent constructs EventHandler with the
+ * Infinization facade's shared `vmLock` (a KeyedMutex keyed by vmId). When
+ * provided, EventHandler serializes its destructive guest-shutdown cleanup
+ * (terminateQEMUProcess + the 'off' status flip) against concurrent locked
+ * lifecycle ops (start/stop/etc.) on the SAME vmId. When omitted, EventHandler
+ * behaves exactly as before (no locking) — backward compatible. EventHandler
+ * does NOT add tryRunExclusive to KeyedMutex (that is CORE3's concern); it only
+ * calls runExclusive when a lock is present.
+ */
+export type EventHandlerOptions = Partial<EventHandlerConfig> & {
+  vmLock?: KeyedMutex
+}
 
 /**
  * Default timeout for waiting for QEMU process to exit (30 seconds).
@@ -115,6 +133,19 @@ export class EventHandler extends EventEmitter {
   private attachedVMs: Map<string, AttachedVM> = new Map()
   private debug: Debugger
 
+  // Optional facade vmLock (CORE3). When set, destructive guest-shutdown cleanup
+  // is serialized against locked lifecycle ops on the same vmId. See EventHandlerOptions.
+  private readonly vmLock?: KeyedMutex
+
+  // VMs with an unattended OS install in progress. While a vmId is in this set,
+  // EventHandler MUST NOT reap QEMU or flip the row to 'off' on SHUTDOWN/POWERDOWN:
+  // those power events are part of the install (end-of-install shutdown, reboot
+  // cycles) and are owned by InstallationMonitor, which applies its own
+  // minInstallTimeBeforeComplete/resetCount completion heuristic. VMLifecycle
+  // registers the vmId here for the duration of the background install monitor
+  // (B3 regression — the critic-found unattended-install race).
+  private readonly installInProgress: Set<string> = new Set()
+
   // Resource cleanup services (created internally like HealthMonitor pattern)
   private readonly tapManager: TapDeviceManager
   private readonly nftables: NftablesService
@@ -136,10 +167,14 @@ export class EventHandler extends EventEmitter {
    * @param db Database adapter instance for database operations
    * @param config Optional configuration options
    */
-  constructor (db: DatabaseAdapter, config?: Partial<EventHandlerConfig>) {
+  constructor (db: DatabaseAdapter, config?: EventHandlerOptions) {
     super()
     this.stateSync = new StateSync(db)
-    this.config = { ...DEFAULT_CONFIG, ...config }
+    // Pull the (non-config) vmLock out before merging the rest into config so it
+    // isn't carried into EventHandlerConfig.
+    const { vmLock, ...handlerConfig } = config ?? {}
+    this.vmLock = vmLock
+    this.config = { ...DEFAULT_CONFIG, ...handlerConfig }
     this.debug = new Debugger('event-handler')
 
     // Create service instances for resource cleanup (stateless, safe to create new instances)
@@ -151,6 +186,45 @@ export class EventHandler extends EventEmitter {
     // crash the whole (privileged) backend on the first transient emit. A real
     // consumer listener still fires alongside this one.
     this.on('error', (err) => this.debug.log('error', `EventHandler error event: ${err instanceof Error ? err.message : String(err)}`))
+  }
+
+  /**
+   * Marks a VM as having an unattended OS install in progress.
+   *
+   * While marked, EventHandler will NOT reap QEMU or flip the row to 'off' on a
+   * SHUTDOWN/POWERDOWN event — those power events belong to the install (the
+   * end-of-install shutdown and intermediate reboot cycles) and are owned by
+   * InstallationMonitor. EventHandler still updates DB status for non-terminal
+   * events and still emits observability events.
+   *
+   * CROSS-UNIT CONTRACT: VMLifecycle.create() calls this BEFORE attaching the
+   * general EventHandler for an unattended-install VM, and clears it when the
+   * background install monitor settles (success OR failure). Idempotent.
+   *
+   * @param vmId The VM identifier whose install is in progress
+   */
+  public markInstallInProgress (vmId: string): void {
+    this.installInProgress.add(vmId)
+    this.debug.log('info', `Install-in-progress guard ENABLED for VM ${vmId}; SHUTDOWN/POWERDOWN will not reap until install completes`)
+  }
+
+  /**
+   * Clears the unattended-install guard for a VM (install completed or failed).
+   * After this, normal terminal SHUTDOWN/POWERDOWN handling resumes. Idempotent.
+   *
+   * @param vmId The VM identifier whose install has settled
+   */
+  public clearInstallInProgress (vmId: string): void {
+    if (this.installInProgress.delete(vmId)) {
+      this.debug.log('info', `Install-in-progress guard CLEARED for VM ${vmId}; terminal shutdown handling resumed`)
+    }
+  }
+
+  /**
+   * Returns whether an unattended install is currently in progress for a VM.
+   */
+  public isInstallInProgress (vmId: string): boolean {
+    return this.installInProgress.has(vmId)
   }
 
   /**
@@ -179,20 +253,43 @@ export class EventHandler extends EventEmitter {
       qmpClient.on(eventType, listener)
     }
 
-    // Track the disconnect event
+    // Track the disconnect event. H9: a 'disconnect' while the client still
+    // intends to reconnect is a TRANSIENT flap — we keep the attachment and
+    // listeners alive (so a post-reconnect SHUTDOWN is not missed) and only emit
+    // for observability. Real teardown happens in reconnect_failed / detachFromVM.
     const disconnectListener = () => {
       this.handleDisconnect(vmId)
     }
     listeners.set('disconnect', disconnectListener)
     qmpClient.on('disconnect', disconnectListener)
 
+    // Track reconnect: when the QMP client successfully re-establishes its socket
+    // after a flap, re-sync VM state from the live guest (a SHUTDOWN/STOP that
+    // happened during the blip would otherwise be lost) and surface 'vm:reconnect'
+    // so the backend can clear any "disconnected" UI state.
+    // CROSS-UNIT CONTRACT: emits 'vm:reconnect' { vmId } (a sibling backend agent
+    // already subscribes to this).
+    const reconnectListener = () => {
+      this.handleReconnect(vmId).catch((err) => {
+        this.debug.log('error', `Reconnect re-sync failed for VM ${vmId}: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+    listeners.set('reconnect', reconnectListener)
+    qmpClient.on('reconnect', reconnectListener)
+
     // Track reconnect_failed: when the QMP client exhausts its reconnect attempts
     // it goes permanently dead and stops syncing VM state. Previously NOTHING
     // subscribed, so the VM silently drifted (DB 'running' forever after QEMU
     // died, or vice-versa). Surface it as an actionable event the backend can
-    // alarm on, and mark the VM as needing reconciliation.
+    // alarm on, and mark the VM as needing reconciliation. This is also the ONLY
+    // place (besides explicit detachFromVM) where attachment is actually torn down.
     const reconnectFailedListener = () => {
       this.debug.log('error', `QMP reconnect failed for VM ${vmId}; client is dead, state sync stopped — needs re-attach/reconcile`)
+      const attached = this.attachedVMs.get(vmId)
+      if (attached) {
+        this.removeListeners(attached)
+        this.attachedVMs.delete(vmId)
+      }
       this.emit('vm:stale', { vmId, reason: 'qmp_reconnect_failed' })
     }
     listeners.set('reconnect_failed', reconnectFailedListener)
@@ -311,51 +408,38 @@ export class EventHandler extends EventEmitter {
       // Determine new status based on event
       const newStatus = EVENT_TO_STATUS[event]
 
-      if (newStatus) {
-        // CRITICAL: Get PID BEFORE updating status to 'off'.
-        // Reason: findRunningVMs() filters by status='running', so if we update
-        // status first, we won't be able to retrieve the PID for process monitoring.
-        // This ensures we can track QEMU termination even after DB status changes.
-        let qemuPid: number | null = null
-        let tapDeviceName: string | null = null
-        if (newStatus === 'off' && (event === 'SHUTDOWN' || event === 'POWERDOWN')) {
-          qemuPid = await this.stateSync.getVMPid(vmId)
-          // Capture the TAP name NOW too: getVMInfo()/findRunningVMs filter by
-          // status='running', so once we flip to 'off' below it becomes
-          // unrecoverable and the TAP would never be detached from the bridge
-          // (a leak on every ACPI shutdown).
-          try {
-            const info = await this.stateSync.getVMInfo(vmId)
-            tapDeviceName = info?.tapDeviceName ?? null
-          } catch { /* best-effort capture */ }
-          this.debug.log('debug', `Retrieved PID ${qemuPid}, TAP ${tapDeviceName ?? 'none'} for VM ${vmId} before status update`)
+      // B3 (unattended-install race): while an unattended install is in progress
+      // for this VM, a SHUTDOWN/POWERDOWN is NOT terminal — it is the end-of-
+      // install power-off or an intermediate reboot. InstallationMonitor owns the
+      // completion decision (minInstallTimeBeforeComplete/resetCount heuristic).
+      // The general EventHandler must NOT flip the row to 'off' or reap QEMU here,
+      // or it would defeat the install. Defer entirely to InstallationMonitor:
+      // skip the destructive path but still emit observability events below.
+      const isTerminalShutdown = newStatus === 'off' && (event === 'SHUTDOWN' || event === 'POWERDOWN')
+      if (isTerminalShutdown && this.isInstallInProgress(vmId)) {
+        this.debug.log('warn', `${event} for VM ${vmId} while install in progress — deferring to InstallationMonitor, NOT reaping/flipping`)
+        if (this.config.emitCustomEvents) {
+          this.emitCustomEvents(vmId, event, previousStatus, previousStatus, timestamp, data)
         }
+        return
+      }
 
-        // Update database
+      if (isTerminalShutdown) {
+        // Destructive terminal-shutdown path: status flip to 'off' + QEMU reap +
+        // resource cleanup. When the facade vmLock is provided (CORE3), serialize
+        // this whole block against concurrent locked lifecycle ops on the same
+        // vmId. When absent, run inline (backward compatible).
+        if (this.vmLock) {
+          await this.vmLock.runExclusive(vmId, () => this.handleTerminalShutdown(vmId, event, data))
+        } else {
+          await this.handleTerminalShutdown(vmId, event, data)
+        }
+      } else if (newStatus) {
+        // Non-terminal status change (STOP/RESUME/SUSPEND/WAKEUP). Just update DB.
         const result = await this.stateSync.updateStatusDirect(vmId, newStatus)
 
         if (result.success && this.config.enableLogging) {
           this.debug.log(`VM ${vmId} status updated: ${result.previousStatus} → ${result.newStatus}`)
-        }
-
-        // When VM shuts down, handle QEMU process termination
-        if (newStatus === 'off' && (event === 'SHUTDOWN' || event === 'POWERDOWN')) {
-          // Determine shutdown type from QMP event data.
-          // IMPORTANT QEMU LIMITATION: We cannot reliably distinguish between:
-          //   1. Guest clicked PowerOff inside VM
-          //   2. Host sent system_powerdown via QMP
-          // Both produce identical events: {guest: true, reason: 'guest-shutdown'}
-          //
-          // The ONLY distinguishable case is direct quit command:
-          //   - Host sent 'quit' via QMP → {guest: false, reason: 'host-qmp-quit'}
-          //
-          // For ACPI shutdowns (cases 1 & 2), QEMU will exit automatically after
-          // guest completes shutdown. We monitor the process but do NOT send quit.
-          const shutdownData = data as QMPShutdownEventData | undefined
-          const isHostQmpQuit = shutdownData?.reason === 'host-qmp-quit'
-
-          this.debug.log('info', `Shutdown event - isHostQmpQuit: ${isHostQmpQuit}, reason: ${shutdownData?.reason ?? 'unknown'}`)
-          await this.terminateQEMUProcess(vmId, isHostQmpQuit, qemuPid, tapDeviceName)
         }
       } else if (event === 'RESET') {
         // RESET doesn't change status, just log it
@@ -366,29 +450,7 @@ export class EventHandler extends EventEmitter {
 
       // Emit custom events for backend integration
       if (this.config.emitCustomEvents) {
-        const eventData: VMEventData = {
-          vmId,
-          event,
-          previousStatus,
-          newStatus: newStatus ?? previousStatus,
-          timestamp: new Date(timestamp.seconds * 1000 + timestamp.microseconds / 1000),
-          qmpData: data
-        }
-
-        // Emit specific QMP event (e.g., vm:shutdown, vm:stop)
-        this.emit(`vm:${event.toLowerCase()}`, eventData)
-
-        // Emit higher-level status events for easier consumption
-        if (newStatus === 'off') {
-          this.emit('vm:off', eventData)
-        } else if (newStatus === 'suspended') {
-          this.emit('vm:suspended', eventData)
-        } else if (newStatus === 'running') {
-          this.emit('vm:running', eventData)
-        }
-
-        // Emit generic event
-        this.emit('vm:event', eventData)
+        this.emitCustomEvents(vmId, event, previousStatus, newStatus ?? previousStatus, timestamp, data)
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown error'
@@ -400,20 +462,208 @@ export class EventHandler extends EventEmitter {
   }
 
   /**
-   * Handles QMP client disconnect
+   * Performs the destructive terminal-shutdown handling for a SHUTDOWN/POWERDOWN:
+   * captures PID/TAP before the flip, flips the row to 'off', then reaps QEMU and
+   * cleans up resources. Extracted so it can be wrapped in the facade vmLock
+   * (CORE3) as a single critical section. The install-in-progress guard and the
+   * terminal-event check are applied by the caller before invoking this.
+   */
+  private async handleTerminalShutdown (vmId: string, event: QMPEventType, data: unknown): Promise<void> {
+    // CRITICAL: Get PID BEFORE updating status to 'off'.
+    // Reason: findRunningVMs() filters by status='running', so if we update
+    // status first, we won't be able to retrieve the PID for process monitoring.
+    // This ensures we can track QEMU termination even after DB status changes.
+    const qemuPid = await this.stateSync.getVMPid(vmId)
+    // Capture the TAP name NOW too: getVMInfo()/findRunningVMs filter by
+    // status='running', so once we flip to 'off' below it becomes unrecoverable
+    // and the TAP would never be detached from the bridge (a leak on every ACPI
+    // shutdown).
+    let tapDeviceName: string | null = null
+    try {
+      const info = await this.stateSync.getVMInfo(vmId)
+      tapDeviceName = info?.tapDeviceName ?? null
+    } catch { /* best-effort capture */ }
+    this.debug.log('debug', `Retrieved PID ${qemuPid}, TAP ${tapDeviceName ?? 'none'} for VM ${vmId} before status update`)
+
+    // Flip the row to 'off'.
+    const result = await this.stateSync.updateStatusDirect(vmId, 'off')
+    if (result.success && this.config.enableLogging) {
+      this.debug.log(`VM ${vmId} status updated: ${result.previousStatus} → ${result.newStatus}`)
+    }
+
+    // Determine shutdown type from QMP event data.
+    // IMPORTANT QEMU LIMITATION: We cannot reliably distinguish between:
+    //   1. Guest clicked PowerOff inside VM
+    //   2. Host sent system_powerdown via QMP
+    // Both produce identical events: {guest: true, reason: 'guest-shutdown'}
+    //
+    // The ONLY distinguishable case is direct quit command:
+    //   - Host sent 'quit' via QMP → {guest: false, reason: 'host-qmp-quit'}
+    //
+    // For ACPI shutdowns (cases 1 & 2), QEMU will exit automatically after
+    // guest completes shutdown. We monitor the process but do NOT send quit.
+    const shutdownData = data as QMPShutdownEventData | undefined
+    const isHostQmpQuit = shutdownData?.reason === 'host-qmp-quit'
+
+    this.debug.log('info', `Shutdown event - isHostQmpQuit: ${isHostQmpQuit}, reason: ${shutdownData?.reason ?? 'unknown'}`)
+    await this.terminateQEMUProcess(vmId, isHostQmpQuit, qemuPid, tapDeviceName)
+  }
+
+  /**
+   * Emits the custom backend-integration events for a handled QMP event. Shared
+   * by the normal path and the install-guard early-return path (where the status
+   * does NOT change, so previousStatus is passed as newStatus).
+   */
+  private emitCustomEvents (
+    vmId: string,
+    event: QMPEventType,
+    previousStatus: string,
+    newStatus: string,
+    timestamp: QMPTimestamp,
+    data: unknown
+  ): void {
+    const eventData: VMEventData = {
+      vmId,
+      event,
+      previousStatus,
+      newStatus,
+      timestamp: new Date(timestamp.seconds * 1000 + timestamp.microseconds / 1000),
+      qmpData: data
+    }
+
+    // Emit specific QMP event (e.g., vm:shutdown, vm:stop)
+    this.emit(`vm:${event.toLowerCase()}`, eventData)
+
+    // Emit higher-level status events for easier consumption
+    if (newStatus === 'off') {
+      this.emit('vm:off', eventData)
+    } else if (newStatus === 'suspended') {
+      this.emit('vm:suspended', eventData)
+    } else if (newStatus === 'running') {
+      this.emit('vm:running', eventData)
+    }
+
+    // Emit generic event
+    this.emit('vm:event', eventData)
+  }
+
+  /**
+   * Handles QMP client disconnect.
+   *
+   * H9: Do NOT tear down attachment on a transient flap. If the QMPClient still
+   * intends to reconnect (reconnect enabled, not intentionally closed, retry
+   * budget remaining), we keep the entry in attachedVMs and keep the listeners
+   * bound so a SHUTDOWN/POWERDOWN delivered after a successful reconnect is still
+   * handled. Tearing down here would silently stop state sync and defeat the
+   * reconnect_failed -> vm:stale surfacing. Real teardown happens only inside the
+   * reconnect_failed listener and in explicit detachFromVM().
+   *
+   * If the client is NOT going to reconnect (e.g. reconnect disabled), this is a
+   * terminal disconnect and we fall back to the old behavior: remove listeners +
+   * drop the entry, so we don't leak a dead attachment.
    */
   private handleDisconnect (vmId: string): void {
-    this.debug.log(`QMP client disconnected for VM ${vmId}`)
-
-    // Get the attached VM and remove listeners before deleting
     const attached = this.attachedVMs.get(vmId)
+    const willReconnect = attached?.qmpClient.isReconnecting() ?? false
+
+    if (willReconnect) {
+      this.debug.log('warn', `QMP transient disconnect for VM ${vmId}; client is reconnecting — keeping attachment, awaiting reconnect/reconnect_failed`)
+      // Observability only — do NOT detach.
+      this.emit('vm:disconnect', { vmId, timestamp: new Date(), transient: true })
+      return
+    }
+
+    this.debug.log(`QMP client disconnected for VM ${vmId} (terminal — not reconnecting)`)
+
+    // Terminal disconnect: remove listeners before deleting so the dead client
+    // doesn't leak listeners/closures.
     if (attached) {
       this.removeListeners(attached)
       this.attachedVMs.delete(vmId)
     }
 
     // Emit disconnect event
-    this.emit('vm:disconnect', { vmId, timestamp: new Date() })
+    this.emit('vm:disconnect', { vmId, timestamp: new Date(), transient: false })
+  }
+
+  /**
+   * Handles a successful QMP reconnect after a transient flap.
+   *
+   * Re-syncs DB status from the live guest (query-status -> updateStatusDirect)
+   * so any state change missed during the blip is reconciled, then emits
+   * 'vm:reconnect' { vmId } for the backend.
+   *
+   * LOW fix: a reconnect that re-syncs to a TERMINAL run-state (shutdown /
+   * guest-panicked, mapped to 'off') must NOT be written as a bare terminal 'off'
+   * here. That write-only path skipped reap + cleanupVMResources (leaking the
+   * VM's TAP/firewall) AND bypassed the B3 install-in-progress guard (a reconnect
+   * mid-unattended-install would stomp the install by flipping it 'off'). Instead
+   * we route a terminal re-sync through the SAME path a normal terminal SHUTDOWN
+   * uses — handleTerminalShutdown — which respects the install guard, takes the
+   * facade vmLock, and runs cleanupVMResources. Non-terminal states keep the
+   * lightweight status re-sync.
+   *
+   * CROSS-UNIT CONTRACT: emits 'vm:reconnect' { vmId } on success.
+   */
+  private async handleReconnect (vmId: string): Promise<void> {
+    this.debug.log('info', `QMP reconnected for VM ${vmId}; re-syncing state`)
+
+    const attached = this.attachedVMs.get(vmId)
+    const client = attached?.qmpClient
+
+    if (client && client.isConnected()) {
+      try {
+        const status = await client.queryStatus()
+        // Map the live run-state to a DB status. 'running' is the common case;
+        // 'paused'/'suspended' map to suspended. Anything that maps cleanly is
+        // pushed through; unknown states are left untouched (best-effort resync).
+        const mapped = this.mapQmpStatusToDB(status.status, status.running)
+        if (mapped === 'off') {
+          // Terminal re-sync: the VM powered off (or guest-panicked) during the
+          // blip. Do NOT bare-write 'off'. Defer to InstallationMonitor while an
+          // unattended install is in progress — a reconnect mid-install must not
+          // trigger a terminal teardown (the end-of-install power-off / reboot
+          // cycle is owned by the installer; flipping 'off' + reaping here would
+          // stomp it). Otherwise run the full terminal-shutdown path (reap +
+          // cleanupVMResources) under the facade vmLock, exactly like a live
+          // SHUTDOWN event would.
+          if (this.isInstallInProgress(vmId)) {
+            this.debug.log('warn', `Reconnect re-sync for VM ${vmId} resolved to terminal while install in progress — deferring to InstallationMonitor, NOT reaping/flipping`)
+          } else {
+            this.debug.log('info', `Reconnect re-sync for VM ${vmId} resolved to terminal — routing through terminal-shutdown path (reap + cleanup)`)
+            if (this.vmLock) {
+              await this.vmLock.runExclusive(vmId, () => this.handleTerminalShutdown(vmId, 'SHUTDOWN', undefined))
+            } else {
+              await this.handleTerminalShutdown(vmId, 'SHUTDOWN', undefined)
+            }
+          }
+        } else if (mapped) {
+          await this.stateSync.updateStatusDirect(vmId, mapped)
+          this.debug.log('info', `Re-synced VM ${vmId} status to '${mapped}' after reconnect`)
+        }
+      } catch (err) {
+        this.debug.log('warn', `Could not query live status during reconnect re-sync for VM ${vmId}: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
+    this.emit('vm:reconnect', { vmId })
+  }
+
+  /**
+   * Maps a QMP run-state to a DB status for reconnect re-sync. Returns null when
+   * there is no safe mapping (leave the DB row as-is).
+   */
+  private mapQmpStatusToDB (qmpStatus: string, running: boolean): DBVMStatus | null {
+    if (running || qmpStatus === 'running') {
+      return 'running'
+    }
+    if (qmpStatus === 'paused' || qmpStatus === 'suspended' || qmpStatus === 'prelaunch') {
+      return 'suspended'
+    }
+    if (qmpStatus === 'shutdown' || qmpStatus === 'guest-panicked') {
+      return 'off'
+    }
+    return null
   }
 
   /**
@@ -484,7 +734,9 @@ export class EventHandler extends EventEmitter {
     const startTime = Date.now()
 
     if (pid) {
-      const exited = await this.waitForProcessExit(pid, DEFAULT_PROCESS_EXIT_TIMEOUT)
+      // L194: use the shared, zombie-aware waitForProcessExit/isProcessAlive so a
+      // single implementation governs liveness semantics across the codebase.
+      const exited = await sharedWaitForProcessExit(pid, DEFAULT_PROCESS_EXIT_TIMEOUT, PROCESS_POLL_INTERVAL)
       const elapsed = Date.now() - startTime
       if (exited) {
         this.debug.log('info', `✓ QEMU process (PID ${pid}) exited cleanly after ACPI shutdown for VM ${vmId} (took ${elapsed}ms)`)
@@ -585,48 +837,5 @@ export class EventHandler extends EventEmitter {
     }
 
     this.debug.log('info', `Completed resource cleanup for VM ${vmId} after guest-initiated shutdown`)
-  }
-
-  /**
-   * Waits for a process to exit by polling its status.
-   *
-   * @param pid The process ID to monitor
-   * @param timeout Maximum time to wait in milliseconds
-   * @returns true if process exited, false if timeout reached
-   */
-  private async waitForProcessExit (pid: number, timeout: number): Promise<boolean> {
-    const startTime = Date.now()
-
-    while (Date.now() - startTime < timeout) {
-      if (!this.isProcessAlive(pid)) {
-        return true
-      }
-      await this.sleep(PROCESS_POLL_INTERVAL)
-    }
-
-    return false
-  }
-
-  /**
-   * Checks if a process is still alive.
-   *
-   * @param pid The process ID to check
-   * @returns true if process is alive, false otherwise
-   */
-  private isProcessAlive (pid: number): boolean {
-    try {
-      // Signal 0 doesn't kill the process, just checks if it exists
-      process.kill(pid, 0)
-      return true
-    } catch {
-      return false
-    }
-  }
-
-  /**
-   * Async sleep helper.
-   */
-  private sleep (ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
   }
 }

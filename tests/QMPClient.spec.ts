@@ -320,6 +320,72 @@ describe('QMPClient', () => {
     })
   })
 
+  describe('execute() pending-command leak (L161)', () => {
+    it('rejects immediately and drops the pending entry if sendCommand throws synchronously', async () => {
+      await qmpClient.connect()
+
+      // Force the synchronous write to throw, simulating the socket vanishing between
+      // the connected-check and the write. The pending entry + its 30s timeout must NOT
+      // leak: the promise should reject right away rather than hang until the timeout.
+      const socket = (qmpClient as any).socket
+      jest.spyOn(socket, 'write').mockImplementation(() => {
+        throw new Error('EPIPE: broken pipe')
+      })
+
+      await expect(qmpClient.execute('query-status')).rejects.toThrow(/EPIPE/)
+
+      // No leaked pending command (it would otherwise fire its timeout 30s later).
+      expect((qmpClient as any).pendingCommands.size).toBe(0)
+    })
+  })
+
+  describe('connect() socket teardown on re-entry (L233)', () => {
+    it('destroys and de-listens the previous socket before creating a new connection', async () => {
+      await qmpClient.connect()
+
+      // Capture the live socket and watch its teardown when connect() runs again
+      // (as a reconnect would). Without the L233 fix the old socket + its
+      // data/close listeners would leak on every flap.
+      const oldSocket = (qmpClient as any).socket
+      const destroySpy = jest.spyOn(oldSocket, 'destroy')
+      const removeListenersSpy = jest.spyOn(oldSocket, 'removeAllListeners')
+
+      // Drop connected state so connect() proceeds past the already-connected guard.
+      ;(qmpClient as any).connected = false
+      await qmpClient.connect()
+
+      expect(removeListenersSpy).toHaveBeenCalled()
+      expect(destroySpy).toHaveBeenCalled()
+      // A fresh socket replaced the old one.
+      expect((qmpClient as any).socket).not.toBe(oldSocket)
+    })
+  })
+
+  describe('isReconnecting() accessor (H9)', () => {
+    it('is false when reconnect is disabled', () => {
+      const client = new QMPClient(testSocketPath, { reconnect: false })
+      expect(client.isReconnecting()).toBe(false)
+    })
+
+    it('is true when reconnect is enabled and not intentionally closed', () => {
+      const client = new QMPClient(testSocketPath, { reconnect: true, maxReconnectAttempts: 3 })
+      expect(client.isReconnecting()).toBe(true)
+    })
+
+    it('is false after disconnect() intentionally closes the client', async () => {
+      const client = new QMPClient(testSocketPath, { reconnect: true })
+      await client.connect()
+      await client.disconnect()
+      expect(client.isReconnecting()).toBe(false)
+    })
+
+    it('is false once the retry budget is exhausted', () => {
+      const client = new QMPClient(testSocketPath, { reconnect: true, maxReconnectAttempts: 2 })
+      ;(client as any).reconnectAttempts = 2
+      expect(client.isReconnecting()).toBe(false)
+    })
+  })
+
   describe('Connection State', () => {
     it('should return correct connection status', async () => {
       expect(qmpClient.isConnected()).toBe(false)

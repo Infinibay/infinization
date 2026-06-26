@@ -138,6 +138,16 @@ export interface BackupRestoreOptions {
    * Default: false (user must stop the VM manually).
    */
   autoStopStart?: boolean
+  /**
+   * SNAPSHOT restore only: explicit opt-in to revert the LIVE source disk
+   * in-place (a `qemu-img snapshot -a` mutates the original qcow2). Internal
+   * snapshots cannot be reverted to a *different* file, so when the supplied
+   * target path differs from the snapshot's source path the restore refuses
+   * unless this flag is set AND the target equals the source. This guard
+   * exists so a snapshot restore can never silently clobber the live disk
+   * (the default is fail-closed). Ignored for FULL/INCREMENTAL restores.
+   */
+  allowInPlaceSnapshotRevert?: boolean
 }
 
 /**
@@ -248,6 +258,20 @@ export interface BackupMetadata {
   parentBackupId?: string
   /** Error message if status is FAILED */
   errorMessage?: string
+  /**
+   * Whether the VM was running when this backup was taken. A backup taken of a
+   * live disk may capture a torn / in-flight write unless the guest filesystem
+   * was quiesced — see `crashConsistent`.
+   */
+  runningAtBackup?: boolean
+  /**
+   * True when the backup is only crash-consistent (live disk read WITHOUT a
+   * successful guest fsfreeze quiesce). A restore of a crash-consistent backup
+   * behaves like a hard power-loss recovery and should be surfaced to the user.
+   * Absent / false means the source was quiesced or the VM was stopped, i.e.
+   * the backup is application-/filesystem-consistent.
+   */
+  crashConsistent?: boolean
 }
 
 /**
@@ -343,7 +367,12 @@ export enum BackupErrorCode {
   /** Invalid backup configuration */
   INVALID_CONFIG = 'INVALID_CONFIG',
   /** Backup file is corrupt or unreadable */
-  CORRUPT_BACKUP = 'CORRUPT_BACKUP'
+  CORRUPT_BACKUP = 'CORRUPT_BACKUP',
+  /**
+   * The backup cannot be deleted because another backup depends on it as an
+   * INCREMENTAL parent (deleting it would orphan the dependent chain).
+   */
+  DEPENDENCY = 'DEPENDENCY'
 }
 
 /**

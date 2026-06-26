@@ -31,10 +31,26 @@ import {
 } from '../types/sync.types'
 import { NftablesService } from '../network/NftablesService'
 import { TapDeviceManager } from '../network/TapDeviceManager'
+import { CgroupsManager } from '../system/CgroupsManager'
 import { Debugger } from '../utils/debug'
-import { isProcessAlive as sharedIsProcessAlive, forceKillProcess } from '../utils/processIdentity'
+import { isProcessAlive as sharedIsProcessAlive, forceKillProcess, pidIdentityState } from '../utils/processIdentity'
+import { KeyedMutex } from '../utils/KeyedMutex'
 import { isPrismaAdapterError } from '../types/db.types'
 import { DEFAULT_PIDFILE_DIR } from '../types/lifecycle.types'
+
+/**
+ * HealthMonitor configuration extended with the optional facade vmLock.
+ *
+ * Following CORE2's local-Options pattern (EventHandlerOptions): the (non-config)
+ * `vmLock` is carried alongside the public {@link HealthMonitorConfig} but kept
+ * out of that interface in sync.types. When the Infinization facade supplies its
+ * shared `vmLock` (a KeyedMutex keyed by vmId), HealthMonitor serializes its
+ * per-VM destructive cleanup against locked lifecycle ops on the same VM. When
+ * absent (back-compat), HealthMonitor behaves exactly as before (no locking).
+ */
+export type HealthMonitorOptions = Partial<HealthMonitorConfig> & {
+  vmLock?: KeyedMutex
+}
 
 /** DB statuses that the startup reconcile pass owns; the orphan scanner must NOT
  *  act on a VM in one of these (a still-booting VM looks like an orphan). */
@@ -255,20 +271,31 @@ export class HealthMonitor extends EventEmitter {
   private isChecking: boolean = false
   private tapManager: TapDeviceManager
   private nftables: NftablesService
+  private cgroupsManager: CgroupsManager
   private debug: Debugger
   private readonly pidfileDir: string
+
+  // Optional facade vmLock (CORE3). When set, per-VM destructive cleanup
+  // (handleCrashedVM, killOrphan's cleanup, reconcile's per-VM body) is serialized
+  // against locked lifecycle ops on the same vmId. See HealthMonitorOptions.
+  private readonly vmLock?: KeyedMutex
 
   /**
    * Creates a new HealthMonitor instance
    * @param db Database adapter instance for database operations
-   * @param config Optional configuration options
+   * @param config Optional configuration options (may include the facade vmLock)
    */
-  constructor (db: DatabaseAdapter, config?: Partial<HealthMonitorConfig>) {
+  constructor (db: DatabaseAdapter, config?: HealthMonitorOptions) {
     super()
     this.db = db
-    this.config = { ...DEFAULT_CONFIG, ...config }
+    // Pull the (non-config) vmLock out before merging the rest into config so it
+    // isn't carried into HealthMonitorConfig.
+    const { vmLock, ...monitorConfig } = config ?? {}
+    this.vmLock = vmLock
+    this.config = { ...DEFAULT_CONFIG, ...monitorConfig }
     this.tapManager = new TapDeviceManager()
     this.nftables = new NftablesService()
+    this.cgroupsManager = new CgroupsManager()
     this.debug = new Debugger('health-monitor')
     this.pidfileDir = config?.pidfileDir ?? DEFAULT_PIDFILE_DIR
 
@@ -293,8 +320,19 @@ export class HealthMonitor extends EventEmitter {
     // Run first check immediately
     await this.runCheck()
 
+    // stop() may have been called (and cleared isRunning) while the initial
+    // runCheck() was awaiting. If so, do NOT arm the interval — otherwise it
+    // leaks forever because stop() already ran and found intervalHandle null.
+    if (!this.isRunning) {
+      this.debug.log('Health monitor stopped during initial check; not arming interval')
+      return
+    }
+
     // Schedule periodic checks
     this.intervalHandle = setInterval(async () => {
+      // Guard the body too: a tick can fire after stop() between clearInterval and
+      // the event-loop draining an already-queued callback.
+      if (!this.isRunning) return
       await this.runCheck()
     }, this.config.checkIntervalMs)
   }
@@ -360,14 +398,47 @@ export class HealthMonitor extends EventEmitter {
         }
 
         try {
-          const isAlive = this.isProcessAlive(pid)
+          // H8: a PID is only THIS VM's QEMU when liveness AND identity both hold.
+          // A bare isProcessAlive on a recycled PID (an unrelated host process that
+          // grabbed the dead VM's old PID) would otherwise keep a dead VM pinned
+          // 'running' forever, leaking its TAP/firewall/config.
+          //
+          // LOW-regression fix: use the TRI-STATE pidIdentityState (NOT the fail-
+          // closed boolean) for this NON-destructive decision. The boolean collapses
+          // a TRANSIENT /proc read error (EMFILE/EACCES under load) to false, which
+          // here would tear down a LIVE VM's TAP/firewall and flip it to 'off' — a
+          // false-crash. We only treat the PID as CRASHED when the process is dead
+          // OR identity is DEFINITIVELY 'mismatch'. 'match' (it's ours) and 'unknown'
+          // (we couldn't tell — could be transient) are both treated as alive/ours so
+          // a flaky read never destroys a healthy VM. A genuinely recycled PID still
+          // reads cleanly as 'mismatch' and is torn down.
+          const liveProcess = this.isProcessAlive(pid)
+          const identity = liveProcess ? pidIdentityState(pid, vm.internalName) : 'mismatch'
+          const isAlive = liveProcess && identity !== 'mismatch'
           checkResult.isAlive = isAlive
 
           if (isAlive) {
+            if (liveProcess && identity === 'unknown') {
+              this.debug.log('warn',
+                `VM ${vm.id} DB PID ${pid} is alive but identity is UNKNOWN ` +
+                `(transient /proc read failure, internalName='${vm.internalName}') — ` +
+                `treating as ALIVE (NOT tearing down) to avoid a false-crash`
+              )
+            }
             alive++
           } else {
+            if (liveProcess) {
+              this.debug.log('warn',
+                `VM ${vm.id} DB PID ${pid} is alive but is NOT this VM's QEMU ` +
+                `(recycled PID, internalName='${vm.internalName}') — treating as crashed`
+              )
+            }
             crashed++
-            await this.handleCrashedVM(vm.id, pid, vm.MachineConfiguration)
+            // Periodic path: defer to an in-flight operator lifecycle op on this VM
+            // rather than blocking the scan. The op (or a later cycle) finishes it.
+            await this.tryRunDestructiveLocked(vm.id, () =>
+              this.handleCrashedVM(vm.id, pid, vm.MachineConfiguration)
+            )
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Unknown error'
@@ -580,8 +651,43 @@ export class HealthMonitor extends EventEmitter {
 
     for (const vm of vms) {
       const pid = vm.MachineConfiguration?.qemuPid ?? null
-      const pidAlive = pid !== null && this.isProcessAlive(pid)
+      // H7: only promote to 'running' when the live PID is actually THIS VM's QEMU.
+      // After a host reboot the kernel recycles PIDs, so a stale qemuPid may now be
+      // an unrelated host process; promoting on bare liveness corrupts state
+      // permanently.
+      //
+      // LOW-regression fix: gate the promote with the TRI-STATE pidIdentityState
+      // (NOT the fail-closed boolean) and keep it conservative:
+      //   - promote to 'running' ONLY on a definitive 'match'.
+      //   - a live-but-DEFINITIVELY-'mismatch' PID (recycled foreign process) falls
+      //     through to the dead-PID branch and is demoted (unchanged behavior).
+      //   - a live-but-'unknown' PID (TRANSIENT /proc read failure) is SKIPPED: do
+      //     NOT promote (might be foreign) but ALSO do NOT demote/cleanup (might be
+      //     a live VM whose /proc read just flaked) — a later cycle or the operator
+      //     resolves it. The boolean would have demoted it here, falsely tearing
+      //     down a live VM's resources.
+      const liveProcess = pid !== null && this.isProcessAlive(pid)
+      const identity = liveProcess ? pidIdentityState(pid!, vm.internalName) : 'mismatch'
+      const pidAlive = liveProcess && identity === 'match'
       const previousStatus = vm.status
+
+      if (liveProcess && identity === 'unknown') {
+        this.debug.log('warn',
+          `Reconcile: VM ${vm.id} (${previousStatus}) PID ${pid} is alive but identity is ` +
+          `UNKNOWN (transient /proc read failure, internalName='${vm.internalName}') — ` +
+          `SKIPPING (not promoting, not demoting) to avoid a false teardown`
+        )
+        skipped.push(vm.id)
+        results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'skipped', reason: 'identity unknown (transient /proc read)' })
+        continue
+      }
+
+      if (liveProcess && identity === 'mismatch') {
+        this.debug.log('warn',
+          `Reconcile: VM ${vm.id} (${previousStatus}) PID ${pid} is alive but is NOT this ` +
+          `VM's QEMU (recycled PID, internalName='${vm.internalName}') — treating as dead`
+        )
+      }
 
       try {
         if (pidAlive) {
@@ -592,28 +698,33 @@ export class HealthMonitor extends EventEmitter {
           continue
         }
 
-        if (this.config.enableCleanup && vm.MachineConfiguration) {
-          try {
-            await this.cleanupVMResources(vm.id, vm.MachineConfiguration)
-          } catch (cleanupErr) {
-            this.debug.log('warn', `Reconcile cleanup failed for VM ${vm.id}: ${String(cleanupErr)}`)
+        // Startup reconcile runs BEFORE the monitor starts, so there is no monitor
+        // contention; we still take the facade vmLock (blocking) when present so a
+        // concurrent operator op that races startup is serialized correctly.
+        await this.runDestructiveLocked(vm.id, async () => {
+          if (this.config.enableCleanup && vm.MachineConfiguration) {
+            try {
+              await this.cleanupVMResources(vm.id, vm.MachineConfiguration)
+            } catch (cleanupErr) {
+              this.debug.log('warn', `Reconcile cleanup failed for VM ${vm.id}: ${String(cleanupErr)}`)
+            }
           }
-        }
 
-        if (previousStatus === 'rebuilding') {
+          if (previousStatus === 'rebuilding') {
+            await this.db.clearVolatileMachineConfiguration(vm.id)
+            await this.db.updateMachineStatus(vm.id, 'error')
+            resetToError.push(vm.id)
+            results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_error', reason: 'crash during rebuild' })
+            this.debug.log('warn', `Reconcile: VM ${vm.id} stuck 'rebuilding' with no live PID -> 'error'`)
+            return
+          }
+
           await this.db.clearVolatileMachineConfiguration(vm.id)
-          await this.db.updateMachineStatus(vm.id, 'error')
-          resetToError.push(vm.id)
-          results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_error', reason: 'crash during rebuild' })
-          this.debug.log('warn', `Reconcile: VM ${vm.id} stuck 'rebuilding' with no live PID -> 'error'`)
-          continue
-        }
-
-        await this.db.clearVolatileMachineConfiguration(vm.id)
-        await this.db.updateMachineStatus(vm.id, 'off')
-        resetToOff.push(vm.id)
-        results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_off' })
-        this.debug.log('info', `Reconcile: VM ${vm.id} (${previousStatus}) no live PID -> 'off' (TAP preserved)`)
+          await this.db.updateMachineStatus(vm.id, 'off')
+          resetToOff.push(vm.id)
+          results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_off' })
+          this.debug.log('info', `Reconcile: VM ${vm.id} (${previousStatus}) no live PID -> 'off' (TAP preserved)`)
+        })
       } catch (err) {
         skipped.push(vm.id)
         results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'skipped', reason: String(err) })
@@ -676,11 +787,17 @@ export class HealthMonitor extends EventEmitter {
     let cleanupResult: CleanupResult | undefined
 
     if (vmRecord?.MachineConfiguration) {
+      const record = vmRecord
       try {
-        cleanupResult = await this.cleanupVMResources(vmRecord.id, vmRecord.MachineConfiguration)
-        cleanupPerformed = true
+        // Periodic orphan scan: defer the destructive cleanup to an in-flight
+        // operator op on this VM rather than blocking it. The process is already
+        // killed above (identity-checked); only resource/DB cleanup is deferred.
+        await this.tryRunDestructiveLocked(record.id, async () => {
+          cleanupResult = await this.cleanupVMResources(record.id, record.MachineConfiguration!)
+          cleanupPerformed = true
+        })
       } catch (err) {
-        this.debug.log('error', `Resource cleanup failed for orphan VM ${vmRecord.id}: ${String(err)}`)
+        this.debug.log('error', `Resource cleanup failed for orphan VM ${record.id}: ${String(err)}`)
       }
     }
 
@@ -727,6 +844,37 @@ export class HealthMonitor extends EventEmitter {
     // EPERM => alive) so liveness semantics are identical in HealthMonitor,
     // EventHandler and VMLifecycle.
     return sharedIsProcessAlive(pid)
+  }
+
+  /**
+   * Runs a per-VM destructive block under the facade vmLock when present,
+   * BLOCKING until the lock is free. Used by the startup reconcile pass (which
+   * runs before the monitor starts, so there is no scan contention to defer).
+   * If no vmLock was provided (back-compat), runs the block directly.
+   */
+  private async runDestructiveLocked<T> (vmId: string, fn: () => Promise<T>): Promise<T> {
+    if (this.vmLock) {
+      return this.vmLock.runExclusive(vmId, fn)
+    }
+    return fn()
+  }
+
+  /**
+   * Runs a per-VM destructive block under the facade vmLock, NON-BLOCKING: if an
+   * operator lifecycle op already holds (or is queued for) this VM's lock, the
+   * block is SKIPPED so the periodic scan never stalls behind an in-flight op —
+   * that op (or a later scan cycle) re-observes the state and finishes the work.
+   * If no vmLock was provided (back-compat), runs the block directly.
+   */
+  private async tryRunDestructiveLocked (vmId: string, fn: () => Promise<void>): Promise<void> {
+    if (this.vmLock) {
+      const outcome = await this.vmLock.tryRunExclusive(vmId, fn)
+      if (!outcome.ran) {
+        this.debug.log(`Deferring cleanup for VM ${vmId}: a locked lifecycle op is in flight`)
+      }
+      return
+    }
+    await fn()
   }
 
   /**
@@ -907,6 +1055,20 @@ export class HealthMonitor extends EventEmitter {
           await this.db.clearVolatileMachineConfiguration(vmId)
         }
       )
+    }
+
+    // Cgroup scope reclaim — a crashed/orphaned/transient-dead VM leaks its
+    // qemu-<pid>.scope (created when the VM was CPU-pinned). cleanupEmptyScopes is
+    // self-scanning, only removes scopes whose cgroup.procs is empty, swallows its
+    // own errors and is idempotent, so it is safe to call unconditionally on every
+    // cleanup. Best-effort: a failure here must not fail the rest of the cleanup.
+    try {
+      const reclaimed = await this.cgroupsManager.cleanupEmptyScopes()
+      if (reclaimed > 0) {
+        this.debug.log(`Reclaimed ${reclaimed} empty cgroup scope(s) during cleanup for VM ${vmId}`)
+      }
+    } catch (err) {
+      this.debug.log('warn', `Cgroup scope reclaim failed for VM ${vmId}: ${err instanceof Error ? err.message : String(err)}`)
     }
 
     const result = orchestrator.getResult()

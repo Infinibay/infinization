@@ -1,5 +1,6 @@
 import {
   pidBelongsToVM,
+  pidIdentityState,
   isProcessAlive,
   waitForProcessExit,
   forceKillProcess
@@ -35,6 +36,51 @@ describe('processIdentity', () => {
 
     ;(isLinux ? it : it.skip)('returns false when /proc entry is gone (already exited)', () => {
       expect(pidBelongsToVM(DEAD_PID, 'vm-internal')).toBe(false)
+    })
+  })
+
+  describe('pidIdentityState (tri-state, non-destructive)', () => {
+    it("returns 'unknown' on non-linux (cannot read /proc)", () => {
+      Object.defineProperty(process, 'platform', { value: 'darwin' })
+      expect(pidIdentityState(1234, 'vm-internal')).toBe('unknown')
+    })
+
+    it("returns 'unknown' for an empty token (cannot verify)", () => {
+      Object.defineProperty(process, 'platform', { value: 'linux' })
+      expect(pidIdentityState(1234, '')).toBe('unknown')
+    })
+
+    // The runner is a node process, NOT qemu-system: a readable cmdline that is a
+    // DIFFERENT process must be 'mismatch' (definitive), not 'unknown'.
+    ;(isLinux ? it : it.skip)("returns 'mismatch' for a live NON-qemu process", () => {
+      expect(pidIdentityState(process.pid, 'node')).toBe('mismatch')
+    })
+
+    // A gone process (ENOENT) is a LIVENESS fact, not identity: report 'unknown'
+    // here and let isProcessAlive own "gone" so the liveness branch reaps it.
+    ;(isLinux ? it : it.skip)("returns 'unknown' (not mismatch) when /proc entry is gone", () => {
+      expect(pidIdentityState(DEAD_PID, 'vm-internal')).toBe('unknown')
+    })
+
+    // A TRANSIENT, non-definitive read error (here EACCES) must be 'unknown' so a
+    // caller does NOT tear down a live VM on a flaky read.
+    ;(isLinux ? it : it.skip)("returns 'unknown' on a transient (non-ENOENT) /proc read error", () => {
+      const fs = require('fs') as typeof import('fs')
+      jest.spyOn(fs, 'readFileSync').mockImplementation(() => {
+        const err = new Error('permission denied') as NodeJS.ErrnoException
+        err.code = 'EACCES'
+        throw err
+      })
+      expect(pidIdentityState(process.pid, 'vm-internal')).toBe('unknown')
+    })
+
+    // A readable cmdline that contains qemu-system AND the token is a 'match'.
+    ;(isLinux ? it : it.skip)("returns 'match' for a readable qemu-system cmdline containing the token", () => {
+      const fs = require('fs') as typeof import('fs')
+      jest.spyOn(fs, 'readFileSync').mockReturnValue(
+        Buffer.from('qemu-system-x86_64\0-name\0my-vm-token\0', 'utf8')
+      )
+      expect(pidIdentityState(1234, 'my-vm-token')).toBe('match')
     })
   })
 

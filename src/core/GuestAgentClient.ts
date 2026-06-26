@@ -156,9 +156,39 @@ export class GuestAgentClient {
         timeout
       })
 
+      // Register the pending command + timer FIRST, then write. If socket.write
+      // throws synchronously (destroyed socket, EPIPE surfaced sync, etc.) the
+      // pending entry would otherwise leak and its 30s timer fire later with no
+      // owner. Clear both and reject immediately. Mirrors the QMPClient pattern.
       const json = JSON.stringify(message) + '\n'
-      this.socket!.write(json)
+      try {
+        this.socket!.write(json)
+      } catch (err) {
+        clearTimeout(timeout)
+        this.pendingCommands.delete(id)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
     })
+  }
+
+  /**
+   * Execute a command inside the guest VM and return RAW stdout/stderr buffers,
+   * preserving binary output exactly. Use this instead of {@link guestExec} when
+   * the guest command emits non-UTF-8 bytes (a binary, a tarball, a registry
+   * blob); decoding those through `toString('utf-8')` replaces invalid sequences
+   * with U+FFFD and silently corrupts the data.
+   */
+  public async guestExecRaw (
+    command: string,
+    args?: string[],
+    options?: { timeout?: number }
+  ): Promise<{ stdout: Buffer, stderr: Buffer, exitCode: number }> {
+    const { stdout, stderr, exitCode } = await this.guestExecInternal(command, args, options)
+    return {
+      stdout: Buffer.from(stdout ?? '', 'base64'),
+      stderr: Buffer.from(stderr ?? '', 'base64'),
+      exitCode
+    }
   }
 
   /**
@@ -175,6 +205,32 @@ export class GuestAgentClient {
     args?: string[],
     options?: { timeout?: number, cwd?: string }
   ): Promise<{ stdout: string, stderr: string, exitCode: number }> {
+    const { stdout, stderr, exitCode } = await this.guestExecInternal(command, args, options)
+    // Decode the base64 output through 'latin1' (a.k.a. 'binary'): it maps every
+    // byte 0x00-0xFF to a single code point losslessly, so binary output is NOT
+    // mangled the way 'utf-8' would mangle it (invalid sequences -> U+FFFD). Text
+    // callers that only care about ASCII/UTF-8 still get correct results; callers
+    // needing exact bytes should use guestExecRaw.
+    const decode = (b64: string | null | undefined): string =>
+      b64 ? Buffer.from(b64, 'base64').toString('latin1') : ''
+    return {
+      stdout: decode(stdout),
+      stderr: decode(stderr),
+      exitCode
+    }
+  }
+
+  /**
+   * Shared guest-exec driver: spawns the command, polls guest-exec-status until
+   * it exits, and returns the RAW base64 out-data/err-data plus the exit code.
+   * Both {@link guestExec} (string) and {@link guestExecRaw} (Buffer) build on
+   * this so the polling/reaping logic lives in exactly one place.
+   */
+  private async guestExecInternal (
+    command: string,
+    args?: string[],
+    options?: { timeout?: number, cwd?: string }
+  ): Promise<{ stdout: string | null | undefined, stderr: string | null | undefined, exitCode: number }> {
     const execArgs: Record<string, unknown> = {
       path: command,
       'capture-output': true
@@ -202,12 +258,9 @@ export class GuestAgentClient {
         const status = await this.execute<GuestExecStatusResult>('guest-exec-status', { pid })
 
         if (status.exited) {
-          const decode = (b64: string | null | undefined): string =>
-            b64 ? Buffer.from(b64, 'base64').toString('utf-8') : ''
-
           return {
-            stdout: decode(status['out-data']),
-            stderr: decode(status['err-data']),
+            stdout: status['out-data'],
+            stderr: status['err-data'],
             exitCode: status.exitcode ?? -1
           }
         }
@@ -227,6 +280,25 @@ export class GuestAgentClient {
         /* ignore */
       }
     }
+  }
+
+  /**
+   * Quiesce the guest filesystems via `guest-fsfreeze-freeze`. After this
+   * resolves the guest has flushed and frozen all freezable filesystems, so a
+   * disk read taken now is filesystem-consistent. ALWAYS pair with
+   * {@link fsThaw} in a finally — a guest left frozen is unusable.
+   *
+   * @returns the number of filesystems frozen (QGA return value).
+   */
+  public async fsFreeze (): Promise<number> {
+    const frozen = await this.execute<number>('guest-fsfreeze-freeze')
+    return typeof frozen === 'number' ? frozen : 0
+  }
+
+  /** Thaw filesystems frozen by {@link fsFreeze}. Safe to call when not frozen. */
+  public async fsThaw (): Promise<number> {
+    const thawed = await this.execute<number>('guest-fsfreeze-thaw')
+    return typeof thawed === 'number' ? thawed : 0
   }
 
   private handleData (data: Buffer): void {

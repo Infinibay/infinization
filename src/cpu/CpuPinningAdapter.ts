@@ -26,6 +26,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import { Debugger } from '../utils/debug'
 import { CommandExecutor } from '../utils/commandExecutor'
+import { getOnlineCpus } from './CpuListUtils'
 import {
   calculateBasicPinning,
   calculateHybridPinning,
@@ -194,6 +195,32 @@ export class CpuPinningAdapter {
       }
     }
 
+    // Final safety net: never emit an OFFLINE core to numactl --physcpubind.
+    // getNumaTopology already drops offline ids, but we re-check against the
+    // live online set here so a core that went offline between topology caching
+    // and now (or a fallback that kept PRESENT cpus) cannot hard-fail the whole
+    // VM start. Offline cores are dropped, not fatal.
+    const { kept: onlineCores, dropped: offlineCores } = await this.filterOnlineCores(pinning.cores)
+    if (offlineCores.length > 0) {
+      this.debug.log('warn', `Dropping offline cores from CPU pinning: [${offlineCores.join(',')}] (kept [${onlineCores.join(',')}])`)
+    }
+    pinning.cores = onlineCores
+
+    // If every requested core turned out to be offline, skip pinning entirely
+    // rather than emit an empty/invalid --physcpubind and fail the VM start.
+    if (pinning.cores.length === 0) {
+      this.debug.log('warn', 'All requested cores are offline; skipping CPU pinning')
+      return {
+        wrapperCommand: null,
+        wrapperArgs: [],
+        originalCommand,
+        originalArgs,
+        pinningApplied: false,
+        pinnedCores: [],
+        numaNodes: []
+      }
+    }
+
     // Generate numactl arguments
     const wrapperArgs = this.generateNumactlArgs(pinning.cores, pinning.nodes)
 
@@ -277,6 +304,17 @@ export class CpuPinningAdapter {
 
       topology.isNumaSystem = nodeDirs.length > 1
 
+      // The host-wide ONLINE cpu set. A node's cpulist enumerates PRESENT cpus,
+      // which on a host with offline/hot-unplugged cores is a superset of the
+      // online ones. Emitting an offline id to `numactl --physcpubind` makes
+      // numactl exit non-zero and the ENTIRE VM start hard-fails, so we drop
+      // offline ids here (and fall back to keeping all PRESENT cpus when the
+      // online file is unreadable, preserving prior behavior).
+      const onlineCpus = await getOnlineCpus()
+      if (onlineCpus === null) {
+        this.debug.log('warn', 'Could not read online CPU set; numactl pinning will use PRESENT cpus (offline cores may cause VM start to fail)')
+      }
+
       for (const nodeDir of nodeDirs) {
         const nodeId = parseInt(nodeDir.replace('node', ''), 10)
         if (isNaN(nodeId)) continue
@@ -285,7 +323,16 @@ export class CpuPinningAdapter {
         if (!fs.existsSync(cpuListPath)) continue
 
         const cpuList = fs.readFileSync(cpuListPath, 'utf8').trim()
-        const cpus = this.expandCpuList(cpuList)
+        let cpus = this.expandCpuList(cpuList)
+
+        // Prefer the per-node online list when present (most direct source);
+        // otherwise intersect with the host-wide online set.
+        const nodeOnline = this.readNodeOnlineCpus(path.join(nodesDir, nodeDir))
+        if (nodeOnline !== null) {
+          cpus = cpus.filter(c => nodeOnline.has(c))
+        } else if (onlineCpus !== null) {
+          cpus = cpus.filter(c => onlineCpus.has(c))
+        }
 
         topology.nodes.set(nodeId, cpus)
         topology.totalCpus += cpus.length
@@ -340,6 +387,23 @@ export class CpuPinningAdapter {
   }
 
   /**
+   * Reads a node's ONLINE cpu list from /sys/devices/system/node/<n>/online,
+   * the most direct per-node source of which of its cpus are usable. Returns
+   * null when the file is absent/unreadable (e.g. older kernels) so the caller
+   * can fall back to the host-wide online set.
+   */
+  private readNodeOnlineCpus (nodeDir: string): Set<number> | null {
+    try {
+      const onlinePath = path.join(nodeDir, 'online')
+      if (!fs.existsSync(onlinePath)) return null
+      const raw = fs.readFileSync(onlinePath, 'utf8').trim()
+      return new Set(this.expandCpuList(raw))
+    } catch {
+      return null
+    }
+  }
+
+  /**
    * Gets CPU count from /proc/cpuinfo as fallback
    */
   private async getCpuCountFromProc (): Promise<number> {
@@ -376,10 +440,16 @@ export class CpuPinningAdapter {
   }
 
   /**
-   * Validates that requested cores exist on the host
+   * Validates that requested cores are ONLINE on the host.
+   *
+   * getNumaTopology() already drops offline ids, so the topology core set is the
+   * online set on any host where the online files are readable. We additionally
+   * intersect with the host-wide online file directly when available, so that
+   * even if topology fell back to PRESENT cpus, an offline id is still rejected
+   * here rather than handed to numactl (where it hard-fails the VM start).
    *
    * @param cores - Array of CPU core indices to validate
-   * @throws Error if any cores are invalid
+   * @throws Error if any cores are offline/invalid
    */
   async validateCores (cores: number[]): Promise<void> {
     if (!cores || cores.length === 0) return
@@ -390,13 +460,42 @@ export class CpuPinningAdapter {
       nodeCores.forEach(core => allCores.add(core))
     })
 
-    const invalidCores = cores.filter(c => !allCores.has(c))
+    // Intersect the topology cores with the host-wide online set when readable,
+    // so a present-but-offline core is excluded from the "valid" set regardless
+    // of how topology was built.
+    const onlineCpus = await getOnlineCpus()
+    const validCores = onlineCpus
+      ? new Set(Array.from(allCores).filter(c => onlineCpus.has(c)))
+      : allCores
+
+    const invalidCores = cores.filter(c => !validCores.has(c))
     if (invalidCores.length > 0) {
       throw new Error(
-        `Invalid CPU cores: ${invalidCores.join(',')}. ` +
-        `Valid cores: ${Array.from(allCores).sort((a, b) => a - b).join(',')}`
+        `Invalid or offline CPU cores: ${invalidCores.join(',')}. ` +
+        `Valid online cores: ${Array.from(validCores).sort((a, b) => a - b).join(',')}`
       )
     }
+  }
+
+  /**
+   * Filters a list of cores down to the ONLINE set, returning the kept cores and
+   * any that were dropped. Used by generatePinningCommand to degrade gracefully
+   * (drop offline cores) instead of hard-failing the VM start when numactl would
+   * reject an offline --physcpubind id.
+   */
+  private async filterOnlineCores (cores: number[]): Promise<{ kept: number[]; dropped: number[] }> {
+    const onlineCpus = await getOnlineCpus()
+    if (!onlineCpus) {
+      // Online set unreadable: keep cores as-is (prior behavior).
+      return { kept: cores, dropped: [] }
+    }
+    const kept: number[] = []
+    const dropped: number[] = []
+    for (const c of cores) {
+      if (onlineCpus.has(c)) kept.push(c)
+      else dropped.push(c)
+    }
+    return { kept, dropped }
   }
 
   /**

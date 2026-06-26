@@ -92,6 +92,14 @@ interface PrismaMachineConfigurationRecord {
   hugepages?: boolean | null
   // CPU pinning configuration
   cpuPinning?: unknown | null // JSON field from Prisma
+  // NUMA-aware CPU pinning via numactl
+  enableNumaCtlPinning?: boolean | null
+  cpuPinningStrategy?: string | null
+  // Advanced device configuration
+  tpmSocketPath?: string | null
+  virtioDriversIso?: string | null
+  enableAudio?: boolean | null
+  enableUsbTablet?: boolean | null
   // Socket paths for guest agent and infini service
   guestAgentSocketPath?: string | null
   infiniServiceSocketPath?: string | null
@@ -187,6 +195,82 @@ interface PrismaClientLike {
 }
 
 // =============================================================================
+// Shared configuration select
+// =============================================================================
+
+/**
+ * SINGLE SOURCE OF TRUTH for the machineConfiguration `select` used by
+ * findMachineWithConfig and transitionVMStatus. Previously this literal was
+ * duplicated in two places and the two copies could silently drift — dropping a
+ * column from one (but not the other) re-introduced the just-fixed
+ * TPM/guest-agent/virtio/NUMA data-loss bug with NO compile error.
+ *
+ * Two safeguards now make that data loss a COMPILE error instead:
+ *  1. The `satisfies` clause below requires every key of
+ *     `PrismaMachineConfigurationRecord` to be present and set to `true`. Remove
+ *     any column here and the `satisfies` check fails to type-check.
+ *  2. mapToExtendedMachineConfiguration reads these columns with direct typed
+ *     property access (no `as unknown` casts), so a missing field in the record
+ *     interface also fails to compile.
+ *
+ * `as const` preserves the literal `true` types so both protections hold.
+ */
+const MACHINE_CONFIG_SELECT = {
+  machineId: true,
+  qemuPid: true,
+  tapDeviceName: true,
+  qmpSocketPath: true,
+  graphicProtocol: true,
+  graphicPort: true,
+  graphicPassword: true,
+  graphicHost: true,
+  assignedGpuBus: true,
+  // QEMU configuration fields
+  bridge: true,
+  machineType: true,
+  cpuModel: true,
+  diskBus: true,
+  diskCacheMode: true,
+  networkModel: true,
+  networkQueues: true,
+  memoryBalloon: true,
+  // Multi-disk support
+  diskPaths: true,
+  // UEFI firmware configuration
+  uefiFirmware: true,
+  // Hugepages configuration
+  hugepages: true,
+  // CPU pinning configuration
+  cpuPinning: true,
+  // NUMA-aware CPU pinning via numactl
+  enableNumaCtlPinning: true,
+  cpuPinningStrategy: true,
+  // Advanced devices / sockets — previously OMITTED from these selects, which
+  // made mapToExtendedMachineConfiguration read them as null on every start,
+  // silently dropping a VM's TPM (Win11), guest-agent, virtio drivers, audio,
+  // USB tablet and NUMA-pinning config.
+  tpmSocketPath: true,
+  guestAgentSocketPath: true,
+  infiniServiceSocketPath: true,
+  virtioDriversIso: true,
+  enableAudio: true,
+  enableUsbTablet: true
+} as const satisfies Record<keyof PrismaMachineConfigurationRecord, true>
+
+/**
+ * Shared configuration `select` for the lightweight RunningVMRecord queries
+ * (findRunningVMs, findMachinesByStatuses, findMachineByInternalName). These
+ * only need the subset of fields that map to MachineConfigurationRecord.
+ */
+const RUNNING_VM_CONFIG_SELECT = {
+  qemuPid: true,
+  tapDeviceName: true,
+  qmpSocketPath: true,
+  guestAgentSocketPath: true,
+  infiniServiceSocketPath: true
+} as const
+
+// =============================================================================
 // PrismaAdapter Class
 // =============================================================================
 
@@ -266,13 +350,7 @@ export class PrismaAdapter implements DatabaseAdapter {
         where: { internalName },
         include: {
           configuration: {
-            select: {
-              qemuPid: true,
-              tapDeviceName: true,
-              qmpSocketPath: true,
-              guestAgentSocketPath: true,
-              infiniServiceSocketPath: true
-            }
+            select: RUNNING_VM_CONFIG_SELECT
           }
         }
       })
@@ -285,6 +363,9 @@ export class PrismaAdapter implements DatabaseAdapter {
       return {
         id: machine.id,
         status: machine.status,
+        // We queried by this exact internalName, so it is non-null here; fall
+        // back to the queried value if Prisma did not echo the column.
+        internalName: machine.internalName ?? internalName,
         MachineConfiguration: machine.configuration
           ? {
               qemuPid: machine.configuration.qemuPid,
@@ -362,13 +443,7 @@ export class PrismaAdapter implements DatabaseAdapter {
         where: { status: 'running' },
         include: {
           configuration: {
-            select: {
-              qemuPid: true,
-              tapDeviceName: true,
-              qmpSocketPath: true,
-              guestAgentSocketPath: true,
-              infiniServiceSocketPath: true
-            }
+            select: RUNNING_VM_CONFIG_SELECT
           }
         }
       })
@@ -378,6 +453,7 @@ export class PrismaAdapter implements DatabaseAdapter {
       return machines.map(machine => ({
         id: machine.id,
         status: machine.status,
+        internalName: machine.internalName ?? '',
         MachineConfiguration: machine.configuration
           ? {
               qemuPid: machine.configuration.qemuPid,
@@ -410,13 +486,7 @@ export class PrismaAdapter implements DatabaseAdapter {
         where: { status: { in: statuses } },
         include: {
           configuration: {
-            select: {
-              qemuPid: true,
-              tapDeviceName: true,
-              qmpSocketPath: true,
-              guestAgentSocketPath: true,
-              infiniServiceSocketPath: true
-            }
+            select: RUNNING_VM_CONFIG_SELECT
           }
         }
       })
@@ -426,6 +496,7 @@ export class PrismaAdapter implements DatabaseAdapter {
       return machines.map(machine => ({
         id: machine.id,
         status: machine.status,
+        internalName: machine.internalName ?? '',
         MachineConfiguration: machine.configuration
           ? {
               qemuPid: machine.configuration.qemuPid,
@@ -529,46 +600,7 @@ export class PrismaAdapter implements DatabaseAdapter {
         where: { id },
         include: {
           configuration: {
-            select: {
-              machineId: true,
-              qemuPid: true,
-              tapDeviceName: true,
-              qmpSocketPath: true,
-              graphicProtocol: true,
-              graphicPort: true,
-              graphicPassword: true,
-              graphicHost: true,
-              assignedGpuBus: true,
-              // QEMU configuration fields
-              bridge: true,
-              machineType: true,
-              cpuModel: true,
-              diskBus: true,
-              diskCacheMode: true,
-              networkModel: true,
-              networkQueues: true,
-              memoryBalloon: true,
-              // Multi-disk support
-              diskPaths: true,
-              // UEFI firmware configuration
-              uefiFirmware: true,
-              // Hugepages configuration
-              hugepages: true,
-              // CPU pinning configuration
-              cpuPinning: true,
-              // Advanced devices / sockets — previously OMITTED here, which made
-              // mapToExtendedMachineConfiguration read them as null on every
-              // start, silently dropping a VM's TPM (Win11), guest-agent, virtio
-              // drivers, audio, USB tablet and NUMA-pinning config.
-              tpmSocketPath: true,
-              guestAgentSocketPath: true,
-              infiniServiceSocketPath: true,
-              virtioDriversIso: true,
-              enableAudio: true,
-              enableUsbTablet: true,
-              enableNumaCtlPinning: true,
-              cpuPinningStrategy: true
-            }
+            select: MACHINE_CONFIG_SELECT
           },
           firewallRuleSet: {
             include: {
@@ -681,45 +713,7 @@ export class PrismaAdapter implements DatabaseAdapter {
           where: { id: machineId },
           include: {
             configuration: {
-              select: {
-                machineId: true,
-                qemuPid: true,
-                tapDeviceName: true,
-                qmpSocketPath: true,
-                graphicProtocol: true,
-                graphicPort: true,
-                graphicPassword: true,
-                graphicHost: true,
-                assignedGpuBus: true,
-                // QEMU configuration fields
-                bridge: true,
-                machineType: true,
-                cpuModel: true,
-                diskBus: true,
-                diskCacheMode: true,
-                networkModel: true,
-                networkQueues: true,
-                memoryBalloon: true,
-                // Multi-disk support
-                diskPaths: true,
-                // UEFI firmware configuration
-                uefiFirmware: true,
-                // Hugepages configuration
-                hugepages: true,
-                // CPU pinning configuration
-                cpuPinning: true,
-                // Advanced devices / sockets (see findMachineWithConfig) — these
-                // were omitted, so a restart through transitionVMStatus dropped a
-                // Win11 VM's TPM and the guest-agent/virtio/audio/NUMA config.
-                tpmSocketPath: true,
-                guestAgentSocketPath: true,
-                infiniServiceSocketPath: true,
-                virtioDriversIso: true,
-                enableAudio: true,
-                enableUsbTablet: true,
-                enableNumaCtlPinning: true,
-                cpuPinningStrategy: true
-              }
+              select: MACHINE_CONFIG_SELECT
             },
             firewallRuleSet: {
               include: {
@@ -1077,16 +1071,19 @@ export class PrismaAdapter implements DatabaseAdapter {
       hugepages: config.hugepages ?? null,
       // CPU pinning configuration (cgroups-based)
       cpuPinning: this.parseCpuPinning(config.cpuPinning),
-      // NUMA-aware CPU pinning via numactl
-      enableNumaCtlPinning: ((config as unknown as Record<string, unknown>).enableNumaCtlPinning as boolean) ?? null,
-      cpuPinningStrategy: ((config as unknown as Record<string, unknown>).cpuPinningStrategy as string) ?? null,
-      // Advanced device configuration (cast through unknown for forward compatibility)
-      tpmSocketPath: ((config as unknown as Record<string, unknown>).tpmSocketPath as string) ?? null,
-      guestAgentSocketPath: ((config as unknown as Record<string, unknown>).guestAgentSocketPath as string) ?? null,
-      infiniServiceSocketPath: ((config as unknown as Record<string, unknown>).infiniServiceSocketPath as string) ?? null,
-      virtioDriversIso: ((config as unknown as Record<string, unknown>).virtioDriversIso as string) ?? null,
-      enableAudio: ((config as unknown as Record<string, unknown>).enableAudio as boolean) ?? null,
-      enableUsbTablet: ((config as unknown as Record<string, unknown>).enableUsbTablet as boolean) ?? null
+      // NUMA-aware CPU pinning via numactl — now read via direct typed property
+      // access. If a future change drops any of these columns from
+      // MACHINE_CONFIG_SELECT (or from PrismaMachineConfigurationRecord), this
+      // mapper fails to COMPILE rather than silently regressing to null.
+      enableNumaCtlPinning: config.enableNumaCtlPinning ?? null,
+      cpuPinningStrategy: config.cpuPinningStrategy ?? null,
+      // Advanced device configuration
+      tpmSocketPath: config.tpmSocketPath ?? null,
+      guestAgentSocketPath: config.guestAgentSocketPath ?? null,
+      infiniServiceSocketPath: config.infiniServiceSocketPath ?? null,
+      virtioDriversIso: config.virtioDriversIso ?? null,
+      enableAudio: config.enableAudio ?? null,
+      enableUsbTablet: config.enableUsbTablet ?? null
     }
   }
 

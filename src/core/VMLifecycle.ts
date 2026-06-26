@@ -276,9 +276,12 @@ export class VMLifecycle {
           const existingPid = parseInt(pidContent, 10)
 
           if (!isNaN(existingPid) && existingPid > 0) {
-            try {
-              process.kill(existingPid, 0)
-              // Process is alive - conflict
+            // L153: Only treat the pidfile as a real conflict when the live PID is
+            // actually THIS VM's QEMU. A bare process.kill(pid,0) false-positives on
+            // a recycled PID (now an unrelated host process), aborting create with a
+            // spurious CREATE_FAILED. Gate on identity; if it's not our QEMU, the
+            // pidfile is stale/recycled — unlink it and proceed.
+            if (this.isProcessAlive(existingPid) && this.pidBelongsToVM(existingPid, config.internalName)) {
               throw new LifecycleError(
                 LifecycleErrorCode.CREATE_FAILED,
                 `A QEMU process (PID ${existingPid}) is already running with internalName '${config.internalName}'. ` +
@@ -287,15 +290,11 @@ export class VMLifecycle {
                 vmId,
                 { existingPid, pidFilePath: paths.pidFilePath, internalName: config.internalName }
               )
-            } catch (killError) {
-              if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
-                this.debug.log('info', `Process ${existingPid} is dead, removing orphan PID file`)
-                fs.unlinkSync(paths.pidFilePath)
-                this.debug.log('info', `Removed orphan PID file: ${paths.pidFilePath}`)
-              } else {
-                throw killError
-              }
             }
+            // Not alive, or alive but not our QEMU (recycled PID): treat as orphan.
+            this.debug.log('info', `Stale/recycled pidfile PID ${existingPid} (not VM '${config.internalName}' QEMU), removing orphan PID file`)
+            fs.unlinkSync(paths.pidFilePath)
+            this.debug.log('info', `Removed orphan PID file: ${paths.pidFilePath}`)
           } else {
             this.debug.log('warn', `PID file contains invalid content: "${pidContent}", removing`)
             fs.unlinkSync(paths.pidFilePath)
@@ -460,6 +459,18 @@ export class VMLifecycle {
       // Validate hugepages at creation time - check availability and coerce to false if unavailable
       const effectiveHugepages = this.validateHugepages(config.hugepages)
 
+      // H3: Mark the row TRANSIENT ('starting') BEFORE we spawn QEMU. Until now
+      // the row stayed 'off' while QEMU was already live, so the HealthMonitor
+      // orphan scan (lock-free, every 30s) could SIGKILL the just-created VM
+      // because its alive PID had a non-running/non-transient DB row. Setting
+      // 'starting' here puts the row in TRANSIENT_STATUSES for the whole create
+      // window; the updateMachineStatus(vmId, 'running') on success clears it, and
+      // the create-failure cleanup path lands on a terminal 'error' (and startup
+      // reconcileTransientStates resets any dead 'starting' row), so a row is never
+      // stranded. Mirrors start()'s 'off'->'starting' optimistic transition.
+      await this.prisma.updateMachineStatus(vmId, 'starting')
+      this.debug.log(`VM ${vmId} status set to 'starting' before QEMU spawn (H3 orphan-scan guard)`)
+
       // Serialize display-port allocation through QEMU spawn process-wide so two
       // concurrent creates cannot both probe the same free port and hand it to
       // QEMU. Only this brief region is locked (probe -> QEMU binds the port);
@@ -485,7 +496,12 @@ export class VMLifecycle {
             enableNumaCtlPinning: config.enableNumaCtlPinning,
             cpuPinningStrategy: config.cpuPinningStrategy,
             // Host-hardening knobs (now reachable from the public create config).
-            runAsUser: config.runAsUser,
+            // MF-4: fall back to INFINIZATION_QEMU_USER so the -runas privilege
+            // drop is applied uniformly. The explicit per-VM config wins; the env
+            // only fills in when config.runAsUser is unset (?? short-circuits, so
+            // there is no double-apply / conflict). Unset env => undefined =>
+            // current behavior preserved.
+            runAsUser: config.runAsUser ?? process.env.INFINIZATION_QEMU_USER,
             disableSandbox: config.disableSandbox
           }
 
@@ -603,6 +619,17 @@ export class VMLifecycle {
       // 11. Update database status
       await this.prisma.updateMachineStatus(vmId, 'running')
 
+      // 11b. B3 (unattended-install race): if this VM is being created with an
+      // unattended install, register it with the EventHandler BEFORE attaching so
+      // there is no window in which a guest SHUTDOWN/POWERDOWN is treated as
+      // terminal. While marked, the EventHandler defers all SHUTDOWN/POWERDOWN
+      // reaping to the InstallationMonitor (which owns the completion heuristic).
+      // The mark is cleared when the background monitor settles (below).
+      const isInstallingOS = !!(unattendedInstaller && installationIsoPath)
+      if (isInstallingOS) {
+        this.eventHandler.markInstallInProgress(vmId)
+      }
+
       // 12. Attach event handler for monitoring
       await this.eventHandler.attachToVM(vmId, qmpClient)
 
@@ -610,7 +637,6 @@ export class VMLifecycle {
       this.emitEvent('machines', 'create', vmId, { pid, tapDevice })
 
       // 14. Start unattended installation monitoring (if configured)
-      const isInstallingOS = !!(unattendedInstaller && installationIsoPath)
       if (unattendedInstaller && installationIsoPath && qmpClient) {
         this.debug.log('Starting unattended installation monitoring')
 
@@ -635,6 +661,13 @@ export class VMLifecycle {
           .catch((err) => {
             this.debug.log('error', `Unattended installation monitoring error: ${err instanceof Error ? err.message : String(err)}`)
           })
+          .finally(() => {
+            // B3: install settled (success OR failure) — lift the guard so normal
+            // terminal SHUTDOWN/POWERDOWN handling resumes for this VM. The
+            // end-of-install shutdown was already consumed by InstallationMonitor;
+            // from here on a guest power-off is a real power-off.
+            this.eventHandler.clearInstallInProgress(vmId)
+          })
       }
 
       this.debug.log(`VM created successfully: ${vmId}`)
@@ -653,6 +686,11 @@ export class VMLifecycle {
       }
     } catch (error) {
       this.debug.log('error', `Failed to create VM: ${error instanceof Error ? error.message : String(error)}`)
+      // B3: if we marked an install-in-progress but create() failed before the
+      // background monitor's finally could clear it, lift the guard here so a
+      // future re-create of the same vmId is not stuck deferring shutdowns.
+      // Idempotent if never marked / already cleared.
+      this.eventHandler.clearInstallInProgress(vmId)
       await this.cleanup(resources)
       throw this.wrapError(error, LifecycleErrorCode.CREATE_FAILED, vmId)
     }
@@ -687,10 +725,14 @@ export class VMLifecycle {
         )
       }
 
-      // 2. Check if already running
+      // 2. Check if already running. H7/H8 (VMLifecycle side): a bare liveness
+      // check trusts a possibly-recycled DB PID — if that PID now belongs to an
+      // unrelated host process we would short-circuit start() and report the VM
+      // "already running" forever. Gate on identity so only THIS VM's live QEMU
+      // counts as already-running; otherwise fall through to the dead-PID reset.
       if (initialVmConfig.status === 'running') {
         const pid = initialVmConfig.configuration?.qemuPid
-        if (pid && this.isProcessAlive(pid)) {
+        if (pid && this.isProcessAlive(pid) && this.pidBelongsToVM(pid, initialVmConfig.internalName)) {
           return {
             success: true,
             message: `VM ${vmId} is already running`,
@@ -712,7 +754,10 @@ export class VMLifecycle {
       // instead of dead-ending on the orphan-pidfile check.
       if (initialVmConfig.status === 'starting') {
         const stalePid = initialVmConfig.configuration?.qemuPid
-        if (stalePid && this.isProcessAlive(stalePid)) {
+        // Same identity gate as the 'running' branch: only adopt a still-live QEMU
+        // that is actually THIS VM's process; a recycled foreign PID must NOT be
+        // promoted to 'running'.
+        if (stalePid && this.isProcessAlive(stalePid) && this.pidBelongsToVM(stalePid, initialVmConfig.internalName)) {
           await this.prisma.updateMachineStatus(vmId, 'running')
           this.debug.log(`VM ${vmId} was stale 'starting' but PID ${stalePid} is alive -> 'running'`)
           return { success: true, message: `VM ${vmId} is already running`, vmId, timestamp }
@@ -722,40 +767,84 @@ export class VMLifecycle {
         this.debug.log(`VM ${vmId} was stale 'starting' with no live PID, resetting to 'off' (TAP preserved)`)
       }
 
-      // 3. Atomically transition status from 'off' to 'starting' with optimistic locking.
+      // 3. Atomically transition status to 'starting' with optimistic locking.
       // Re-read AFTER any reset above so version/status are current.
+      //
+      // MF-3 (fail-closed): the DB status is the authoritative cross-service
+      // gate. Only a row that is genuinely idle may boot QEMU — that is 'off',
+      // plus 'error' as an explicit recovery-from-failed-start case. ANY other
+      // status (a backend disk-op marker such as 'backing_up'/'restoring'/
+      // 'snapshotting', or 'running'/'suspended'/'starting') means the qcow2 may
+      // be live or being rewritten, so starting QEMU over it risks corruption.
+      // We therefore ALWAYS attempt the transition with a startable status as the
+      // expected base and treat any failure as a HARD refusal — never silently
+      // skip the transition for a non-'off' status. The disk-op markers are
+      // refused inherently because they are not in the startable set; we do not
+      // hardcode the marker strings.
       let vmConfig = initialVmConfig
       let transitionBase = initialVmConfig
       if (initialVmConfig.status === 'running' || initialVmConfig.status === 'starting') {
         const refreshed = await this.prisma.findMachineWithConfig(vmId)
         if (refreshed) transitionBase = refreshed
       }
-      const expectedStatus = (transitionBase.status === 'running' || transitionBase.status === 'starting')
-        ? 'off'
-        : transitionBase.status
-      if (expectedStatus === 'off') {
-        try {
-          const transitionResult = await this.prisma.transitionVMStatus(
-            vmId,
-            'off',
-            'starting',
-            transitionBase.version
-          )
-          vmConfig = transitionResult.vmConfig
-          this.debug.log(`VM ${vmId} status transitioned to 'starting' (version: ${transitionResult.newVersion})`)
-        } catch (error) {
-          // Handle concurrent modification - another process is already starting this VM
-          if (error instanceof PrismaAdapterError && error.code === PrismaAdapterErrorCode.VERSION_CONFLICT) {
+      // The startable set: 'off' (normal idle) and 'error' (recover a previously
+      // failed start). Everything else — including every disk-op marker — is
+      // refused below before any QEMU is spawned.
+      const STARTABLE_STATUSES = ['off', 'error'] as const
+      if (!STARTABLE_STATUSES.includes(transitionBase.status as typeof STARTABLE_STATUSES[number])) {
+        this.debug.log('warn', `VM ${vmId} start refused: status '${transitionBase.status}' is not startable (disk op or already active)`)
+        throw new LifecycleError(
+          LifecycleErrorCode.INVALID_STATE,
+          `VM ${vmId} is not startable in its current state ('${transitionBase.status}')`,
+          vmId,
+          { currentStatus: transitionBase.status, startableStatuses: [...STARTABLE_STATUSES] }
+        )
+      }
+      try {
+        const transitionResult = await this.prisma.transitionVMStatus(
+          vmId,
+          transitionBase.status,
+          'starting',
+          transitionBase.version
+        )
+        vmConfig = transitionResult.vmConfig
+        this.debug.log(`VM ${vmId} status transitioned '${transitionBase.status}' -> 'starting' (version: ${transitionResult.newVersion})`)
+      } catch (error) {
+        // The transition is authoritative: a row that is no longer in the
+        // expected startable status (e.g. a backend just flipped it to a disk-op
+        // marker between our read and the transaction), a version conflict, or a
+        // 0-row race ALL mean another actor owns this row right now. Refuse hard
+        // rather than proceeding — booting QEMU here could corrupt the qcow2.
+        //
+        // - VERSION_CONFLICT  -> optimistic-lock race / concurrent start.
+        // - UPDATE_FAILED     -> status changed under us. If it carries the
+        //   underlying deadlock prismaCode 'P2034' it is a concurrency conflict;
+        //   otherwise the row's status simply is no longer startable.
+        if (error instanceof PrismaAdapterError) {
+          const isP2034Deadlock = error.code === PrismaAdapterErrorCode.UPDATE_FAILED &&
+            (error.details as { prismaCode?: string } | undefined)?.prismaCode === 'P2034'
+          if (error.code === PrismaAdapterErrorCode.VERSION_CONFLICT || isP2034Deadlock) {
             this.debug.log('warn', `VM ${vmId} start request rejected: concurrent modification detected`)
             throw new LifecycleError(
               LifecycleErrorCode.CONCURRENT_MODIFICATION,
-              `VM ${vmId} is being started by another process`,
+              `VM ${vmId} is being modified by another process`,
               vmId,
               { originalError: error.message }
             )
           }
-          throw error
+          if (error.code === PrismaAdapterErrorCode.UPDATE_FAILED) {
+            // Status changed out from under us to a non-startable value.
+            const currentStatus = (error.details as { currentStatus?: string } | undefined)?.currentStatus
+            this.debug.log('warn', `VM ${vmId} start refused: status changed to '${currentStatus ?? 'unknown'}' before transition`)
+            throw new LifecycleError(
+              LifecycleErrorCode.INVALID_STATE,
+              `VM ${vmId} is not startable in its current state${currentStatus ? ` ('${currentStatus}')` : ''}`,
+              vmId,
+              { currentStatus, originalError: error.message }
+            )
+          }
         }
+        throw error
       }
 
       // 4. Validate required hardware configuration exists
@@ -820,10 +909,12 @@ export class VMLifecycle {
           const existingPid = parseInt(pidContent, 10)
 
           if (!isNaN(existingPid) && existingPid > 0) {
-            // Check if process with this PID is still alive
-            try {
-              process.kill(existingPid, 0) // Signal 0 = just check if process exists
-              // Process is alive - this is a real conflict
+            // L57: Only a live PID that is actually THIS VM's QEMU is a real
+            // conflict. A bare process.kill(pid,0) false-positives on a recycled
+            // PID (now an unrelated host process), aborting start with a spurious
+            // START_FAILED. Gate on identity; if it's not our QEMU, the pidfile is
+            // stale/recycled — unlink and proceed.
+            if (this.isProcessAlive(existingPid) && this.pidBelongsToVM(existingPid, vmConfig.internalName)) {
               throw new LifecycleError(
                 LifecycleErrorCode.START_FAILED,
                 `VM ${vmId} appears to have a running QEMU process (PID ${existingPid}) that is not tracked. ` +
@@ -832,17 +923,11 @@ export class VMLifecycle {
                 vmId,
                 { existingPid, pidFilePath }
               )
-            } catch (killError) {
-              if ((killError as NodeJS.ErrnoException).code === 'ESRCH') {
-                // Process not found (ESRCH) - safe to remove orphan PID file
-                this.debug.log('info', `Process ${existingPid} is dead, removing orphan PID file`)
-                fs.unlinkSync(pidFilePath)
-                this.debug.log('info', `Removed orphan PID file: ${pidFilePath}`)
-              } else {
-                // Re-throw LifecycleError or other errors
-                throw killError
-              }
             }
+            // Not alive, or alive but not our QEMU (recycled PID): treat as orphan.
+            this.debug.log('info', `Stale/recycled pidfile PID ${existingPid} (not VM '${vmConfig.internalName}' QEMU), removing orphan PID file`)
+            fs.unlinkSync(pidFilePath)
+            this.debug.log('info', `Removed orphan PID file: ${pidFilePath}`)
           } else {
             // Invalid PID content - safe to remove
             this.debug.log('warn', `PID file contains invalid content: "${pidContent}", removing`)
@@ -922,10 +1007,17 @@ export class VMLifecycle {
       // 11. Create or reuse TAP device (persistent TAP support)
       // Check if a TAP device was preserved from a previous stop (persistent lifecycle)
       let tapDevice: string
+      // L202: a reused persistent TAP must NOT be (re)attached to the bridge until
+      // the fail-closed firewall posture is installed, so the device never sits on
+      // the bridge with no terminal drop. Defer the bridge attach to after the
+      // firewall is applied (below). The new-TAP branch's configure() also attaches
+      // to the bridge, but it does so on a brand-new device that has no carrier
+      // until QEMU connects (which only happens AFTER the firewall block).
+      let deferredBridgeAttach: string | null = null
       const existingTapDevice = vmConfig.configuration?.tapDeviceName
 
       if (existingTapDevice && await this.tapManager.exists(existingTapDevice)) {
-        // Reuse existing TAP device - just reattach to bridge
+        // Reuse existing TAP device - bridge reattach deferred until after firewall.
         this.debug.log(`Reattaching TAP device ${existingTapDevice} for VM: ${vmId}`)
 
         // Check if TAP already has carrier (unexpected in start - could indicate stale QEMU)
@@ -936,20 +1028,24 @@ export class VMLifecycle {
 
         tapDevice = existingTapDevice
         resources.tapWasReused = true // never destroy a persistent reused TAP on failure
-        await this.tapManager.attachToBridge(tapDevice, bridge)
-        this.debug.log(`TAP device ${tapDevice} reattached to bridge ${bridge}`)
+        // L149/L202: record the TAP for cleanup BEFORE the (deferred) bridge attach.
+        resources.tapDevice = tapDevice
+        deferredBridgeAttach = bridge
       } else {
         // Create new TAP device (first start or after host reboot)
         // Note: tapManager.create() proactively cleans up orphaned TAP devices
         this.debug.log(`Creating new TAP device for VM: ${vmId}`)
         tapDevice = await this.tapManager.create(vmId, bridge)
+        // L149: record the freshly-created TAP IMMEDIATELY (before configure()/the
+        // DB write), so cleanup destroys it if configure() or the write throws.
+        // tapWasReused stays false here, keeping the new-branch TAP destroyable.
+        resources.tapDevice = tapDevice
         await this.tapManager.configure(tapDevice, bridge)
         this.debug.log(`TAP device ${tapDevice} created and configured for VM: ${vmId}`)
 
         // Store TAP device name for persistence across stop/start cycles
         await this.prisma.updateMachineConfiguration(vmId, { tapDeviceName: tapDevice })
       }
-      resources.tapDevice = tapDevice
 
       // 12. Setup firewall (persistent chain support)
       // Chain persists across stop/start - only jump rules are attached/detached
@@ -972,6 +1068,14 @@ export class VMLifecycle {
       )
       if (!changed) {
         this.debug.log(`Firewall rules unchanged for VM ${vmId}, skipped re-apply`)
+      }
+
+      // L202: NOW that the VM chain + jump rules + terminal fail-closed drop are in
+      // place, attach the reused TAP to the bridge. (The new-TAP branch already
+      // attached via configure() on a carrier-less device.)
+      if (deferredBridgeAttach) {
+        await this.tapManager.attachToBridge(tapDevice, deferredBridgeAttach)
+        this.debug.log(`TAP device ${tapDevice} reattached to bridge ${deferredBridgeAttach} (after firewall)`)
       }
 
       // 13. Build QEMU command from stored configuration
@@ -1032,7 +1136,16 @@ export class VMLifecycle {
         enableUsbTablet: vmConfig.configuration?.enableUsbTablet,
         // CPU pinning configuration
         enableNumaCtlPinning: vmConfig.configuration?.enableNumaCtlPinning,
-        cpuPinningStrategy: this.validateCpuPinningStrategy(vmConfig.configuration?.cpuPinningStrategy)
+        cpuPinningStrategy: this.validateCpuPinningStrategy(vmConfig.configuration?.cpuPinningStrategy),
+        // MF-4: the -runas privilege drop must survive every restart. create()
+        // applies runAsUser, but start() rebuilds the command from DB config and
+        // historically set neither runAsUser nor disableSandbox, so operator
+        // stop/start, restartVM, and host-reboot recovery relaunched QEMU as
+        // ROOT. Apply the same INFINIZATION_QEMU_USER fallback here so the drop is
+        // uniform across the lifecycle. (disableSandbox is intentionally NOT set:
+        // seccomp must stay on — buildQemuCommand enables it unless explicitly
+        // disabled.) Unset env => undefined => current (root) behavior preserved.
+        runAsUser: process.env.INFINIZATION_QEMU_USER
       }
 
       // 14. Create and start QEMU process. Serialize the port re-probe + spawn

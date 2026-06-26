@@ -276,6 +276,12 @@ export class QemuImgService {
 
       const args: string[] = [
         'convert',
+        // -t none: use a cache mode that bypasses the host page cache for the
+        // OUTPUT image so a crash right after convert returns cannot lose data
+        // still sitting dirty in cache. Callers that durably rename the result
+        // (restore) still fsync, but this hardens the common path and the
+        // backup-write path which does not rename.
+        '-t', 'none',
         '-f', sourceFormat,
         '-O', destFormat
       ]

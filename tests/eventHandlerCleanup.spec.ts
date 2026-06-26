@@ -31,6 +31,11 @@ const MockedCgroupsManager = CgroupsManager as jest.MockedClass<typeof CgroupsMa
 // Mock QMPClient
 class MockQMPClient extends EventEmitter {
   private _isConnected = true
+  // Mirrors QMPClient.isReconnecting(): whether the client still INTENDS to
+  // reconnect after a disconnect. Defaults to false so a plain disconnect is
+  // treated as terminal (the common case for these legacy tests). Tests that
+  // exercise the transient-flap path flip this to true.
+  private _isReconnecting = false
 
   isConnected (): boolean {
     return this._isConnected
@@ -40,8 +45,16 @@ class MockQMPClient extends EventEmitter {
     this._isConnected = connected
   }
 
-  async queryStatus (): Promise<{ status: string }> {
-    return { status: 'running' }
+  isReconnecting (): boolean {
+    return this._isReconnecting
+  }
+
+  setReconnecting (reconnecting: boolean): void {
+    this._isReconnecting = reconnecting
+  }
+
+  async queryStatus (): Promise<{ status: string, running: boolean }> {
+    return { status: 'running', running: true }
   }
 }
 
@@ -77,6 +90,7 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
     mockDb.findRunningVMs.mockResolvedValue([
       {
         id: testVmId,
+        internalName: testVmId,
         status: 'running',
         MachineConfiguration: {
           qmpSocketPath: '/var/run/qemu/test.sock',
@@ -184,6 +198,7 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
       mockDb.findRunningVMs.mockResolvedValue([
         {
           id: testVmId,
+          internalName: testVmId,
           status: 'running',
           MachineConfiguration: {
             qmpSocketPath: '/var/run/qemu/test.sock',
@@ -290,14 +305,59 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
       expect(eventHandler.getAttachedVMs()).toContain(testVmId)
     })
 
-    it('handles detachment on QMP disconnect', async () => {
+    it('detaches on a TERMINAL QMP disconnect (client not reconnecting)', async () => {
       await eventHandler.attachToVM(testVmId, mockQmpClient as any)
       expect(eventHandler.isAttached(testVmId)).toBe(true)
 
-      // Simulate disconnect
+      // Client is NOT reconnecting -> terminal disconnect -> tear down.
+      mockQmpClient.setReconnecting(false)
       mockQmpClient.emit('disconnect')
 
       expect(eventHandler.isAttached(testVmId)).toBe(false)
+    })
+
+    it('H9: does NOT detach on a TRANSIENT disconnect while the client is reconnecting', async () => {
+      await eventHandler.attachToVM(testVmId, mockQmpClient as any)
+      expect(eventHandler.isAttached(testVmId)).toBe(true)
+
+      // Client still intends to reconnect -> transient flap -> keep attachment so
+      // a post-reconnect SHUTDOWN is not missed.
+      mockQmpClient.setReconnecting(true)
+      mockQmpClient.emit('disconnect')
+
+      expect(eventHandler.isAttached(testVmId)).toBe(true)
+    })
+
+    it('H9: tears down ONLY on reconnect_failed and emits vm:stale', async () => {
+      await eventHandler.attachToVM(testVmId, mockQmpClient as any)
+      mockQmpClient.setReconnecting(true)
+
+      // A flap keeps the attachment...
+      mockQmpClient.emit('disconnect')
+      expect(eventHandler.isAttached(testVmId)).toBe(true)
+
+      // ...until the client gives up. reconnect_failed is the teardown point.
+      const stale = jest.fn()
+      eventHandler.on('vm:stale', stale)
+      mockQmpClient.emit('reconnect_failed')
+
+      expect(eventHandler.isAttached(testVmId)).toBe(false)
+      expect(stale).toHaveBeenCalledWith({ vmId: testVmId, reason: 'qmp_reconnect_failed' })
+    })
+
+    it('H9: re-syncs state and emits vm:reconnect on a successful reconnect', async () => {
+      await eventHandler.attachToVM(testVmId, mockQmpClient as any)
+
+      const reconnected = jest.fn()
+      eventHandler.on('vm:reconnect', reconnected)
+
+      mockQmpClient.emit('reconnect')
+      // handleReconnect is async (queryStatus -> updateStatusDirect -> emit)
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      expect(reconnected).toHaveBeenCalledWith({ vmId: testVmId })
+      // Attachment is preserved across a reconnect.
+      expect(eventHandler.isAttached(testVmId)).toBe(true)
     })
 
     it('provides QMP client access for attached VMs', async () => {

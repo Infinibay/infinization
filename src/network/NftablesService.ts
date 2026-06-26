@@ -44,6 +44,7 @@ import {
   DEFAULT_CHAIN_PRIORITY,
   generateVMChainName
 } from '../types/firewall.types'
+import { TAP_NAME_PREFIX } from '../types/network.types'
 
 /** Delay after removing jump rules before flushing chain (ms) */
 const POST_JUMP_REMOVAL_DELAY_MS = 500
@@ -56,6 +57,17 @@ const BASE_FORWARD_CHAIN = 'forward'
 export interface NftablesServiceConfig {
   /** Whether to persist rules to disk after changes (default: true) */
   enablePersistence?: boolean
+  /**
+   * Bridge-family conntrack policy (audit L94). The default established/related rule
+   * and any user ct-state rule require nf_conntrack_bridge / br_netfilter on the host.
+   *   - 'fail' (default): initialize() probes for bridge-conntrack support and THROWS
+   *     a single, actionable error naming the missing modules if unsupported, instead
+   *     of letting every per-VM applyRules() fail opaquely at start time.
+   *   - 'degrade': if the probe fails, log ONE warning and run stateless — the auto
+   *     established/related rule is omitted so VMs can still start (best-effort,
+   *     less precise filtering). Set this only when you accept stateless filtering.
+   */
+  bridgeConntrackMode?: 'fail' | 'degrade'
 }
 
 export class NftablesService {
@@ -67,6 +79,44 @@ export class NftablesService {
   private persistence: NftablesPersistence
   /** Whether to persist rules to disk after changes */
   private enablePersistence: boolean
+  /**
+   * Bridge-family conntrack policy (see NftablesServiceConfig.bridgeConntrackMode).
+   *
+   * STATIC / process-wide (audit MF-5): the host's conntrack capability is a property
+   * of the KERNEL, not of any one NftablesService instance. The backend constructs
+   * several instances (Infinization-owned, VMLifecycle, HealthMonitor, EventHandler,
+   * ...) and only the Infinization-owned one calls initialize(); the instances that
+   * actually apply rules on the VM-start path never do. A per-instance mode/support
+   * field meant the probe result never reached those instances and the established
+   * rule was ALWAYS injected — so on a host without bridge conntrack, even in
+   * 'degrade' mode, the VM-start apply still threw and the VM failed to start. Making
+   * the mode + support SHARED (mirroring the static chainLock) lets the single
+   * memoized probe govern every instance's apply path.
+   *
+   * Default resolved from INFINIZATION_BRIDGE_CONNTRACK_MODE at class-load time; an
+   * explicit `new NftablesService({ bridgeConntrackMode })` overwrites the shared
+   * static (so the existing Infinization.ts construction keeps working).
+   */
+  private static bridgeConntrackMode: 'fail' | 'degrade' =
+    process.env.INFINIZATION_BRIDGE_CONNTRACK_MODE === 'degrade' ? 'degrade' : 'fail'
+  /**
+   * Tri-state result of the one-time bridge-conntrack probe (audit L94 / MF-5).
+   * STATIC / process-wide so the result is visible to every instance's apply path,
+   * not only the instance that ran the probe:
+   *   - null  → not yet probed — treat conntrack as available so a stale read before
+   *             the (awaited) probe completes never wrongly omits the ct-state rule.
+   *   - true  → probe confirmed nf_conntrack_bridge/br_netfilter support.
+   *   - false → probe failed AND mode='degrade' → run stateless (omit ct-state rules).
+   */
+  private static bridgeConntrackSupported: boolean | null = null
+  /**
+   * Memoized one-shot probe (audit MF-5). The probe runs at most ONCE per process: the
+   * first apply on ANY instance (or initialize()) starts it and stores the promise here;
+   * every subsequent call awaits the same promise instead of re-probing the kernel.
+   * In 'fail' mode a rejected probe rejects this promise too, so the first apply of any
+   * instance surfaces the actionable error (and a later apply re-awaits/re-throws).
+   */
+  private static conntrackProbe?: Promise<void>
   /**
    * Serializes mutations to a given VM chain, keyed by chain name, so apply/
    * remove/jump-rule operations on the same chain (and the shared forward chain)
@@ -85,6 +135,13 @@ export class NftablesService {
     this.debug = new Debugger('nftables')
     this.persistence = new NftablesPersistence()
     this.enablePersistence = config.enablePersistence ?? true
+    // An explicit constructor option overwrites the SHARED static mode (audit MF-5):
+    // the policy is process-wide, so the last explicit choice wins for every instance.
+    // Absent an explicit option, keep the static default resolved from
+    // INFINIZATION_BRIDGE_CONNTRACK_MODE at class load.
+    if (config.bridgeConntrackMode !== undefined) {
+      NftablesService.bridgeConntrackMode = config.bridgeConntrackMode
+    }
   }
 
   // ============================================================================
@@ -103,10 +160,117 @@ export class NftablesService {
     // Create table (bridge family for Layer 2 filtering)
     await this.createTableIfNotExists()
 
+    // One-time host-capability preflight (audit L94): the bridge-family chains we
+    // build inject `ct state established,related`, which needs nf_conntrack_bridge /
+    // br_netfilter. Probe ONCE here so a missing module surfaces as a single,
+    // actionable init-time error (or a degraded-mode warning) — not as an opaque
+    // failure on every single VM start. Runs BEFORE the base chain / any VM apply.
+    await this.ensureBridgeConntrackSupport()
+
     // Create base forward chain with hook
     await this.createBaseChainIfNotExists()
 
     this.debug.log('nftables infrastructure initialized successfully')
+  }
+
+  /**
+   * Ensures the one-time bridge-conntrack probe has run, memoized PROCESS-WIDE
+   * (audit MF-5). The first caller — initialize() OR the first apply on ANY instance —
+   * kicks off the probe and stores the promise on the static `conntrackProbe`; every
+   * later caller awaits that same promise instead of re-probing the kernel. In 'fail'
+   * mode a rejected probe leaves the rejected promise memoized, so a subsequent apply
+   * re-awaits and re-throws the same actionable error rather than silently proceeding.
+   */
+  private async ensureBridgeConntrackSupport (): Promise<void> {
+    if (NftablesService.conntrackProbe === undefined) {
+      NftablesService.conntrackProbe = this.runBridgeConntrackProbe()
+    }
+    try {
+      await NftablesService.conntrackProbe
+    } catch (error) {
+      // Do NOT permanently memoize a rejected probe: a transient failure (e.g. a
+      // 'Device or resource busy' collision with other host nft tooling at startup)
+      // would otherwise poison the process-wide static and brick every later
+      // init/apply/cron until a full restart. Clear it so the next caller re-probes
+      // the kernel. SUCCESS and degrade-mode resolutions stay memoized (run once).
+      NftablesService.conntrackProbe = undefined
+      throw error
+    }
+  }
+
+  /**
+   * Probes whether the host supports stateful (conntrack) matching in the BRIDGE
+   * family, which the auto established/related rule and any user ct-state rule rely on
+   * (audit L94). Best-effort `modprobe br_netfilter nf_conntrack_bridge`, then applies
+   * and deletes a throwaway `ct state established` rule in a temporary bridge chain via
+   * a single `nft -f -` transaction.
+   *
+   *   - On success: records support and returns.
+   *   - On failure with mode='fail' (default): throws ONE clear NftablesError naming the
+   *     missing modules, so the operator fixes the host instead of debugging per-VM
+   *     start failures.
+   *   - On failure with mode='degrade': logs one warning and records that ct-state rules
+   *     must be omitted (stateless degraded mode) so VMs can still start.
+   *
+   * Runs at most once per process — callers go through the memoizing
+   * ensureBridgeConntrackSupport() wrapper above.
+   */
+  private async runBridgeConntrackProbe (): Promise<void> {
+    // Best-effort module load. modprobe may be absent (e.g. modules built-in) — that
+    // is fine; the probe below is the real source of truth.
+    try {
+      await this.executor.execute('modprobe', ['br_netfilter', 'nf_conntrack_bridge'])
+      this.debug.log('Loaded bridge conntrack modules (br_netfilter, nf_conntrack_bridge)')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.debug.log('warn', `modprobe br_netfilter nf_conntrack_bridge failed/unavailable (continuing to probe): ${message}`)
+    }
+
+    // Probe: create a throwaway bridge chain, add a `ct state established` rule, then
+    // tear it down — all in ONE atomic `nft -f -` transaction. If conntrack-in-bridge
+    // is unsupported, the kernel rejects the ct-state rule and the whole transaction
+    // rolls back (so the probe leaves no residue).
+    const probeChain = 'infz_ctprobe'
+    const probeRuleset = [
+      `add table ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME}`,
+      `add chain ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} ${probeChain}`,
+      `add rule ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} ${probeChain} ct state established accept`,
+      `delete chain ${INFINIZATION_TABLE_FAMILY} ${INFINIZATION_TABLE_NAME} ${probeChain}`
+    ].join('\n') + '\n'
+
+    try {
+      // Retry a transient 'Device or resource busy' (a real, codebase-acknowledged
+      // condition for nft — see utils/retry) before concluding conntrack is unsupported.
+      await retryOnBusy(async () => await this.execFile(probeRuleset))
+      NftablesService.bridgeConntrackSupported = true
+      this.debug.log('Bridge conntrack probe succeeded — stateful (established/related) filtering available')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      // Best-effort cleanup of the probe chain in case it survived a partial apply.
+      try {
+        await this.exec(['delete', 'chain', INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME, probeChain])
+      } catch { /* chain already gone (transaction rolled back) — ignore */ }
+
+      const diagnostic =
+        'Bridge-family conntrack is unavailable: the kernel rejected a `ct state established` rule in the ' +
+        `${INFINIZATION_TABLE_FAMILY} family. This blocks stateful per-VM firewalling. ` +
+        'Load the required modules on the host: `modprobe br_netfilter nf_conntrack_bridge` ' +
+        '(and ensure they persist across reboots). ' +
+        `Underlying nft error: ${message}`
+
+      if (NftablesService.bridgeConntrackMode === 'degrade') {
+        NftablesService.bridgeConntrackSupported = false
+        this.debug.log('warn', `${diagnostic} — continuing in STATELESS degraded mode (established/related rule omitted; filtering is less precise).`)
+        return
+      }
+
+      NftablesService.bridgeConntrackSupported = false
+      this.debug.log('error', diagnostic)
+      throw this.wrapError(new Error(diagnostic), NftablesErrorCode.COMMAND_FAILED, {
+        command: 'ct-state preflight',
+        args: ['br_netfilter', 'nf_conntrack_bridge']
+      })
+    }
   }
 
   /**
@@ -119,6 +283,14 @@ export class NftablesService {
    * @throws Error if chain creation fails
    */
   async createVMChain (vmId: string, tapDeviceName: string): Promise<string> {
+    // Serialize chain + forward-jump mutations process-wide (same lock as applyRules)
+    // so a concurrent attach/detach/cleanup on the same VM chain cannot interleave
+    // with this create's list-then-add jump-rule sequence.
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.createVMChainUnlocked(vmId, tapDeviceName))
+  }
+
+  private async createVMChainUnlocked (vmId: string, tapDeviceName: string): Promise<string> {
     const chainName = generateVMChainName(vmId)
     this.debug.log(`Creating VM chain: ${chainName} for VM: ${vmId} (TAP: ${tapDeviceName})`)
 
@@ -213,13 +385,24 @@ export class NftablesService {
     }
 
     try {
+      // Establish host bridge-conntrack capability BEFORE building/applying any ruleset
+      // (audit MF-5). This memoized, process-wide probe runs at most once and is what
+      // makes the VM-start path (instances that never call initialize()) honor the
+      // operator's mode: in 'fail' mode a missing module throws the actionable error
+      // HERE (so the VM fails fast with a clear cause); in 'degrade' mode it sets the
+      // shared bridgeConntrackSupported=false so the established rule is omitted below
+      // and the atomic apply does not throw on a host without nf_conntrack_bridge.
+      await this.ensureBridgeConntrackSupport()
+
       // Ensure chain + jump rules exist (idempotent). The atomic ruleset below also
       // re-asserts the chain via `add chain`, but createVMChain wires the jump rules
       // from the base forward chain on first creation.
       const exists = await this.chainExists(chainName)
       if (!exists) {
         this.debug.log(`Chain ${chainName} does not exist, creating it`)
-        await this.createVMChain(vmId, tapDeviceName)
+        // Call the UNLOCKED body: applyRulesUnlocked already holds this VM's chainLock
+        // (KeyedMutex is not re-entrant, so re-locking via createVMChain would deadlock).
+        await this.createVMChainUnlocked(vmId, tapDeviceName)
       }
 
       // Merge rules (VM rules can override department rules)
@@ -227,7 +410,13 @@ export class NftablesService {
 
       // Inject default rule for established/related traffic so connections initiated
       // by the VM (or accepted via explicit rules) keep working under a terminal drop.
-      mergedRules.push(this.getDefaultEstablishedRule())
+      // Omitted in stateless degraded mode (audit L94) where the host lacks bridge
+      // conntrack — injecting a ct-state rule there would make the whole apply throw.
+      // Reads the SHARED static support flag (audit MF-5) just resolved by the probe
+      // above, so this holds on every instance — not only one that called initialize().
+      if (NftablesService.bridgeConntrackSupported !== false) {
+        mergedRules.push(this.getDefaultEstablishedRule())
+      }
 
       // Sort by priority (lower number = evaluated first)
       mergedRules.sort((a, b) => a.priority - b.priority)
@@ -494,6 +683,13 @@ export class NftablesService {
    * @param vmId - The VM identifier
    */
   async flushVMRules (vmId: string): Promise<void> {
+    // Same per-chain lock as applyRules/removeVMChain — a flush must not interleave
+    // with an apply or a jump-rule mutation on this VM's chain.
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.flushVMRulesUnlocked(vmId))
+  }
+
+  private async flushVMRulesUnlocked (vmId: string): Promise<void> {
     const chainName = generateVMChainName(vmId)
     this.debug.log(`Flushing rules from chain: ${chainName}`)
 
@@ -599,6 +795,12 @@ export class NftablesService {
    * @returns The chain name
    */
   async ensureVMChain (vmId: string): Promise<string> {
+    // Serialize against concurrent apply/remove/jump mutations on this VM's chain.
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.ensureVMChainUnlocked(vmId))
+  }
+
+  private async ensureVMChainUnlocked (vmId: string): Promise<string> {
     const chainName = generateVMChainName(vmId)
     this.debug.log(`Ensuring VM chain exists: ${chainName} for VM: ${vmId}`)
 
@@ -616,6 +818,14 @@ export class NftablesService {
         chainName
       ])
       this.debug.log(`VM chain created: ${chainName}`)
+
+      // FAIL-CLOSED (audit L86): we just recreated an EMPTY chain (no terminal drop).
+      // The in-memory rule-hash cache may still hold the hash from before the chain
+      // vanished; if we leave it, the next applyRulesIfChanged() sees a cache HIT and
+      // skips re-applying, booting the VM with an empty chain that falls through to
+      // the base forward `policy accept` — i.e. unrestricted L3. Invalidate the cache
+      // here so the next applyRulesIfChanged() is forced to re-write the terminal drop.
+      this.ruleHashCache.delete(vmId)
       return chainName
     } catch (error) {
       const message = `Failed to ensure VM chain ${chainName}: ${error instanceof Error ? error.message : String(error)}`
@@ -635,22 +845,28 @@ export class NftablesService {
    * @param tapDeviceName - The TAP device name to route traffic from/to
    */
   async attachJumpRules (vmId: string, tapDeviceName: string): Promise<void> {
+    // Serialize forward-jump mutations for this VM chain (audit L102): without the
+    // lock, two concurrent attaches (or an attach racing a detach/cleanup) list the
+    // forward chain at the same time and both decide the jump is absent, appending
+    // duplicates / deleting the wrong handle.
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.attachJumpRulesUnlocked(vmId, tapDeviceName))
+  }
+
+  private async attachJumpRulesUnlocked (vmId: string, tapDeviceName: string): Promise<void> {
     const chainName = generateVMChainName(vmId)
     this.debug.log(`Attaching jump rules for VM ${vmId} (chain: ${chainName}, TAP: ${tapDeviceName})`)
 
     try {
+      // addJumpRules is now idempotent (lists the forward chain and skips already-present
+      // directional jumps), so no "already exists" swallow is needed here.
       await this.addJumpRules(chainName, tapDeviceName)
       this.debug.log(`Jump rules attached for VM ${vmId}`)
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      // If rules already exist, that's fine
-      if (!errorMessage.includes('File exists')) {
-        throw this.wrapError(error, NftablesErrorCode.COMMAND_FAILED, {
-          command: 'attach jump rules',
-          args: [vmId, tapDeviceName]
-        })
-      }
-      this.debug.log(`Jump rules already exist for VM ${vmId}`)
+      throw this.wrapError(error, NftablesErrorCode.COMMAND_FAILED, {
+        command: 'attach jump rules',
+        args: [vmId, tapDeviceName]
+      })
     }
   }
 
@@ -662,6 +878,13 @@ export class NftablesService {
    * @param vmId - The VM identifier
    */
   async detachJumpRules (vmId: string): Promise<void> {
+    // Serialize the list-then-delete-by-handle against concurrent attach/cleanup
+    // on this VM chain (audit L102).
+    return this.chainLock.runExclusive(generateVMChainName(vmId), () =>
+      this.detachJumpRulesUnlocked(vmId))
+  }
+
+  private async detachJumpRulesUnlocked (vmId: string): Promise<void> {
     const chainName = generateVMChainName(vmId)
     this.debug.log(`Detaching jump rules for VM ${vmId} (chain: ${chainName})`)
 
@@ -694,17 +917,40 @@ export class NftablesService {
     vmRules: FirewallRuleInput[],
     defaultAction: FirewallDefaultAction = 'drop'
   ): Promise<{ changed: boolean; result?: FirewallApplyResult }> {
+    // Resolve host bridge-conntrack capability BEFORE hashing (audit MF-5) so the hash
+    // reflects whether the established/related rule will actually be folded in. Without
+    // this, an instance that never called initialize() would hash WITH the ct-state rule
+    // (support still null) while applyRules() — having run the probe — omits it in
+    // degraded mode, so the cached hash would never match and we'd re-apply every time.
+    // The probe is memoized process-wide, so this is a no-op after the first call.
+    await this.ensureBridgeConntrackSupport()
+
     // Compute hash of the merged rules (including default established/related rule)
     // AND the terminal posture — changing the policy must invalidate the cache.
     // This ensures the hash matches the effective rule set applied by applyRules().
     const mergedRules = this.mergeRules(departmentRules, vmRules)
-    mergedRules.push(this.getDefaultEstablishedRule())
+    // Mirror applyRulesUnlocked: only fold in the established/related rule when bridge
+    // conntrack is available, so the cache hash matches the effective applied ruleset
+    // (audit L94 degraded mode). Reads the SHARED static flag (audit MF-5).
+    if (NftablesService.bridgeConntrackSupported !== false) {
+      mergedRules.push(this.getDefaultEstablishedRule())
+    }
     const newHash = this.hashRules(mergedRules, defaultAction)
     const cachedHash = this.ruleHashCache.get(vmId)
 
     if (cachedHash === newHash) {
-      this.debug.log(`Rules unchanged for VM ${vmId} (hash: ${newHash.substring(0, 8)}...), skipping apply`)
-      return { changed: false }
+      // FAIL-CLOSED (audit L86): never trust the in-memory hash over a vanished kernel
+      // chain. If the chain was deleted/recreated-empty out from under us (e.g. a
+      // restart that recreated an empty chain via ensureVMChain), honoring the cache
+      // hit would skip the re-apply and boot the VM WITHOUT its terminal drop. Only
+      // honor the hit when the chain genuinely exists in the kernel; otherwise fall
+      // through and re-write the full ruleset (terminal drop included).
+      const chainName = generateVMChainName(vmId)
+      if (await this.chainExists(chainName)) {
+        this.debug.log(`Rules unchanged for VM ${vmId} (hash: ${newHash.substring(0, 8)}...), skipping apply`)
+        return { changed: false }
+      }
+      this.debug.log('warn', `Cache hit for VM ${vmId} but chain ${chainName} is missing from the kernel — forcing re-apply (fail-closed)`)
     }
 
     this.debug.log(`Rules changed for VM ${vmId} (old: ${cachedHash?.substring(0, 8) ?? 'none'}..., new: ${newHash.substring(0, 8)}...), applying`)
@@ -833,7 +1079,16 @@ export class NftablesService {
   private async addDHCPAllowRules (): Promise<void> {
     this.debug.log('Adding DHCP allow rules to forward chain')
 
-    // Check if DHCP rules already exist by listing the chain
+    // Interface-name wildcard matching the managed TAP devices (e.g. "vnet-*").
+    // Scoping the DHCP accepts to managed interfaces + the exact DHCP flow (audit L98)
+    // closes the bypass where a guest, on ANY bridge the host's forward hook sees,
+    // could spoof bare udp sport/dport 67/68 and have it accepted ABOVE every per-VM
+    // jump — sailing past its terminal drop. We now require BOTH a managed interface
+    // AND the correct sport/dport pair for the direction.
+    const tapWildcard = `${TAP_NAME_PREFIX}*`
+
+    // Check if DHCP rules already exist by listing the chain (idempotent — these are
+    // inserted at base-chain creation AND re-asserted when the chain already exists).
     try {
       const chainOutput = await this.exec([
         'list', 'chain',
@@ -841,9 +1096,11 @@ export class NftablesService {
         BASE_FORWARD_CHAIN
       ])
 
-      // If rules already exist, skip adding them
-      if (chainOutput.includes('udp dport 67') && chainOutput.includes('udp dport 68')) {
-        this.debug.log('DHCP allow rules already exist, skipping')
+      // Match on our scoped comment markers so a partial/legacy rule set is replaced
+      // rather than left in place.
+      if (chainOutput.includes('infinization-dhcp-client-to-server') &&
+          chainOutput.includes('infinization-dhcp-server-to-client')) {
+        this.debug.log('Scoped DHCP allow rules already exist, skipping')
         return
       }
     } catch {
@@ -851,40 +1108,33 @@ export class NftablesService {
     }
 
     try {
-      // Rule 1: Allow DHCP client -> server (DHCPDISCOVER, DHCPREQUEST)
-      // Clients send to UDP port 67, broadcasts from 0.0.0.0:68 to 255.255.255.255:67
+      // Rule 1: Allow DHCP client -> server (DHCPDISCOVER, DHCPREQUEST), scoped to a
+      // managed TAP as the INPUT interface and the canonical client->server flow
+      // (client :68 -> server :67). A guest cannot match this by merely targeting
+      // dport 67 from an arbitrary source port.
       await this.exec([
         'insert', 'rule',
         INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN,
-        'udp', 'dport', '67', 'accept',
-        'comment', '"Allow DHCP client to server"'
+        'iifname', tapWildcard,
+        'udp', 'sport', '68', 'udp', 'dport', '67', 'accept',
+        'comment', '"infinization-dhcp-client-to-server"'
       ])
-      this.debug.log('Added DHCP client->server rule (UDP dport 67)')
+      this.debug.log(`Added scoped DHCP client->server rule (iifname ${tapWildcard}, udp sport 68 dport 67)`)
 
-      // Rule 2: Allow DHCP server -> client (DHCPOFFER, DHCPACK)
-      // Server responds from port 67 to client port 68
+      // Rule 2: Allow DHCP server -> client (DHCPOFFER, DHCPACK), scoped to a managed
+      // TAP as the OUTPUT interface and the server->client flow (server :67 -> client :68).
       await this.exec([
         'insert', 'rule',
         INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
         BASE_FORWARD_CHAIN,
-        'udp', 'dport', '68', 'accept',
-        'comment', '"Allow DHCP server to client"'
+        'oifname', tapWildcard,
+        'udp', 'sport', '67', 'udp', 'dport', '68', 'accept',
+        'comment', '"infinization-dhcp-server-to-client"'
       ])
-      this.debug.log('Added DHCP server->client rule (UDP dport 68)')
+      this.debug.log(`Added scoped DHCP server->client rule (oifname ${tapWildcard}, udp sport 67 dport 68)`)
 
-      // Rule 3: Allow broadcast traffic for DHCP discovery
-      // DHCP uses broadcast when client doesn't have an IP yet
-      await this.exec([
-        'insert', 'rule',
-        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
-        BASE_FORWARD_CHAIN,
-        'pkttype', 'broadcast', 'udp', 'dport', '67', 'accept',
-        'comment', '"Allow DHCP broadcast discovery"'
-      ])
-      this.debug.log('Added DHCP broadcast rule')
-
-      this.debug.log('DHCP allow rules added successfully')
+      this.debug.log('Scoped DHCP allow rules added successfully')
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
       // Log but don't throw - DHCP rules are best-effort
@@ -907,20 +1157,66 @@ export class NftablesService {
     // Jump rule for traffic FROM the VM (input interface is TAP)
     const fromVmTokens: NftablesRuleTokens = ['iifname', tapDeviceName, 'jump', chainName]
 
-    try {
-      // Add both jump rules
-      await this.addRuleTokens(BASE_FORWARD_CHAIN, toVmTokens)
-      await this.addRuleTokens(BASE_FORWARD_CHAIN, fromVmTokens)
+    // Idempotency guard (audit L90), mirroring DepartmentNatService.hasMasquerade:
+    // `nft add rule` does NOT report "File exists" (only add table/chain/element do),
+    // so the old catch-and-ignore was dead code and every attach/reconcile appended
+    // ANOTHER identical jump, accumulating duplicates in the shared forward chain.
+    // Instead list the forward chain ONCE and only add each directional jump that is
+    // not already present. Matching is anchored to the exact `<dir> <tap> jump <chain>`
+    // token sequence so a tap/chain whose name is a prefix of another cannot collide.
+    const existing = await this.listForwardChainText()
+    const toVmPresent = this.forwardHasJump(existing, 'oifname', tapDeviceName, chainName)
+    const fromVmPresent = this.forwardHasJump(existing, 'iifname', tapDeviceName, chainName)
 
-      this.debug.log(`Jump rules added for chain ${chainName}`)
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error)
-      // If rule already exists, that's fine
-      if (!errorMessage.includes('File exists')) {
-        throw error
-      }
-      this.debug.log(`Jump rules already exist for chain ${chainName}`)
+    // Let real exec errors propagate (the dead `File exists` swallow is removed).
+    if (!toVmPresent) {
+      await this.addRuleTokens(BASE_FORWARD_CHAIN, toVmTokens)
+      this.debug.log(`Added to-VM jump rule (oifname ${tapDeviceName} jump ${chainName})`)
+    } else {
+      this.debug.log(`To-VM jump rule already present for chain ${chainName}, skipping`)
     }
+
+    if (!fromVmPresent) {
+      await this.addRuleTokens(BASE_FORWARD_CHAIN, fromVmTokens)
+      this.debug.log(`Added from-VM jump rule (iifname ${tapDeviceName} jump ${chainName})`)
+    } else {
+      this.debug.log(`From-VM jump rule already present for chain ${chainName}, skipping`)
+    }
+
+    this.debug.log(`Jump rules ensured for chain ${chainName}`)
+  }
+
+  /**
+   * Lists the base forward chain ruleset text (best-effort). Returns '' if the chain
+   * cannot be listed (e.g. not yet created) so the caller proceeds to add rules.
+   */
+  private async listForwardChainText (): Promise<string> {
+    try {
+      return await this.exec([
+        'list', 'chain',
+        INFINIZATION_TABLE_FAMILY, INFINIZATION_TABLE_NAME,
+        BASE_FORWARD_CHAIN
+      ])
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * Returns true if the forward-chain text already contains the exact directional
+   * jump `<dir> <tap> jump <chain>`. Anchored on the full token sequence (with word
+   * boundaries) so a prefix-collision (vnet-abc vs vnet-abc1, or vm_abc vs vm_abc1)
+   * does not yield a false positive that would skip installing the real jump.
+   */
+  private forwardHasJump (
+    forwardText: string,
+    direction: 'oifname' | 'iifname',
+    tapDeviceName: string,
+    chainName: string
+  ): boolean {
+    const esc = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`${direction}\\s+"?${esc(tapDeviceName)}"?\\s+jump\\s+${esc(chainName)}\\b`)
+    return re.test(forwardText)
   }
 
   /**

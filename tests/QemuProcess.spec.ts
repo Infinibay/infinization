@@ -9,6 +9,8 @@ import { QemuProcess } from '../src/core/QemuProcess'
 import { QemuCommandBuilder } from '../src/core/QemuCommandBuilder'
 import { spawn } from 'child_process'
 import { promises as fsPromises } from 'fs'
+import * as fs from 'fs'
+import { setLogSink, LogEntry } from '../src/utils/debug'
 
 // Mock child_process.spawn
 jest.mock('child_process', () => ({
@@ -32,6 +34,9 @@ const MockedSpawn = spawn as jest.MockedFunction<typeof spawn>
 const MockedReadFile = fsPromises.readFile as jest.MockedFunction<typeof fsPromises.readFile>
 const MockedAccess = fsPromises.access as jest.MockedFunction<typeof fsPromises.access>
 const MockedUnlink = fsPromises.unlink as jest.MockedFunction<typeof fsPromises.unlink>
+// Sync /proc reader used by processIdentity.pidBelongsToVM (the H2 PID-reuse guard).
+const MockedReadFileSync = fs.readFileSync as jest.MockedFunction<typeof fs.readFileSync>
+const MockedExistsSync = fs.existsSync as jest.MockedFunction<typeof fs.existsSync>
 
 describe('QemuProcess', () => {
   let qemuProcess: QemuProcess
@@ -92,6 +97,15 @@ describe('QemuProcess', () => {
     MockedReadFile.mockResolvedValue('12345')
     MockedAccess.mockResolvedValue(undefined)
     MockedUnlink.mockResolvedValue(undefined)
+
+    // L157: completeStart() now verifies the adopted pidfile PID via pidBelongsToVM()
+    // (reads /proc/<pid>/cmdline through fs.readFileSync). Default that read to a
+    // cmdline that DOES look like this VM's QEMU so happy-path daemonized starts adopt
+    // the PID; identity-guard tests override this per-case.
+    MockedExistsSync.mockReturnValue(false)
+    MockedReadFileSync.mockReturnValue(
+      '/usr/bin/qemu-system-x86_64\0-pidfile\0/var/run/qemu/test.pid\0-qmp\0unix:/var/run/qemu/test.sock,server,nowait' as any
+    )
 
     qemuProcess = new QemuProcess(testVmId, mockCommandBuilder)
   })
@@ -265,12 +279,25 @@ describe('QemuProcess', () => {
     it('escalates to SIGKILL after the graceful timeout', async () => {
       MockedAccess.mockResolvedValue(undefined)
       await qemuProcess.start()
-      const killSpy = mockKill({ aliveForSig0: true }) // never exits gracefully
+
+      // Survive SIGTERM (stays alive through the identity-checked grace window) but die
+      // once SIGKILL lands, so forceKill()'s escalation reaches SIGKILL and confirms.
+      let sigkilled = false
+      const killSpy = jest.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+        if (sig === 'SIGKILL') sigkilled = true
+        if (sig === 0) {
+          if (!sigkilled) return true // alive until SIGKILL is delivered
+          const err = new Error('ESRCH') as NodeJS.ErrnoException
+          err.code = 'ESRCH'
+          throw err
+        }
+        return true
+      }) as never)
 
       await qemuProcess.stop(50).catch(() => { /* forceKill may throw if unreaped */ })
 
       expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGKILL')
-    })
+    }, 20000) // identity-checked SIGTERM grace (5s) + SIGKILL confirm runs longer than the default
 
     it('does nothing if process is not running', async () => {
       await qemuProcess.stop()
@@ -293,15 +320,40 @@ describe('QemuProcess', () => {
       mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
     })
 
-    it('sends SIGKILL to the daemon PID and confirms it is gone', async () => {
+    it('signals the daemon PID (identity-checked escalation) and confirms it is gone', async () => {
       MockedAccess.mockResolvedValue(undefined)
       await qemuProcess.start()
+      // Process dies on the first SIGTERM, so the identity-checked escalation resolves
+      // gracefully without needing SIGKILL. The destructive signal targets the daemon PID.
       const killSpy = mockKill({ aliveForSig0: false })
 
       await qemuProcess.forceKill()
 
-      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGKILL')
+      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGTERM')
+      expect(qemuProcess.getPid()).toBeNull()
     })
+
+    it('escalates to SIGKILL on the daemon PID when SIGTERM does not kill it', async () => {
+      MockedAccess.mockResolvedValue(undefined)
+      await qemuProcess.start()
+
+      let sigkilled = false
+      const killSpy = jest.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+        if (sig === 'SIGKILL') sigkilled = true
+        if (sig === 0) {
+          if (!sigkilled) return true // survives SIGTERM grace window
+          const err = new Error('ESRCH') as NodeJS.ErrnoException
+          err.code = 'ESRCH'
+          throw err
+        }
+        return true
+      }) as never)
+
+      await qemuProcess.forceKill()
+
+      expect(killSpy).toHaveBeenCalledWith(testPid, 'SIGKILL')
+      expect(qemuProcess.getPid()).toBeNull()
+    }, 20000)
 
     it('handles an already-dead process without throwing', async () => {
       MockedAccess.mockResolvedValue(undefined)
@@ -309,6 +361,123 @@ describe('QemuProcess', () => {
       mockKill({ aliveForSig0: false })
 
       await expect(qemuProcess.forceKill()).resolves.toBeUndefined()
+    })
+  })
+
+  // ===========================================================================
+  // H2 / L61 — PID-reuse guard on destructive signals.
+  //
+  // forceKill()/stop() must verify (via /proc) that the recorded PID is still THIS
+  // VM's QEMU before signalling it. The check lives in processIdentity and reads
+  // /proc/<pid>/cmdline (fs.readFileSync). It is Linux-only — on other platforms
+  // pidBelongsToVM() short-circuits to true, so these assertions only hold on Linux.
+  // ===========================================================================
+  const describeOnLinux = process.platform === 'linux' ? describe : describe.skip
+
+  describeOnLinux('forceKill identity guard (H2/L61)', () => {
+    const pidFilePath = '/var/run/qemu/test.pid'
+
+    beforeEach(() => {
+      qemuProcess.setPidFilePath(pidFilePath)
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
+      MockedAccess.mockResolvedValue(undefined)
+    })
+
+    it('does NOT send SIGTERM/SIGKILL and preserves getPid() when identity FAILS', async () => {
+      await qemuProcess.start() // adopts daemon PID 12345 from the pidfile
+
+      // /proc/<pid>/cmdline does NOT look like this VM's QEMU (no token, not qemu-system)
+      // -> pidBelongsToVM() returns false -> forceKillProcess() skips the signal.
+      MockedReadFileSync.mockReturnValue('/usr/bin/postgres --some-flag' as any)
+      const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true as never)
+
+      await expect(qemuProcess.forceKill()).rejects.toThrow(/identity verification|fail-closed/i)
+
+      // No destructive signal was ever sent (signal 0 liveness probes are allowed).
+      const destructive = killSpy.mock.calls.filter(([, sig]) => sig === 'SIGTERM' || sig === 'SIGKILL')
+      expect(destructive).toHaveLength(0)
+      // PID is preserved so the caller can alarm — the VM was NOT reaped.
+      expect(qemuProcess.getPid()).toBe(testPid)
+    })
+
+    it('SENDS SIGKILL when identity verifies', async () => {
+      await qemuProcess.start()
+
+      // /proc/<pid>/cmdline matches: looks like qemu-system AND contains the token
+      // (the pidfile path the command builder embeds in the cmdline).
+      const cmdline = `/usr/bin/qemu-system-x86_64 -pidfile ${pidFilePath} -qmp unix:/x.sock`
+      MockedReadFileSync.mockReturnValue(cmdline as any)
+
+      const killSpy = jest.spyOn(process, 'kill').mockImplementation(((pid: number, sig?: string | number) => {
+        if (sig === 0) {
+          // After SIGTERM/SIGKILL, report the process as gone so forceKill confirms.
+          const err = new Error('ESRCH') as NodeJS.ErrnoException
+          err.code = 'ESRCH'
+          throw err
+        }
+        return true
+      }) as never)
+
+      await qemuProcess.forceKill()
+
+      const signalled = killSpy.mock.calls.map(([, sig]) => sig)
+      // Identity-checked escalation issues SIGTERM first, then resolves once gone.
+      expect(signalled).toContain('SIGTERM')
+      expect(qemuProcess.getPid()).toBeNull()
+    })
+
+    it('FAILS CLOSED (no signal, pid preserved) when no identity token can be derived', async () => {
+      await qemuProcess.start()
+
+      // Strip every source of a token: no explicit token, no pidfile path, builder
+      // returns null, no QMP socket path. getIdentityToken() -> null -> refuse to kill.
+      ;(qemuProcess as any).pidFilePath = null
+      ;(qemuProcess as any).qmpSocketPath = null
+      mockCommandBuilder.getPidfilePath.mockReturnValue(null)
+
+      const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => true as never)
+
+      await expect(qemuProcess.forceKill()).rejects.toThrow(/identity token unknown|fail-closed/i)
+
+      const destructive = killSpy.mock.calls.filter(([, sig]) => sig === 'SIGTERM' || sig === 'SIGKILL')
+      expect(destructive).toHaveLength(0)
+      expect(qemuProcess.getPid()).toBe(testPid)
+    })
+  })
+
+  // ===========================================================================
+  // L186 — spawn-log redaction. A display password placed in argv (legacy
+  // SpiceConfig path) must be redacted to `password=***` in the logged command.
+  // ===========================================================================
+  describe('spawn-log redaction (L186)', () => {
+    afterEach(() => {
+      setLogSink(null)
+    })
+
+    it('redacts a display password in the "Full command" log line', async () => {
+      const entries: LogEntry[] = []
+      setLogSink((e) => entries.push(e))
+
+      // argv carries a SPICE password sub-option.
+      mockCommandBuilder.buildCommand.mockReturnValue({
+        command: '/usr/bin/qemu-system-x86_64',
+        args: ['-spice', 'port=5901,addr=0.0.0.0,password=SuperSecret123']
+      })
+      mockProcess.on.mockImplementation((event: string, callback: (...cbArgs: any[]) => void) => mockProcess)
+      MockedAccess.mockResolvedValue(undefined)
+      qemuProcess.setQmpSocketPath('/var/run/qemu/test.sock')
+      qemuProcess.setPidFilePath('/var/run/qemu/test.pid')
+
+      await qemuProcess.start()
+
+      const fullCmd = entries.find(e => e.message.startsWith('Full command:'))
+      expect(fullCmd).toBeDefined()
+      expect(fullCmd!.message).toContain('password=***')
+      expect(fullCmd!.message).not.toContain('SuperSecret123')
+
+      // The per-arg loop must also be redacted (no cleartext anywhere in the logs).
+      const leaked = entries.filter(e => e.message.includes('SuperSecret123'))
+      expect(leaked).toHaveLength(0)
     })
   })
 

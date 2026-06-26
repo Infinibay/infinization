@@ -22,15 +22,30 @@ import { constants as fsConstants } from 'fs'
 import * as path from 'path'
 import { CommandExecutor } from '../utils/commandExecutor'
 import { Debugger } from '../utils/debug'
+import { getOnlineCpus, parseCpuList, ONLINE_CPUS_PATH } from '../cpu/CpuListUtils'
 
-/** Base path for cgroups v2 unified hierarchy */
-const CGROUPS_V2_BASE = '/sys/fs/cgroup'
+/** Default base path for cgroups v2 unified hierarchy */
+const DEFAULT_CGROUPS_V2_BASE = '/sys/fs/cgroup'
 
-/** Controller file that indicates cgroups v2 is active */
-const CGROUPS_V2_CONTROLLERS = '/sys/fs/cgroup/cgroup.controllers'
+/** Default sysfs root for NUMA node topology (cpuset.mems derivation). */
+const DEFAULT_NODE_SYSFS_BASE = '/sys/devices/system/node'
 
-/** Path for Infinization's cgroup slice */
-const INFINIZATION_SLICE = '/sys/fs/cgroup/infinization.slice'
+/**
+ * Optional overrides for the host paths CgroupsManager reads/writes. Production
+ * leaves these unset and the real sysfs locations are used; tests pass a
+ * temp-dir-backed fake cgroup/sysfs tree so the real cpuset/mems/online-CPU and
+ * root->slice delegation logic can run without root or a live kernel.
+ */
+export interface CgroupsManagerOptions {
+  /** cgroups v2 unified hierarchy root (default /sys/fs/cgroup). */
+  cgroupsV2Base?: string
+  /** Infinization slice path (default <base>/infinization.slice). */
+  infinizationSlice?: string
+  /** File listing ONLINE cpu ids (default /sys/devices/system/cpu/online). */
+  onlineCpusPath?: string
+  /** Root of per-node NUMA sysfs dirs (default /sys/devices/system/node). */
+  nodeSysfsBase?: string
+}
 
 /** Outcome of an applyCpuPinning() attempt. `applied` reflects REALITY so the
  *  caller never records requested-but-unhonored cores as if they were honored. */
@@ -48,9 +63,22 @@ export class CgroupsManager {
   private debug: Debugger
   private cgroupsV2Available: boolean | null = null
 
-  constructor () {
+  /** Resolved host paths (overridable for tests via CgroupsManagerOptions). */
+  private readonly cgroupsV2Base: string
+  private readonly cgroupsV2Controllers: string
+  private readonly infinizationSlice: string
+  private readonly onlineCpusPath: string
+  private readonly nodeSysfsBase: string
+
+  constructor (options: CgroupsManagerOptions = {}) {
     this.executor = new CommandExecutor()
     this.debug = new Debugger('cgroups-manager')
+
+    this.cgroupsV2Base = options.cgroupsV2Base ?? DEFAULT_CGROUPS_V2_BASE
+    this.cgroupsV2Controllers = path.join(this.cgroupsV2Base, 'cgroup.controllers')
+    this.infinizationSlice = options.infinizationSlice ?? path.join(this.cgroupsV2Base, 'infinization.slice')
+    this.onlineCpusPath = options.onlineCpusPath ?? ONLINE_CPUS_PATH
+    this.nodeSysfsBase = options.nodeSysfsBase ?? DEFAULT_NODE_SYSFS_BASE
   }
 
   /**
@@ -83,7 +111,7 @@ export class CgroupsManager {
 
     // Create unique scope name for this VM process
     const scopeName = `qemu-${pid}.scope`
-    const scopePath = path.join(INFINIZATION_SLICE, scopeName)
+    const scopePath = path.join(this.infinizationSlice, scopeName)
 
     try {
       // Ensure the infinization slice exists
@@ -138,14 +166,14 @@ export class CgroupsManager {
     let cleanedCount = 0
 
     try {
-      if (!await this.pathExists(INFINIZATION_SLICE)) {
+      if (!await this.pathExists(this.infinizationSlice)) {
         return 0
       }
 
-      const entries = await fs.readdir(INFINIZATION_SLICE)
+      const entries = await fs.readdir(this.infinizationSlice)
       for (const entry of entries) {
         if (entry.startsWith('qemu-') && entry.endsWith('.scope')) {
-          const scopePath = path.join(INFINIZATION_SLICE, entry)
+          const scopePath = path.join(this.infinizationSlice, entry)
           // Check if this scope has any active processes
           const procsPath = path.join(scopePath, 'cgroup.procs')
           if (await this.pathExists(procsPath)) {
@@ -220,7 +248,7 @@ export class CgroupsManager {
     // offline or sparse CPUs (e.g. ids 0-3,8-11), a count-based check wrongly
     // accepts/rejects ids. Fall back to a 0..count-1 range only if the online set
     // can't be read.
-    const onlineCpus = await this.getOnlineCpus()
+    const onlineCpus = await getOnlineCpus(this.onlineCpusPath)
     if (onlineCpus) {
       const invalidCores = uniqueCores.filter(c => !onlineCpus.has(c))
       if (invalidCores.length > 0) {
@@ -242,38 +270,6 @@ export class CgroupsManager {
   }
 
   /**
-   * Reads the set of ONLINE CPU ids from /sys/devices/system/cpu/online
-   * (e.g. "0-3,8-11" -> {0,1,2,3,8,9,10,11}). Returns null if unreadable.
-   */
-  private async getOnlineCpus (): Promise<Set<number> | null> {
-    try {
-      const raw = await fs.readFile('/sys/devices/system/cpu/online', 'utf8')
-      return this.parseCpuList(raw.trim())
-    } catch {
-      return null
-    }
-  }
-
-  /** Parses a Linux CPU-list string ("0-3,8,10-11") into a Set of ids. */
-  private parseCpuList (list: string): Set<number> {
-    const result = new Set<number>()
-    for (const part of list.split(',')) {
-      const trimmed = part.trim()
-      if (!trimmed) continue
-      if (trimmed.includes('-')) {
-        const [start, end] = trimmed.split('-').map(n => parseInt(n, 10))
-        if (!isNaN(start) && !isNaN(end) && start <= end) {
-          for (let i = start; i <= end; i++) result.add(i)
-        }
-      } else {
-        const n = parseInt(trimmed, 10)
-        if (!isNaN(n)) result.add(n)
-      }
-    }
-    return result
-  }
-
-  /**
    * Returns the NUMA memory node ids that own the given cores, by scanning each
    * node's cpulist under /sys/devices/system/node. Used to set cpuset.mems
    * correctly instead of hardcoding node 0 (which forces all-remote memory for
@@ -281,14 +277,14 @@ export class CgroupsManager {
    */
   private async getMemoryNodesForCores (cores: number[]): Promise<string[]> {
     try {
-      const nodeDirs = (await fs.readdir('/sys/devices/system/node'))
+      const nodeDirs = (await fs.readdir(this.nodeSysfsBase))
         .filter(d => /^node\d+$/.test(d))
       const nodes = new Set<number>()
       for (const dir of nodeDirs) {
         const nodeId = parseInt(dir.replace('node', ''), 10)
         try {
-          const cpulist = await fs.readFile(`/sys/devices/system/node/${dir}/cpulist`, 'utf8')
-          const nodeCpus = this.parseCpuList(cpulist.trim())
+          const cpulist = await fs.readFile(path.join(this.nodeSysfsBase, dir, 'cpulist'), 'utf8')
+          const nodeCpus = parseCpuList(cpulist.trim())
           if (cores.some(c => nodeCpus.has(c))) nodes.add(nodeId)
         } catch { /* skip unreadable node */ }
       }
@@ -324,15 +320,15 @@ export class CgroupsManager {
 
     // Check if the cgroups v2 controller file exists
     // This file only exists when cgroups v2 unified hierarchy is active
-    if (!await this.pathExists(CGROUPS_V2_CONTROLLERS)) {
-      this.debug.log('info', `Cgroups v2 not detected: ${CGROUPS_V2_CONTROLLERS} does not exist`)
+    if (!await this.pathExists(this.cgroupsV2Controllers)) {
+      this.debug.log('info', `Cgroups v2 not detected: ${this.cgroupsV2Controllers} does not exist`)
       this.cgroupsV2Available = false
       return false
     }
 
     // Check if cpuset controller is available
     try {
-      const controllers = await fs.readFile(CGROUPS_V2_CONTROLLERS, 'utf8')
+      const controllers = await fs.readFile(this.cgroupsV2Controllers, 'utf8')
       if (!controllers.includes('cpuset')) {
         this.debug.log('warn', 'Cgroups v2 available but cpuset controller not enabled')
         this.cgroupsV2Available = false
@@ -346,9 +342,9 @@ export class CgroupsManager {
 
     // Verify we can write to the cgroups hierarchy
     try {
-      await fs.access(CGROUPS_V2_BASE, fsConstants.W_OK)
+      await fs.access(this.cgroupsV2Base, fsConstants.W_OK)
     } catch {
-      this.debug.log('warn', `No write access to ${CGROUPS_V2_BASE}`)
+      this.debug.log('warn', `No write access to ${this.cgroupsV2Base}`)
       this.cgroupsV2Available = false
       return false
     }
@@ -359,22 +355,29 @@ export class CgroupsManager {
   }
 
   /**
-   * Ensures the infinization slice directory exists.
+   * Ensures the infinization slice directory exists AND that the root->slice
+   * +cpuset delegation is in place.
+   *
+   * The delegation step must run on EVERY call, not only when we create the
+   * slice. If the slice pre-exists (created by systemd, an external tool, or a
+   * prior run that crashed before delegating), an early return would leave
+   * cpuset undelegated and cpuset.cpus would be silently ignored for every
+   * scope under it. enableCpusetInParent() is idempotent (it no-ops when cpuset
+   * is already present), so calling it unconditionally is safe and cheap.
    */
   private async ensureInfinizationSlice (): Promise<void> {
-    if (await this.pathExists(INFINIZATION_SLICE)) {
-      return
+    // Create the slice only if missing.
+    if (!await this.pathExists(this.infinizationSlice)) {
+      try {
+        await fs.mkdir(this.infinizationSlice, { recursive: true })
+        this.debug.log(`Created infinization slice: ${this.infinizationSlice}`)
+      } catch (error) {
+        throw new Error(`Failed to create infinization slice: ${error instanceof Error ? error.message : String(error)}`)
+      }
     }
 
-    try {
-      await fs.mkdir(INFINIZATION_SLICE, { recursive: true })
-      this.debug.log(`Created infinization slice: ${INFINIZATION_SLICE}`)
-
-      // Enable cpuset controller for the slice
-      await this.enableCpusetInParent()
-    } catch (error) {
-      throw new Error(`Failed to create infinization slice: ${error instanceof Error ? error.message : String(error)}`)
-    }
+    // ALWAYS (re)assert root->slice +cpuset delegation — idempotent.
+    await this.enableCpusetInParent()
   }
 
   /**
@@ -382,7 +385,7 @@ export class CgroupsManager {
    * This is required before we can use cpuset in child cgroups.
    */
   private async enableCpusetInParent (): Promise<void> {
-    const subtreeControlPath = path.join(CGROUPS_V2_BASE, 'cgroup.subtree_control')
+    const subtreeControlPath = path.join(this.cgroupsV2Base, 'cgroup.subtree_control')
     try {
       // Read current enabled controllers
       const current = await fs.readFile(subtreeControlPath, 'utf8')
@@ -422,7 +425,7 @@ export class CgroupsManager {
    */
   private async enableCpusetController (): Promise<void> {
     // Enable cpuset in the infinization slice's subtree_control
-    const sliceSubtreeControl = path.join(INFINIZATION_SLICE, 'cgroup.subtree_control')
+    const sliceSubtreeControl = path.join(this.infinizationSlice, 'cgroup.subtree_control')
     try {
       const current = await fs.readFile(sliceSubtreeControl, 'utf8')
       if (!current.includes('cpuset')) {

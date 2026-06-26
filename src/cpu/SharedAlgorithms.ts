@@ -105,6 +105,38 @@ export class SeededRandom {
 // =============================================================================
 
 /**
+ * Convert object-based topology (from sysfs) to normalized Map format.
+ *
+ * @param topology - Object with string keys ('node0', 'node1') and string[] CPU values
+ * @returns NormalizedNumaTopology with number-based keys and values
+ *
+ * @example
+ * ```typescript
+ * const objTopology = { 'node0': ['0', '1', '2', '3'], 'node1': ['4', '5', '6', '7'] }
+ * const normalized = normalizeObjectTopology(objTopology)
+ * // normalized.nodes = Map { 0 => [0,1,2,3], 1 => [4,5,6,7] }
+ * ```
+ */
+export function normalizeObjectTopology (
+  topology: { [key: string]: string[] }
+): NormalizedNumaTopology {
+  const nodes = new Map<number, number[]>()
+  let totalCpus = 0
+
+  for (const [nodeKey, cpuStrings] of Object.entries(topology)) {
+    // Extract node ID from 'node0', 'node1', etc.
+    const nodeId = parseInt(nodeKey.replace('node', ''), 10)
+    if (isNaN(nodeId)) continue
+
+    const cpus = cpuStrings.map(s => parseInt(s, 10)).filter(n => !isNaN(n))
+    nodes.set(nodeId, cpus)
+    totalCpus += cpus.length
+  }
+
+  return { nodes, totalCpus }
+}
+
+/**
  * Convert Map-based topology to normalized format (pass-through for type consistency).
  *
  * @param topology - Map with number keys and number[] CPU values
@@ -233,6 +265,9 @@ export function calculateBasicPinning (
   }
 }
 
+// NOTE: calculateHybridPinning follows; formatCpuRanges is appended after it in
+// the "Utility Functions" section to match the backend copy's ordering.
+
 /**
  * Calculate hybrid (randomized) CPU pinning allocation.
  *
@@ -345,4 +380,38 @@ export function calculateHybridPinning (
     vcpuToCoreMapping,
     vcpuAssignments
   }
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+/**
+ * Format a list of CPU indices as compact ranges.
+ * For example, [0,1,2,3,5,7,8,9] becomes "0-3,5,7-9"
+ *
+ * @param cpus - Array of CPU indices to format
+ * @returns Formatted CPU range string
+ */
+export function formatCpuRanges (cpus: number[]): string {
+  if (cpus.length === 0) return ''
+  if (cpus.length === 1) return cpus[0].toString()
+
+  const sorted = [...cpus].sort((a, b) => a - b)
+  const ranges: string[] = []
+
+  let rangeStart = sorted[0]
+  let rangeEnd = rangeStart
+
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === rangeEnd + 1) {
+      rangeEnd = sorted[i]
+    } else {
+      ranges.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`)
+      rangeStart = rangeEnd = sorted[i]
+    }
+  }
+
+  ranges.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`)
+  return ranges.join(',')
 }

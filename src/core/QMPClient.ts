@@ -129,6 +129,16 @@ export class QMPClient extends EventEmitter {
         reject(new Error(`Connection timeout after ${this.options.connectTimeout}ms`))
       }, this.options.connectTimeout)
 
+      // L233: a reconnect (or any second connect()) overwrites this.socket. The previous
+      // socket — and the 'data'/'close' listeners attached below — would otherwise leak
+      // on every flap, eventually tripping MaxListenersExceededWarning and keeping dead
+      // sockets around. Tear the old one down before creating the new connection.
+      if (this.socket) {
+        this.socket.removeAllListeners()
+        this.socket.destroy()
+        this.socket = null
+      }
+
       this.socket = net.createConnection(this.socketPath)
 
       this.socket.once('error', (err: NodeJS.ErrnoException) => {
@@ -205,6 +215,23 @@ export class QMPClient extends EventEmitter {
   }
 
   /**
+   * H9 (CROSS-UNIT CONTRACT for LIB-CORE2 / EventHandler): reports whether this client
+   * still INTENDS to reconnect after a disconnect — i.e. reconnect is enabled, the
+   * client was not intentionally closed via disconnect(), and the retry budget is not
+   * yet exhausted. EventHandler uses this to decide whether a QMP `disconnect` is a
+   * transient flap (the client will resurrect itself) or terminal (treat the VM as
+   * down). Note: this is "will it try again", independent of whether a retry timer is
+   * currently armed.
+   */
+  public isReconnecting (): boolean {
+    return (
+      this.options.reconnect &&
+      !this.intentionallyClosed &&
+      this.reconnectAttempts < this.options.maxReconnectAttempts
+    )
+  }
+
+  /**
    * Returns the QMP greeting received from the server
    */
   public getGreeting (): QMPGreeting | null {
@@ -249,7 +276,17 @@ export class QMPClient extends EventEmitter {
         timeout
       })
 
-      this.sendCommand(message)
+      // L161: sendCommand() can throw synchronously (e.g. socket vanished between the
+      // connected-check and the write). If it does, the pending entry + its 30s timeout
+      // would leak forever and the caller's promise would hang until that timeout fires.
+      // Roll back the registration and reject immediately.
+      try {
+        this.sendCommand(message)
+      } catch (err) {
+        clearTimeout(timeout)
+        this.pendingCommands.delete(id)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      }
     })
   }
 

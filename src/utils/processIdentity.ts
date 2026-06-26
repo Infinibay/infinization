@@ -57,6 +57,68 @@ export function pidBelongsToVM (pid: number, token: string): boolean {
 }
 
 /**
+ * Tri-state result of identifying the process at `pid` against a VM `token`.
+ *  - 'match':    /proc/<pid>/cmdline was read AND contains 'qemu-system' + token.
+ *  - 'mismatch': /proc/<pid>/cmdline was read but is clearly a DIFFERENT process
+ *                (no qemu-system, or qemu-system without this VM's token).
+ *  - 'unknown':  identity could NOT be determined for a NON-definitive reason —
+ *                a transient /proc read error (EMFILE/EACCES/EIO/...), an empty
+ *                token, or a non-Linux platform. Callers MUST treat 'unknown'
+ *                conservatively (do NOT tear down a live VM on it).
+ */
+export type PidIdentityState = 'match' | 'mismatch' | 'unknown'
+
+/**
+ * Tri-state companion to {@link pidBelongsToVM} for NON-destructive crash/
+ * reconcile decisions. Unlike the boolean (which fails CLOSED — collapsing every
+ * failure to false so a kill is never sent on an unverifiable PID), this helper
+ * distinguishes a definitive 'mismatch' from an 'unknown' transient read failure
+ * so a LIVE VM is not torn down on a flaky /proc read (EMFILE/EACCES under load).
+ *
+ * It deliberately does NOT collapse to a boolean and is NOT for the kill paths —
+ * forceKillProcess / pidBelongsToVM keep their fail-closed semantics. A process
+ * that is GONE (ENOENT/ESRCH) is reported as 'unknown' here on purpose: liveness
+ * (isProcessAlive) is the authority on "process gone", not identity.
+ */
+export function pidIdentityState (pid: number, token: string): PidIdentityState {
+  if (process.platform !== 'linux') {
+    // Cannot read /proc to verify; non-definitive.
+    return 'unknown'
+  }
+  if (!token) {
+    log.warn(`pidIdentityState: empty identifying token for PID ${pid}, cannot verify ownership`)
+    return 'unknown'
+  }
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`)
+    // /proc/<pid>/cmdline is NUL-delimited; normalize to spaces for matching.
+    const cmdline = raw.toString('utf8').replace(/\0/g, ' ')
+    const looksLikeQemu = cmdline.includes('qemu-system')
+    const matchesVM = cmdline.includes(token)
+    if (looksLikeQemu && matchesVM) {
+      return 'match'
+    }
+    // Readable cmdline but not this VM's QEMU — a definitively different process.
+    log.warn(`pidIdentityState: PID ${pid} is a DIFFERENT process (qemu=${looksLikeQemu}, token='${token}' matched=${matchesVM})`)
+    return 'mismatch'
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException
+    // ENOENT/ESRCH = the process is GONE. That is a liveness fact, not an identity
+    // fact — return 'unknown' and let isProcessAlive own the "gone" decision so a
+    // dead process is reaped by the liveness branch, not mis-flagged as identity.
+    if (err && (err.code === 'ENOENT' || err.code === 'ESRCH')) {
+      log.info(`pidIdentityState: PID ${pid} has no /proc entry (process gone) — deferring to liveness check`)
+      return 'unknown'
+    }
+    // Any other errno (EMFILE/EACCES/EIO/EPERM...) is a TRANSIENT/non-definitive
+    // read failure: we genuinely don't know. Conservatively 'unknown' so a live VM
+    // is NOT torn down on a flaky read.
+    log.warn(`pidIdentityState: failed to read /proc/${pid}/cmdline: ${err?.code ?? ''} ${err?.message ?? String(error)} — identity UNKNOWN`)
+    return 'unknown'
+  }
+}
+
+/**
  * Checks whether a process exists and is not a zombie.
  *
  * Uses kill(pid, 0) for existence, then reads /proc/<pid>/stat to reject zombies

@@ -445,7 +445,10 @@ export {
 // Backup classes
 export { BackupScheduler, ScheduledJob, ScheduleAdapter, DiskPathResolver, BackupSchedulerOptions } from './backup/BackupScheduler'
 export { BackupScheduleService, CreateScheduleInput, UpdateScheduleInput, BackupScheduleServiceOptions } from './backup/BackupScheduleService'
-export { BackupService, BackupServiceOptions, BackupServiceEvents } from './backup/BackupService'
+export { BackupService, BackupServiceOptions, BackupServiceEvents, IsVmRunningProbe, GuestAgentFactory, GuestQuiesce } from './backup/BackupService'
+
+// Guest agent (needed by consumers wiring the live-backup quiesce probe)
+export { GuestAgentClient, GuestAgentClientOptions } from './core/GuestAgentClient'
 
 // System classes
 export { CgroupsManager } from './system/CgroupsManager'

@@ -110,6 +110,9 @@ export class BackupScheduler extends EventEmitter {
   /** Registered schedules keyed by schedule ID. */
   private readonly schedules: Map<string, BackupSchedule> = new Map()
 
+  /** L245: schedule IDs whose backup run is currently in flight (overlap guard). */
+  private readonly running: Set<string> = new Set()
+
   /**
    * @param backupService - The BackupService instance to trigger backups on.
    * @param adapter - The ScheduleAdapter that provides actual cron scheduling.
@@ -275,6 +278,15 @@ export class BackupScheduler extends EventEmitter {
    * Executes a backup for the given schedule, then enforces retention.
    */
   private async executeScheduledBackup (schedule: BackupSchedule): Promise<void> {
+    // L245: skip a tick if the previous run for THIS schedule is still in flight
+    // (a long backup overlapping the next cron fire would otherwise double-run
+    // against the same disks and saturate IO / race the image lock).
+    if (this.running.has(schedule.id)) {
+      this.debug.log('warn', `Skipping scheduled backup for ${schedule.id}: previous run still in progress`)
+      return
+    }
+    this.running.add(schedule.id)
+
     this.debug.log(`Executing scheduled backup for VM ${schedule.vmId} (schedule: ${schedule.id})`)
     this.emit('schedule:started', schedule)
 
@@ -323,6 +335,8 @@ export class BackupScheduler extends EventEmitter {
       const err = error instanceof Error ? error : new Error(String(error))
       this.debug.log('error', `Scheduled backup failed for schedule ${schedule.id}: ${err.message}`)
       this.emit('schedule:failed', schedule, err)
+    } finally {
+      this.running.delete(schedule.id)
     }
   }
 
@@ -348,17 +362,67 @@ export class BackupScheduler extends EventEmitter {
         (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
       )
 
-      // Delete oldest backups exceeding retention
-      const toDelete = scheduledBackups.slice(0, scheduledBackups.length - schedule.retentionCount)
-      for (const backup of toDelete) {
-        try {
-          await this.backupService.deleteBackup(backup.id, schedule.vmId)
-          this.debug.log(`Retention: deleted old backup ${backup.id}`)
-        } catch (error) {
-          this.debug.log(
-            'error',
-            `Retention: failed to delete backup ${backup.id}: ${error instanceof Error ? error.message : String(error)}`
+      // Age-based candidates for deletion (the oldest beyond the retention count).
+      const ageOutIds = new Set(
+        scheduledBackups
+          .slice(0, scheduledBackups.length - schedule.retentionCount)
+          .map((b) => b.id)
+      )
+      // The set we INTEND to keep (everything not aged out).
+      const keptIds = new Set(
+        scheduledBackups.map((b) => b.id).filter((id) => !ageOutIds.has(id))
+      )
+
+      // H5: never delete a backup while a KEPT backup still depends on it as a
+      // (transitive) INCREMENTAL parent — that would orphan the retained chain.
+      // Walk every kept backup up its parent links (within this schedule's set)
+      // and rescue any aged-out ancestor back into "keep".
+      const byId = new Map(scheduledBackups.map((b) => [b.id, b]))
+      const rescue = (id: string, seen: Set<string>): void => {
+        const b = byId.get(id)
+        if (!b?.parentBackupId) return
+        const parent = b.parentBackupId
+        if (seen.has(parent)) return // cycle guard
+        seen.add(parent)
+        if (ageOutIds.has(parent)) {
+          ageOutIds.delete(parent) // an aged-out base still backs a kept overlay
+          this.debug.log(`Retention: keeping base ${parent} — still backs retained chain`)
+        }
+        rescue(parent, seen)
+      }
+      for (const keptId of keptIds) {
+        rescue(keptId, new Set([keptId]))
+      }
+
+      // Delete children before parents so the deleteBackup DEPENDENCY guard never
+      // trips on an order issue: a backup with NO surviving descendant is a leaf.
+      const toDelete = scheduledBackups.filter((b) => ageOutIds.has(b.id))
+      // Repeatedly delete current leaves of the to-delete forest.
+      const remaining = new Set(toDelete.map((b) => b.id))
+      let progressed = true
+      while (remaining.size > 0 && progressed) {
+        progressed = false
+        for (const backup of toDelete) {
+          if (!remaining.has(backup.id)) continue
+          // A leaf has no still-pending dependent in the delete set.
+          const stillHasDependent = toDelete.some(
+            (b) => remaining.has(b.id) && b.parentBackupId === backup.id
           )
+          if (stillHasDependent) continue
+          try {
+            await this.backupService.deleteBackup(backup.id, schedule.vmId)
+            this.debug.log(`Retention: deleted old backup ${backup.id}`)
+            remaining.delete(backup.id)
+            progressed = true
+          } catch (error) {
+            // DEPENDENCY (or any) error: skip+warn and keep forward-progressing on
+            // the rest, never abort the whole sweep.
+            this.debug.log(
+              'error',
+              `Retention: failed to delete backup ${backup.id}: ${error instanceof Error ? error.message : String(error)}`
+            )
+            remaining.delete(backup.id) // don't spin forever on a stuck one
+          }
         }
       }
     } catch (error) {

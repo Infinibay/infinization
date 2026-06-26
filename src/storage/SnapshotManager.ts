@@ -197,6 +197,71 @@ export class SnapshotManager {
   }
 
   /**
+   * Materializes an internal snapshot of `sourcePath` into a NEW standalone
+   * qcow2 at `destPath`, WITHOUT mutating the source image.
+   *
+   * `qemu-img snapshot -a` (revertSnapshot) rolls the original file back in
+   * place, which is destructive and ignores any requested target path. When a
+   * caller wants the snapshot's contents written to a *different* file (e.g. a
+   * backup restore that must not clobber the live disk), this method runs
+   * `qemu-img convert -l <snapshot> -- <source> <dest>`, reading the named
+   * internal snapshot and emitting an independent image at `destPath`.
+   *
+   * The source image and all its other snapshots are left untouched.
+   *
+   * @param sourcePath - qcow2 image that contains the internal snapshot.
+   * @param snapshotName - Name of the internal snapshot to materialize.
+   * @param destPath - Output path for the new standalone qcow2 image.
+   * @throws StorageError if the snapshot or image is missing, or convert fails.
+   */
+  async materializeSnapshot (sourcePath: string, snapshotName: string, destPath: string): Promise<void> {
+    this.validateSnapshotName(snapshotName)
+    this.debug.log(`Materializing snapshot '${snapshotName}' of ${sourcePath} -> ${destPath}`)
+
+    try {
+      // -l <snapshot>: read the named internal snapshot instead of the current
+      // top. Disk-sized op => no timeout (a multi-GB convert must not be SIGKILLed
+      // mid-write, which would leave a corrupt partial at destPath).
+      await this.executor.execute('qemu-img', [
+        'convert',
+        '-O', 'qcow2',
+        '-l', snapshotName,
+        '--', sourcePath, destPath
+      ], { timeoutMs: 0 })
+      this.debug.log(`Snapshot '${snapshotName}' materialized to ${destPath}`)
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error)
+
+      if (errorMessage.includes('not found') || errorMessage.includes('does not exist') ||
+          errorMessage.includes('Failed to load snapshot') || errorMessage.includes('snapshot')) {
+        throw new StorageError(
+          StorageErrorCode.SNAPSHOT_NOT_FOUND,
+          `Snapshot '${snapshotName}' not found in image ${sourcePath}`,
+          sourcePath,
+          'qemu-img convert -l'
+        )
+      }
+
+      if (errorMessage.includes('No such file') || errorMessage.includes('Could not open')) {
+        throw new StorageError(
+          StorageErrorCode.IMAGE_NOT_FOUND,
+          `Image not found: ${sourcePath}`,
+          sourcePath,
+          'qemu-img convert -l'
+        )
+      }
+
+      this.debug.log('error', `Failed to materialize snapshot '${snapshotName}' of ${sourcePath}: ${errorMessage}`)
+      throw new StorageError(
+        StorageErrorCode.COMMAND_FAILED,
+        `Failed to materialize snapshot '${snapshotName}' of ${sourcePath} to ${destPath}: ${errorMessage}`,
+        sourcePath,
+        'qemu-img convert -l'
+      )
+    }
+  }
+
+  /**
    * Deletes a snapshot from a qcow2 image.
    * @param imagePath - Path to the qcow2 image file
    * @param snapshotName - Name of the snapshot to delete

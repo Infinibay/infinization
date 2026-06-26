@@ -36,6 +36,13 @@ export interface MachineConfigurationRecord {
 export interface RunningVMRecord {
   id: string
   status: string
+  /**
+   * Machine.internalName — the stable identifier used to derive pidfile names,
+   * TAP device names and QMP socket paths. Consumed by HealthMonitor (LIB-CORE3)
+   * to correlate running VMs back to on-disk pidfiles/sockets without a second
+   * round-trip to getMachineInternalName.
+   */
+  internalName: string
   MachineConfiguration: MachineConfigurationRecord | null
 }
 
