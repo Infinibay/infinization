@@ -1,0 +1,71 @@
+# CI for infinization — type-check + unit tests + coverage gate.
+#
+# Runs on every push to main and on every pull request. The coverage gate is
+# intentionally permissive relative to the current 54% baseline (see
+# CODE_REVIEW_REPORT §2.2): it prevents regressions without blocking on the
+# existing low-coverage modules. Tighten the threshold as coverage improves.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # qemu-img backs the byte-level backup/restore/snapshot round-trip suite
+      # (tests/backupRoundtrip.integration.spec.ts). Without it that suite
+      # auto-skips, leaving the IRREVERSIBLE data paths with no behavioural
+      # verification in CI (CODE_REVIEW_REPORT §C.4 TEST-04). Install it so the
+      # destructive round-trip tests run as a real gate.
+      - name: Install qemu-img (qemu-utils)
+        run: sudo apt-get update && sudo apt-get install -y qemu-utils
+
+      - name: Verify qemu-img is available (destructive tests must not silently skip)
+        run: qemu-img --version
+
+      - name: Type-check (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Test with coverage
+        run: npm run test:coverage
+        env:
+          # Surface coverage in the CI summary.
+          CI: 'true'
+
+      - name: Enforce coverage floor (lines)
+        # Fail if line coverage drops below the documented baseline. The
+        # threshold is deliberately a floor, not a target — it catches
+        # regressions without gating on the still-uncovered modules.
+        # Reads the summary produced by the test:coverage step above
+        # (jest.config.js emits json-summary), so the heavy qemu-img-gated suite
+        # is NOT re-run a second time.
+        run: |
+          LINES=$(node -e "const c=require('./coverage/coverage-summary.json'); console.log(c.total.lines.pct)")
+          echo "Line coverage: ${LINES}%"
+          if awk "BEGIN{exit !($LINES < 50)}"; then
+            echo "::error::Line coverage ${LINES}% is below the 50% floor. Add tests or lower the floor with a justification."
+            exit 1
+          fi

@@ -7,6 +7,7 @@
 
 import { UnattendedInstallConfig } from './unattended.types'
 import { FirewallDefaultAction } from './firewall.types'
+import type { PrismaClientLike } from '../db/PrismaAdapter'
 
 // =============================================================================
 // Configuration Types
@@ -656,6 +657,16 @@ export const RUNTIME_DISK_SIZE_PLACEHOLDER_GB = 1
  *
  * Note: Pass your application's PrismaClient singleton for connection pooling.
  * Infinization does not create or manage its own Prisma instance.
+ *
+ * Some behaviour is also configurable via environment variables (host-wide
+ * defaults that a typed field here overrides where one exists). See
+ * `docs/CONFIGURATION.md` for the full catalogue — notably
+ * `INFINIZATION_BRIDGE_CONNTRACK_MODE` (firewall conntrack posture; see
+ * `bridgeConntrackMode` below), `INFINIZATION_QEMU_USER` (host-wide default for
+ * the QEMU `-runas` privilege drop — the per-VM `runAsUser` takes precedence at
+ * create, but start/restart falls back to this env var; see docs/CONFIGURATION.md),
+ * and `INFINIBAY_BACKEND_SERVICES_PATH` (unattended-install
+ * services path; overridable per-installer via `UnattendedInstallerOptions`).
  */
 export interface InfinizationConfig {
   /**
@@ -663,7 +674,7 @@ export interface InfinizationConfig {
    * Required - infinization does not create its own Prisma client.
    * Pass your application's singleton for shared connection pooling.
    */
-  prismaClient: unknown
+  prismaClient: PrismaClientLike
   /** Optional backend EventManager for event emission */
   eventManager?: EventManagerLike
   /** Health monitor check interval in milliseconds (default: 30000) */
@@ -676,6 +687,22 @@ export interface InfinizationConfig {
   qmpSocketDir?: string
   /** Custom PID file directory path */
   pidfileDir?: string
+  /**
+   * Bridge-family conntrack posture for the nftables firewall.
+   *
+   * - `'fail'` (default, RECOMMENDED): fail-closed. `initialize()` throws an
+   *   actionable error on a host missing `nf_conntrack_bridge`/`br_netfilter`,
+   *   and VM firewall chains install the stateful `ct state established,related`
+   *   rule. Use this in production.
+   * - `'degrade'`: run STATELESS — omit the conntrack rule on hosts lacking
+   *   bridge conntrack so VMs still start. This WEAKENS the firewall (no
+   *   established/related state tracking): a fail-open posture. Use only when you
+   *   understand the trade-off.
+   *
+   * Overrides the `INFINIZATION_BRIDGE_CONNTRACK_MODE` env var when set.
+   * Defaults to that env var (`'degrade'` ⇒ degrade), else `'fail'`.
+   */
+  bridgeConntrackMode?: 'fail' | 'degrade'
 }
 
 /**

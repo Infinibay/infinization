@@ -6,6 +6,7 @@
  */
 
 import { QMPVMStatus, QMPEventType } from './qmp.types'
+import { VMConfigRecord } from './db.types'
 
 // =============================================================================
 // Database Adapter Interface
@@ -88,6 +89,9 @@ export interface DatabaseAdapter {
 
   /** Find a machine by internal name (used for orphan detection from pidfile names) */
   findMachineByInternalName (internalName: string): Promise<RunningVMRecord | null>
+
+  /** Find a machine by ID including its configuration (O(1) direct lookup) */
+  findMachineWithConfig (id: string): Promise<VMConfigRecord | null>
 }
 
 /**

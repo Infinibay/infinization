@@ -30,6 +30,27 @@ import {
 } from '../types/firewall.types'
 import { Debugger } from '@utils/debug'
 
+/**
+ * Typed error thrown by {@link FirewallRuleTranslator} when a rule cannot be
+ * translated. Carries a structured {@link NftablesErrorCode} so callers can
+ * classify the failure (invalid rule vs unsupported protocol vs bad port range)
+ * without inspecting the message string.
+ *
+ * Mirrors the `LifecycleError` / `PrismaAdapterError` typed-error pattern used
+ * elsewhere in the codebase.
+ */
+export class FirewallTranslationError extends Error {
+  readonly code: NftablesErrorCode
+  readonly ruleId?: string
+
+  constructor (code: NftablesErrorCode, message: string, ruleId?: string) {
+    super(ruleId ? `[Rule ${ruleId}] ${message}` : message)
+    this.name = 'FirewallTranslationError'
+    this.code = code
+    this.ruleId = ruleId
+  }
+}
+
 /** Type for rule direction from Prisma schema - only concrete directions, not INOUT */
 type RuleDirection = 'IN' | 'OUT'
 
@@ -670,10 +691,10 @@ export class FirewallRuleTranslator {
 
   /**
    * Creates a structured error for validation failures.
+  /**
+   * Creates a structured error for validation failures.
    */
-  private static createError (code: NftablesErrorCode, message: string, ruleId?: string): Error {
-    const error = new Error(ruleId ? `[Rule ${ruleId}] ${message}` : message)
-    ;(error as any).code = code
-    return error
+  private static createError (code: NftablesErrorCode, message: string, ruleId?: string): FirewallTranslationError {
+    return new FirewallTranslationError(code, message, ruleId)
   }
 }

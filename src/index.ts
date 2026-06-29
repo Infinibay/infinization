@@ -18,7 +18,7 @@ export { TapDeviceManager } from './network/TapDeviceManager'
 export { BridgeManager } from './network/BridgeManager'
 export { MacAddressGenerator } from './network/MacAddressGenerator'
 export { NftablesService } from './network/NftablesService'
-export { FirewallRuleTranslator } from './network/FirewallRuleTranslator'
+export { FirewallRuleTranslator, FirewallTranslationError } from './network/FirewallRuleTranslator'
 export { DepartmentNatService } from './network/DepartmentNatService'
 
 // Storage classes
@@ -256,19 +256,33 @@ export {
 } from './types/lifecycle.types'
 
 // Types - VM (Consolidated)
-// Provides a centralized hub for all VM-related types
+// Provides a centralized hub for all VM-related types.
+//
+// ARCH-07: The `*FromHub` / `VM*` prefixed names below are compatibility
+// aliases that re-export canonical types under extra names. Audit found ZERO
+// consumers across backend/frontend/infiniservice/infinization, but they are
+// public API of a published package (@infinibay/infinization) so they are kept
+// for backwards compatibility and formally deprecated via @deprecated tags
+// pointing to the canonical name. Slated for removal in the next major release.
 export {
-  // Re-exported from lifecycle.types for convenience
+  /** @deprecated Use {@link DisplayProtocol} from lifecycle.types instead. */
   DisplayProtocol as VMDisplayProtocol,
+  /** @deprecated Use {@link VMCreateConfig} from lifecycle.types instead. */
   VMCreateConfig as VMCreateConfigFromHub,
+  /** @deprecated Use {@link VMCreateResult} from lifecycle.types instead. */
   VMCreateResult as VMCreateResultFromHub,
+  /** @deprecated Use {@link VMStartConfig} from lifecycle.types instead. */
   VMStartConfig as VMStartConfigFromHub,
+  /** @deprecated Use {@link VMStopConfig} from lifecycle.types instead. */
   VMStopConfig as VMStopConfigFromHub,
+  /** @deprecated Use {@link VMOperationResult} from lifecycle.types instead. */
   VMOperationResult as VMOperationResultFromHub,
+  /** @deprecated Use {@link VMStatusResult} from lifecycle.types instead. */
   VMStatusResult as VMStatusResultFromHub,
   // Re-exported from sync.types for convenience
   VMStatus,
   // Re-exported from qemu.types
+  /** @deprecated Use {@link MachineOptions} from qemu.types instead. */
   MachineOptions as VMMachineOptions,
   // New consolidated types
   VMInfo,
@@ -296,38 +310,69 @@ export {
 } from './types/vm.types'
 
 // Types - Configuration (Consolidated)
-// Provides a centralized hub for all configuration-related types
+// Provides a centralized hub for all configuration-related types.
+//
+// ARCH-07: The `Config*` prefixed names below are compatibility aliases that
+// re-export canonical types under extra names. Audit found ZERO consumers
+// across backend/frontend/infiniservice/infinization, but they are public API
+// of a published package (@infinibay/infinization) so they are kept for
+// backwards compatibility and formally deprecated via @deprecated tags pointing
+// to the canonical name. Slated for removal in the next major release.
 export {
   // Re-exported from qemu.types
+  /** @deprecated Use {@link MachineType} from qemu.types instead. */
   MachineType as ConfigMachineType,
+  /** @deprecated Use {@link DiskBus} from qemu.types instead. */
   DiskBus as ConfigDiskBus,
+  /** @deprecated Use {@link CacheMode} from qemu.types instead. */
   CacheMode as ConfigCacheMode,
+  /** @deprecated Use {@link DisplayType} from qemu.types instead. */
   DisplayType as ConfigDisplayType,
+  /** @deprecated Use {@link VgaType} from qemu.types instead. */
   VgaType as ConfigVgaType,
+  /** @deprecated Use {@link BootDevice} from qemu.types instead. */
   BootDevice as ConfigBootDevice,
+  /** @deprecated Use {@link MachineOptions} from qemu.types instead. */
   MachineOptions as ConfigMachineOptions,
+  /** @deprecated Use {@link DiskOptions} from qemu.types instead. */
   DiskOptions as ConfigDiskOptions,
+  /** @deprecated Use {@link NetworkOptions} from qemu.types instead. */
   NetworkOptions as ConfigNetworkOptions,
+  /** @deprecated Use {@link SpiceOptions} from qemu.types instead. */
   SpiceOptions as ConfigSpiceOptions,
+  /** @deprecated Use {@link VncOptions} from qemu.types instead. */
   VncOptions as ConfigVncOptions,
+  /** @deprecated Use {@link QemuProcessOptions} from qemu.types instead. */
   QemuProcessOptions as ConfigQemuProcessOptions,
   // Re-exported from display.types
+  /** @deprecated Use {@link SpiceConfigOptions} from display.types instead. */
   SpiceConfigOptions as ConfigSpiceConfigOptions,
+  /** @deprecated Use {@link VncConfigOptions} from display.types instead. */
   VncConfigOptions as ConfigVncConfigOptions,
   // Re-exported from network.types
+  /** @deprecated Use {@link TapDeviceConfig} from network.types instead. */
   TapDeviceConfig as ConfigTapDeviceConfig,
+  /** @deprecated Use {@link BridgeConfig} from network.types instead. */
   BridgeConfig as ConfigBridgeConfig,
   // Re-exported from storage.types
+  /** @deprecated Use {@link CreateImageOptions} from storage.types instead. */
   CreateImageOptions as ConfigCreateImageOptions,
+  /** @deprecated Use {@link ConvertImageOptions} from storage.types instead. */
   ConvertImageOptions as ConfigConvertImageOptions,
+  /** @deprecated Use {@link SnapshotCreateOptions} from storage.types instead. */
   SnapshotCreateOptions as ConfigSnapshotCreateOptions,
   // Re-exported from firewall.types
+  /** @deprecated Use {@link VMFirewallConfig} from firewall.types instead. */
   VMFirewallConfig as ConfigVMFirewallConfig,
+  /** @deprecated Use {@link FirewallRuleInput} from firewall.types instead. */
   FirewallRuleInput as ConfigFirewallRuleInput,
   // Re-exported from lifecycle.types
+  /** @deprecated Use {@link InfinizationConfig} from lifecycle.types instead. */
   InfinizationConfig as ConfigInfinizationConfig,
   // Re-exported from sync.types
+  /** @deprecated Use {@link HealthMonitorConfig} from sync.types instead. */
   HealthMonitorConfig as ConfigHealthMonitorConfig,
+  /** @deprecated Use {@link EventHandlerConfig} from sync.types instead. */
   EventHandlerConfig as ConfigEventHandlerConfig,
   // Helper types derived from existing types
   VMDisplayType,

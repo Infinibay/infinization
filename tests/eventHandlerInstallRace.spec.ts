@@ -75,6 +75,20 @@ function makeDb (): jest.Mocked<DatabaseAdapter> {
     ]),
     findMachinesByStatuses: jest.fn().mockResolvedValue([]),
     findMachineByInternalName: jest.fn().mockResolvedValue(null),
+    // StateSync.getVMPid/getVMInfo now use findMachineWithConfig (O(1)) instead
+    // of the findRunningVMs scan above.
+    findMachineWithConfig: jest.fn().mockResolvedValue({
+      id: testVmId,
+      internalName: testVmId,
+      status: 'running',
+      configuration: {
+        qmpSocketPath: '/var/run/qemu/install.sock',
+        qemuPid: testQemuPid,
+        tapDeviceName: testTapDevice,
+        guestAgentSocketPath: null,
+        infiniServiceSocketPath: null
+      }
+    }),
     clearMachineConfiguration: jest.fn().mockResolvedValue(undefined),
     clearVolatileMachineConfiguration: jest.fn().mockResolvedValue(undefined)
   } as unknown as jest.Mocked<DatabaseAdapter>
@@ -259,13 +273,36 @@ describe('Reconnect re-sync to a terminal state routes through handleTerminalShu
     eventHandler = new EventHandler(mockDb, { enableLogging: false, vmLock })
     await eventHandler.attachToVM(testVmId, mockQmpClient as any)
 
-    mockQmpClient.statusResult = { status: 'guest-panicked', running: false }
+    // 'shutdown' is the genuinely-terminal run-state (QEMU process gone) →
+    // maps to 'off' and routes through handleTerminalShutdown under the lock.
+    mockQmpClient.statusResult = { status: 'shutdown', running: false }
     mockQmpClient.emit('reconnect')
     await new Promise(resolve => setTimeout(resolve, 80))
 
     expect(runExclusiveSpy).toHaveBeenCalledWith(testVmId, expect.any(Function))
     expect(mockDb.updateMachineStatus).toHaveBeenCalledWith(testVmId, 'off')
     expect(MockedTapDeviceManager.prototype.detachFromBridge).toHaveBeenCalledWith(testTapDevice)
+  })
+
+  it('ARCH-01: guest-panicked maps to "error" (lightweight re-sync), NOT terminal reap', async () => {
+    // guest-panicked: QEMU process is STILL ALIVE (guest hit a fatal fault but
+    // QEMU itself hasn't exited). Previously the divergent EventHandler mapper
+    // treated this as 'off' → terminal reap, which would prematurely destroy
+    // TAP/firewall resources for a process that hasn't exited yet. Now it maps
+    // to 'error' (canonical StateSync table) → lightweight status flip only.
+    eventHandler = new EventHandler(mockDb, { enableLogging: false })
+    await eventHandler.attachToVM(testVmId, mockQmpClient as any)
+
+    mockQmpClient.statusResult = { status: 'guest-panicked', running: false }
+    mockQmpClient.emit('reconnect')
+    await new Promise(resolve => setTimeout(resolve, 80))
+
+    // Lightweight re-sync: status flipped to 'error', NO resource reap.
+    expect(mockDb.updateMachineStatus).toHaveBeenCalledWith(testVmId, 'error')
+    expect(mockDb.updateMachineStatus).not.toHaveBeenCalledWith(testVmId, 'off')
+    expect(MockedTapDeviceManager.prototype.detachFromBridge).not.toHaveBeenCalled()
+    expect(MockedNftablesService.prototype.detachJumpRules).not.toHaveBeenCalled()
+    expect(mockDb.clearVolatileMachineConfiguration).not.toHaveBeenCalled()
   })
 
   it('does NOT reap/flip off when reconnect resolves to terminal while install in progress', async () => {

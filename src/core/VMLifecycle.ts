@@ -2148,7 +2148,13 @@ export class VMLifecycle {
   }
 
   /**
-   * Fetches firewall rules for a VM
+   * Fetches firewall rules for a VM, split by source (department vs VM-specific).
+   *
+   * Uses {@link PrismaAdapter.getFirewallRulesSplit} to query department-inherited
+   * rules and VM-specific rules separately, preserving the `overridesDept`
+   * override semantics that {@link NftablesService.mergeRules} applies downstream.
+   * Previously all rules were lumped into the `department` bucket, which defeated
+   * VM-rule overrides of department rules; the split query fixes that.
    */
   private async fetchFirewallRules (vmId: string): Promise<{
     department: FirewallRuleInput[]
@@ -2157,18 +2163,15 @@ export class VMLifecycle {
     defaultAction: FirewallDefaultAction
   }> {
     try {
-      const rules = await this.prisma.getFirewallRules(vmId)
+      const { departmentRules, vmRules } = await this.prisma.getFirewallRulesSplit(vmId)
       // Derive the terminal posture from the department's policy so an ALLOW_ALL
       // department is not over-blocked by the fail-closed 'drop' default. Anything
       // other than an explicit ALLOW_ALL maps to 'drop' (fail-closed).
       const policy = await this.prisma.getDepartmentFirewallPolicy(vmId)
       const defaultAction: FirewallDefaultAction = policy === 'ALLOW_ALL' ? 'accept' : 'drop'
-      // Split rules into department and VM rules based on source
-      // For now, return all rules as department rules
-      // TODO: Properly split once we have source information
       return {
-        department: rules,
-        vm: [],
+        department: departmentRules,
+        vm: vmRules,
         defaultAction
       }
     } catch (error) {

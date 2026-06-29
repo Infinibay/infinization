@@ -224,6 +224,82 @@ describe('fail-closed read contract', () => {
     })
   })
 
+  describe('getFirewallRulesSplit', () => {
+    const mkRule = (id: string, overridesDept = false) => ({
+      id,
+      name: `rule-${id}`,
+      description: null,
+      action: 'ACCEPT',
+      direction: 'IN',
+      priority: 100,
+      protocol: 'tcp',
+      srcPortStart: null,
+      srcPortEnd: null,
+      dstPortStart: 80,
+      dstPortEnd: 80,
+      srcIpAddr: null,
+      srcIpMask: null,
+      dstIpAddr: null,
+      dstIpMask: null,
+      connectionState: null,
+      overridesDept
+    })
+
+    it('returns department and VM rules in separate arrays (preserving override flag)', async () => {
+      const machine = {
+        id: 'm-1',
+        department: {
+          id: 'd-1',
+          name: 'eng',
+          firewallRuleSet: {
+            id: 'rs-dept',
+            name: 'dept-rules',
+            rules: [mkRule('dept-1'), mkRule('dept-2')]
+          }
+        },
+        firewallRuleSet: {
+          id: 'rs-vm',
+          name: 'vm-rules',
+          rules: [mkRule('vm-1', true)]
+        }
+      }
+      const client = { machine: { findUnique: jest.fn().mockResolvedValue(machine) } }
+      const adapter = new PrismaAdapter(client as any)
+      const r = await adapter.getFirewallRulesSplit('m-1')
+      expect(r.departmentRules).toHaveLength(2)
+      expect(r.vmRules).toHaveLength(1)
+      // overridesDept flag must survive the mapping so NftablesService.mergeRules
+      // can apply override semantics (the whole point of the split).
+      expect(r.vmRules[0].overridesDept).toBe(true)
+    })
+
+    it('returns empty arrays when the VM has no rule sets', async () => {
+      const machine = { id: 'm-1', department: null, firewallRuleSet: null }
+      const client = { machine: { findUnique: jest.fn().mockResolvedValue(machine) } }
+      const adapter = new PrismaAdapter(client as any)
+      const r = await adapter.getFirewallRulesSplit('m-1')
+      expect(r).toEqual({ departmentRules: [], vmRules: [] })
+    })
+
+    it('throws MACHINE_NOT_FOUND when the VM does not exist (fail-closed, not empty)', async () => {
+      const client = { machine: { findUnique: jest.fn().mockResolvedValue(null) } }
+      const adapter = new PrismaAdapter(client as any)
+      await expect(adapter.getFirewallRulesSplit('missing')).rejects.toMatchObject({
+        code: PrismaAdapterErrorCode.MACHINE_NOT_FOUND
+      })
+    })
+
+    it('re-throws a DB error (fail-closed, never returns [])', async () => {
+      const client = {
+        machine: { findUnique: jest.fn().mockRejectedValue(new Error('connection lost')) }
+      }
+      const adapter = new PrismaAdapter(client as any)
+      await expect(adapter.getFirewallRulesSplit('m-1')).rejects.toMatchObject({
+        code: PrismaAdapterErrorCode.QUERY_FAILED
+      })
+    })
+  })
+
   it('getDepartmentFirewallPolicy returns null for a genuinely missing/department-less VM', async () => {
     const prisma = makeFakePrisma({
       machine: { findUnique: async () => ({ id: 'm-1', status: 'off', department: null }) }

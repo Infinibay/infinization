@@ -26,7 +26,10 @@ module.exports = {
     '!src/index.ts'
   ],
   coverageDirectory: 'coverage',
-  coverageReporters: ['text', 'lcov', 'html'],
+  // json-summary lets CI read coverage/coverage-summary.json from the single
+  // `test:coverage` run instead of re-running the whole (now qemu-img-gated)
+  // suite a second time just to compute the coverage floor.
+  coverageReporters: ['text', 'lcov', 'html', 'json-summary'],
   testTimeout: 10000,
   clearMocks: true,
   restoreMocks: true,

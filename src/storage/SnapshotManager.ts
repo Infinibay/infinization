@@ -69,7 +69,12 @@ export class SnapshotManager {
         )
       }
 
-      if (errorMessage.includes('in use') || errorMessage.includes('locked')) {
+      // Real qemu-img lock failures read `Could not open '<path>': Failed to get
+      // "write" lock` (no 'in use'/'locked' substring), so match the lock form
+      // explicitly here — before the not-found branch — or a running disk is
+      // misclassified as IMAGE_NOT_FOUND.
+      if ((errorMessage.includes('Failed to get') && errorMessage.includes('lock')) ||
+          errorMessage.includes('in use') || errorMessage.includes('locked')) {
         throw new StorageError(
           StorageErrorCode.IMAGE_IN_USE,
           `Cannot create snapshot: image ${imagePath} is in use. Stop the VM first.`,
@@ -168,7 +173,12 @@ export class SnapshotManager {
         )
       }
 
-      if (errorMessage.includes('in use') || errorMessage.includes('locked')) {
+      // Real qemu-img lock failures read `Could not open '<path>': Failed to get
+      // "write" lock` (no 'in use'/'locked' substring), so match the lock form
+      // explicitly here — before the not-found branch — or a running disk is
+      // misclassified as IMAGE_NOT_FOUND.
+      if ((errorMessage.includes('Failed to get') && errorMessage.includes('lock')) ||
+          errorMessage.includes('in use') || errorMessage.includes('locked')) {
         throw new StorageError(
           StorageErrorCode.IMAGE_IN_USE,
           `Cannot revert snapshot: image ${imagePath} is in use. Stop the VM first.`,

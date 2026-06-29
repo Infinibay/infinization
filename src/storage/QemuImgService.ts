@@ -232,7 +232,14 @@ export class QemuImgService {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
 
-      if (errorMessage.includes('in use') || errorMessage.includes('locked')) {
+      // Real qemu-img lock failures arrive as `Could not open '<path>': Failed to
+      // get "write" lock\nIs another process using the image?` — which contains
+      // neither 'in use' nor 'locked' but DOES contain "Could not open", so it must
+      // be matched HERE (before the not-found branch below) via the same
+      // `Failed to get` && `lock` predicate getImageInfo/checkImage use; otherwise a
+      // live/running disk is misreported as IMAGE_NOT_FOUND.
+      if ((errorMessage.includes('Failed to get') && errorMessage.includes('lock')) ||
+          errorMessage.includes('in use') || errorMessage.includes('locked')) {
         throw new StorageError(
           StorageErrorCode.IMAGE_IN_USE,
           `Cannot resize image ${path}: image is in use. Stop the VM first.`,

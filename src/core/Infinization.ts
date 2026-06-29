@@ -76,13 +76,6 @@ import { DEFAULT_HEALTH_CHECK_INTERVAL, ReconcileSummary } from '../types/sync.t
 import { QMPBlockInfo } from '../types/qmp.types'
 
 /**
- * Minimal Prisma client interface for initialization.
- * Uses 'unknown' to allow any Prisma client to be passed.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type PrismaClientLike = any
-
-/**
  * Infinization is the main public API for VM management.
  *
  * It handles:
@@ -164,7 +157,7 @@ export class Infinization {
           'prismaClient is required in InfinizationConfig'
         )
       }
-      this.prisma = new PrismaAdapter(this.config.prismaClient as PrismaClientLike)
+      this.prisma = new PrismaAdapter(this.config.prismaClient)
       this.externalPrisma = true
       this.debug.log('Using external Prisma client')
 
@@ -204,10 +197,14 @@ export class Infinization {
 
       // Initialize nftables infrastructure. bridgeConntrackMode is operator-
       // configurable: default 'fail' (recommended fail-loud-at-init — initialize()
-      // throws a clear error on a host lacking br_netfilter/nf_conntrack_bridge);
-      // set INFINIZATION_BRIDGE_CONNTRACK_MODE=degrade to run stateless instead.
+      // throws a clear error on a host lacking br_netfilter/nf_conntrack_bridge).
+      // Precedence: explicit InfinizationConfig.bridgeConntrackMode wins; else the
+      // INFINIZATION_BRIDGE_CONNTRACK_MODE env var (=degrade ⇒ stateless); else 'fail'.
+      // The typed field makes this security-relevant knob discoverable in the public
+      // config instead of living only in an undocumented env var (CODE_REVIEW §C.4 INT-02).
       this.nftables = new NftablesService({
-        bridgeConntrackMode: process.env.INFINIZATION_BRIDGE_CONNTRACK_MODE === 'degrade' ? 'degrade' : 'fail'
+        bridgeConntrackMode: this.config.bridgeConntrackMode ??
+          (process.env.INFINIZATION_BRIDGE_CONNTRACK_MODE === 'degrade' ? 'degrade' : 'fail')
       })
       await this.nftables.initialize()
       this.debug.log('Nftables infrastructure initialized')

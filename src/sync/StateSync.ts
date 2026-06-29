@@ -254,26 +254,25 @@ export class StateSync {
   /**
    * Gets the QEMU process PID for a VM from the database.
    *
-   * This method searches through running VMs to find the PID.
-   * Note: This is primarily used during shutdown handling to monitor process exit.
+   * Uses a direct id lookup (O(1)) via {@link PrismaAdapter.findMachineWithConfig}
+   * instead of scanning every running VM. Primarily used during shutdown handling
+   * to monitor process exit.
    *
    * @param vmId The VM identifier
    * @returns The PID if found, null otherwise
    */
   public async getVMPid (vmId: string): Promise<number | null> {
-    // Search in running VMs to find the PID
-    // This includes VMs that may still be in 'running' status during shutdown
-    const runningVMs = await this.db.findRunningVMs()
-    const vm = runningVMs.find(v => v.id === vmId)
-    return vm?.MachineConfiguration?.qemuPid ?? null
+    const vm = await this.db.findMachineWithConfig(vmId)
+    return vm?.configuration?.qemuPid ?? null
   }
 
   /**
    * Gets VM information needed for resource cleanup.
    *
-   * This method retrieves the TAP device name and CPU pinning status
-   * which are needed during shutdown cleanup (either host-initiated via
-   * VMLifecycle.stop() or guest-initiated via EventHandler).
+   * Uses a direct id lookup (O(1)) via {@link PrismaAdapter.findMachineWithConfig}
+   * instead of scanning every running VM. Retrieves the TAP device name needed
+   * during shutdown cleanup (either host-initiated via VMLifecycle.stop() or
+   * guest-initiated via EventHandler).
    *
    * @param vmId The VM identifier
    * @returns Object with tapDeviceName and hasCpuPinning, or null if VM not found
@@ -284,19 +283,16 @@ export class StateSync {
   } | null> {
     this.debug.log(`getVMInfo: ${vmId}`)
 
-    // Search in running VMs to find the configuration
-    // This includes VMs that may still be in 'running' status during shutdown
-    const runningVMs = await this.db.findRunningVMs()
-    const vm = runningVMs.find(v => v.id === vmId)
+    const vm = await this.db.findMachineWithConfig(vmId)
 
     if (!vm) {
-      this.debug.log('info', `VM ${vmId} not found in running VMs for info retrieval`)
+      this.debug.log('info', `VM ${vmId} not found for info retrieval`)
       return null
     }
 
     return {
-      tapDeviceName: vm.MachineConfiguration?.tapDeviceName ?? null,
-      // Note: cpuPinning info is not in the RunningVMRecord type, so we default to false
+      tapDeviceName: vm.configuration?.tapDeviceName ?? null,
+      // Note: cpuPinning info is not in the VMConfigRecord type, so we default to false.
       // The cleanup is best-effort anyway - orphaned cgroup scopes get cleaned up opportunistically
       hasCpuPinning: false
     }

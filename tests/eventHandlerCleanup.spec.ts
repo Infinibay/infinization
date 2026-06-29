@@ -80,6 +80,7 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
       findRunningVMs: jest.fn(),
       findMachinesByStatuses: jest.fn().mockResolvedValue([]),
       findMachineByInternalName: jest.fn().mockResolvedValue(null),
+      findMachineWithConfig: jest.fn(),
       clearMachineConfiguration: jest.fn(),
       clearVolatileMachineConfiguration: jest.fn()
     }
@@ -87,20 +88,20 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
     // Setup default mock responses
     mockDb.findMachine.mockResolvedValue({ id: testVmId, status: 'running' })
     mockDb.updateMachineStatus.mockResolvedValue()
-    mockDb.findRunningVMs.mockResolvedValue([
-      {
-        id: testVmId,
-        internalName: testVmId,
-        status: 'running',
-        MachineConfiguration: {
-          qmpSocketPath: '/var/run/qemu/test.sock',
-          qemuPid: testQemuPid,
-          tapDeviceName: testTapDevice,
-          guestAgentSocketPath: null,
-          infiniServiceSocketPath: null
-        }
+    // StateSync.getVMPid/getVMInfo now use findMachineWithConfig (O(1)) instead
+    // of findRunningVMs (O(n) scan). Mock the direct-id lookup.
+    mockDb.findMachineWithConfig.mockResolvedValue({
+      id: testVmId,
+      internalName: testVmId,
+      status: 'running',
+      configuration: {
+        qmpSocketPath: '/var/run/qemu/test.sock',
+        qemuPid: testQemuPid,
+        tapDeviceName: testTapDevice,
+        guestAgentSocketPath: null,
+        infiniServiceSocketPath: null
       }
-    ])
+    } as any)
     mockDb.clearVolatileMachineConfiguration.mockResolvedValue()
 
     // Get mock instances
@@ -194,23 +195,19 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
     })
 
     it('handles missing TAP device gracefully', async () => {
-      // Setup VM without TAP device
-      mockDb.findRunningVMs.mockResolvedValue([
-        {
-          id: testVmId,
-          internalName: testVmId,
-          status: 'running',
-          MachineConfiguration: {
-            qmpSocketPath: '/var/run/qemu/test.sock',
-            qemuPid: testQemuPid,
-            tapDeviceName: null,
-            guestAgentSocketPath: null,
-            infiniServiceSocketPath: null
-          }
+      // Setup VM without TAP device via direct-id lookup (findMachineWithConfig)
+      mockDb.findMachineWithConfig.mockResolvedValue({
+        id: testVmId,
+        internalName: testVmId,
+        status: 'running',
+        configuration: {
+          qmpSocketPath: '/var/run/qemu/test.sock',
+          qemuPid: testQemuPid,
+          tapDeviceName: null,
+          guestAgentSocketPath: null,
+          infiniServiceSocketPath: null
         }
-      ])
-
-      // Simulate SHUTDOWN event
+      } as any)
       mockQmpClient.emit('SHUTDOWN', { guest: true, reason: 'guest-shutdown' }, { seconds: 0, microseconds: 0 })
 
       // Wait for async operations
@@ -284,14 +281,14 @@ describe('EventHandler Guest-Initiated Shutdown Cleanup', () => {
     })
 
     it('retrieves PID before status update for process monitoring', async () => {
-      // Verify findRunningVMs is called to get PID
+      // Verify findMachineWithConfig is called to get PID (O(1) direct lookup)
       mockQmpClient.emit('SHUTDOWN', { guest: true, reason: 'guest-shutdown' }, { seconds: 0, microseconds: 0 })
 
       // Wait for async operations
       await new Promise(resolve => setTimeout(resolve, 50))
 
-      // findRunningVMs should have been called to retrieve PID
-      expect(mockDb.findRunningVMs).toHaveBeenCalled()
+      // findMachineWithConfig should have been called to retrieve PID
+      expect(mockDb.findMachineWithConfig).toHaveBeenCalledWith(testVmId)
     })
   })
 
@@ -382,6 +379,7 @@ describe('StateSync clearVolatileMachineConfiguration', () => {
       findRunningVMs: jest.fn(),
       findMachinesByStatuses: jest.fn().mockResolvedValue([]),
       findMachineByInternalName: jest.fn().mockResolvedValue(null),
+      findMachineWithConfig: jest.fn(),
       clearMachineConfiguration: jest.fn(),
       clearVolatileMachineConfiguration: jest.fn().mockResolvedValue(undefined)
     }

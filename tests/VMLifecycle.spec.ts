@@ -182,6 +182,7 @@ describe('VMLifecycle', () => {
       findMachineWithConfig: jest.fn().mockResolvedValue(makeVmRow()),
       transitionVMStatus: jest.fn().mockResolvedValue({ vmConfig: makeVmRow({ status: 'starting' }), newVersion: 2 }),
       getFirewallRules: jest.fn().mockResolvedValue([]),
+      getFirewallRulesSplit: jest.fn().mockResolvedValue({ departmentRules: [], vmRules: [] }),
       getDepartmentFirewallPolicy: jest.fn().mockResolvedValue('BLOCK_ALL')
     } as unknown as jest.Mocked<PrismaAdapter>
 
@@ -546,28 +547,28 @@ describe('VMLifecycle', () => {
     const fetch = (id: string) => (lifecycle as any).fetchFirewallRules(id)
 
     it("defaults to 'drop' for a BLOCK_ALL department policy", async () => {
-      mockPrisma.getFirewallRules.mockResolvedValue([])
+      mockPrisma.getFirewallRulesSplit.mockResolvedValue({ departmentRules: [], vmRules: [] })
       mockPrisma.getDepartmentFirewallPolicy.mockResolvedValue('BLOCK_ALL')
       const r = await fetch(testVmId)
       expect(r.defaultAction).toBe('drop')
     })
 
     it("defaults to 'drop' for a null / unknown department policy", async () => {
-      mockPrisma.getFirewallRules.mockResolvedValue([])
+      mockPrisma.getFirewallRulesSplit.mockResolvedValue({ departmentRules: [], vmRules: [] })
       mockPrisma.getDepartmentFirewallPolicy.mockResolvedValue(null)
       const r = await fetch(testVmId)
       expect(r.defaultAction).toBe('drop')
     })
 
     it("uses 'accept' ONLY for an explicit ALLOW_ALL policy", async () => {
-      mockPrisma.getFirewallRules.mockResolvedValue([])
+      mockPrisma.getFirewallRulesSplit.mockResolvedValue({ departmentRules: [], vmRules: [] })
       mockPrisma.getDepartmentFirewallPolicy.mockResolvedValue('ALLOW_ALL')
       const r = await fetch(testVmId)
       expect(r.defaultAction).toBe('accept')
     })
 
     it("treats MACHINE_NOT_FOUND as empty rules with a 'drop' posture (not a throw)", async () => {
-      mockPrisma.getFirewallRules.mockRejectedValue(
+      mockPrisma.getFirewallRulesSplit.mockRejectedValue(
         new PrismaAdapterError('no machine', PrismaAdapterErrorCode.MACHINE_NOT_FOUND, testVmId)
       )
       const r = await fetch(testVmId)
@@ -575,7 +576,7 @@ describe('VMLifecycle', () => {
     })
 
     it('RE-THROWS a real DB error (never returns [] / fails open)', async () => {
-      mockPrisma.getFirewallRules.mockRejectedValue(
+      mockPrisma.getFirewallRulesSplit.mockRejectedValue(
         new PrismaAdapterError('db down', PrismaAdapterErrorCode.QUERY_FAILED, testVmId)
       )
       await expect(fetch(testVmId)).rejects.toThrow('db down')

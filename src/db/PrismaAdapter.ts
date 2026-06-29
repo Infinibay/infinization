@@ -154,7 +154,7 @@ interface PrismaDepartmentRecord {
  * This avoids a hard dependency on @prisma/client types while ensuring type safety.
  * The actual PrismaClient from the backend will satisfy this interface.
  */
-interface PrismaClientLike {
+export interface PrismaClientLike {
   machine: {
     findUnique: (args: {
       where: { id: string }
@@ -820,6 +820,7 @@ export class PrismaAdapter implements DatabaseAdapter {
     return code === 'P2034'
   }
 
+
   /**
    * Maps a raw Prisma error to a PrismaAdapterError, PRESERVING the original
    * Prisma code (P2002/P2025/P2034/...) in `details` instead of flattening it to
@@ -912,6 +913,87 @@ export class PrismaAdapter implements DatabaseAdapter {
       this.debug.log('error', `getFirewallRules failed: ${String(error)}`)
       throw new PrismaAdapterError(
         `Failed to get firewall rules: ${String(error)}`,
+        PrismaAdapterErrorCode.QUERY_FAILED,
+        vmId,
+        error
+      )
+    }
+  }
+
+  /**
+   * Returns the VM's firewall rules split by source: department-inherited rules
+   * and VM-specific rules, kept separate (NOT merged/sorted). This is the
+   * source-aware variant of {@link getFirewallRules}: callers that need the
+   * terminal-posture merge with override semantics should pass the two arrays to
+   * `NftablesService.mergeRules` (which honours `overridesDept`).
+   *
+   * Both arrays are returned unsorted by priority here; the merge/sort happens
+   * downstream in NftablesService.
+   *
+   * Fail-closed: on a real DB error this throws (same as getFirewallRules) so a
+   * VM is never brought up unfiltered.
+   *
+   * @param vmId - Machine UUID
+   * @returns Department and VM rule arrays
+   */
+  async getFirewallRulesSplit (vmId: string): Promise<{
+    departmentRules: FirewallRuleRecord[]
+    vmRules: FirewallRuleRecord[]
+  }> {
+    this.debug.log(`getFirewallRulesSplit: ${vmId}`)
+
+    try {
+      const machine = await this.prisma.machine.findUnique({
+        where: { id: vmId },
+        include: {
+          firewallRuleSet: {
+            include: {
+              rules: true
+            }
+          },
+          department: {
+            include: {
+              firewallRuleSet: {
+                include: {
+                  rules: true
+                }
+              }
+            }
+          }
+        }
+      })
+
+      if (!machine) {
+        throw new PrismaAdapterError(
+          `Machine not found: ${vmId}`,
+          PrismaAdapterErrorCode.MACHINE_NOT_FOUND,
+          vmId
+        )
+      }
+
+      const departmentRules: FirewallRuleRecord[] =
+        machine.department?.firewallRuleSet?.rules
+          ? machine.department.firewallRuleSet.rules.map(r => this.mapToFirewallRuleRecord(r))
+          : []
+
+      const vmRules: FirewallRuleRecord[] =
+        machine.firewallRuleSet?.rules
+          ? machine.firewallRuleSet.rules.map(r => this.mapToFirewallRuleRecord(r))
+          : []
+
+      this.debug.log(
+        'info',
+        `Split firewall rules for VM ${vmId}: ${departmentRules.length} dept + ${vmRules.length} VM`
+      )
+
+      return { departmentRules, vmRules }
+    } catch (error) {
+      if (error instanceof PrismaAdapterError) {
+        throw error
+      }
+      this.debug.log('error', `getFirewallRulesSplit failed: ${String(error)}`)
+      throw new PrismaAdapterError(
+        `Failed to get split firewall rules: ${String(error)}`,
         PrismaAdapterErrorCode.QUERY_FAILED,
         vmId,
         error

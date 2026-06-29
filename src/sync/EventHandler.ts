@@ -7,7 +7,7 @@
 
 import { EventEmitter } from 'events'
 import { QMPClient } from '../core/QMPClient'
-import { QMPEventType, QMPTimestamp, QMPShutdownEventData } from '../types/qmp.types'
+import { QMPEventType, QMPTimestamp, QMPShutdownEventData, QMPVMStatus } from '../types/qmp.types'
 import {
   DatabaseAdapter,
   DBVMStatus,
@@ -614,17 +614,17 @@ export class EventHandler extends EventEmitter {
     if (client && client.isConnected()) {
       try {
         const status = await client.queryStatus()
-        // Map the live run-state to a DB status. 'running' is the common case;
-        // 'paused'/'suspended' map to suspended. Anything that maps cleanly is
-        // pushed through; unknown states are left untouched (best-effort resync).
+        // Map the live run-state to a DB status via the canonical mapper.
+        // 'running' is the common case; paused/suspended/etc. map to their
+        // canonical DB status. Only 'off' is terminal (process gone).
         const mapped = this.mapQmpStatusToDB(status.status, status.running)
         if (mapped === 'off') {
-          // Terminal re-sync: the VM powered off (or guest-panicked) during the
-          // blip. Do NOT bare-write 'off'. Defer to InstallationMonitor while an
-          // unattended install is in progress — a reconnect mid-install must not
-          // trigger a terminal teardown (the end-of-install power-off / reboot
-          // cycle is owned by the installer; flipping 'off' + reaping here would
-          // stomp it). Otherwise run the full terminal-shutdown path (reap +
+          // Terminal re-sync: the VM powered off during the blip. Do NOT
+          // bare-write 'off'. Defer to InstallationMonitor while an unattended
+          // install is in progress — a reconnect mid-install must not trigger a
+          // terminal teardown (the end-of-install power-off / reboot cycle is
+          // owned by the installer; flipping 'off' + reaping here would stomp
+          // it). Otherwise run the full terminal-shutdown path (reap +
           // cleanupVMResources) under the facade vmLock, exactly like a live
           // SHUTDOWN event would.
           if (this.isInstallInProgress(vmId)) {
@@ -637,7 +637,10 @@ export class EventHandler extends EventEmitter {
               await this.handleTerminalShutdown(vmId, 'SHUTDOWN', undefined)
             }
           }
-        } else if (mapped) {
+        } else {
+          // Lightweight re-sync: the VM is still alive in some non-terminal
+          // state (running, suspended, error, etc.). Just flip the DB status —
+          // no resource reap needed.
           await this.stateSync.updateStatusDirect(vmId, mapped)
           this.debug.log('info', `Re-synced VM ${vmId} status to '${mapped}' after reconnect`)
         }
@@ -650,20 +653,49 @@ export class EventHandler extends EventEmitter {
   }
 
   /**
-   * Maps a QMP run-state to a DB status for reconnect re-sync. Returns null when
-   * there is no safe mapping (leave the DB row as-is).
+   * Maps a QMP run-state to a DB status for reconnect re-sync.
+   *
+   * Delegates to {@link StateSync.mapQMPStatusToDBStatus} (the canonical,
+   * exhaustive 13-state mapper) so there is a SINGLE source of truth for the
+   * QMP→DB status mapping across the entire sync layer.
+   *
+   * ## Why this exists as a thin wrapper
+   *
+   * Previously this method reimplemented a PARTIAL mapping (only 6 of 13 QMP
+   * run-states) that diverged from StateSync's table in two material ways:
+   *
+   * 1. **guest-panicked** → `'off'` here vs `'error'` in StateSync. Mapping it
+   *    to `'off'` was actively harmful: a panicked guest's QEMU process is
+   *    still alive, so the caller's terminal branch (`mapped === 'off'` →
+   *    reap + cleanupVMResources) would prematurely destroy resources for a
+   *    process that hasn't exited. `'error'` (lightweight status flip) is
+   *    correct — the operator can then decide whether to force-kill.
+   *
+   * 2. **7 states had no mapping at all** (returned `null`): inmigrate,
+   *    postmigrate, finish-migrate, restore-vm, watchdog, io-error, colo. The
+   *    caller treated `null` as "skip re-sync", so a VM that entered any of
+   *    these states during a QMP blip would silently keep a stale DB status
+   *    after reconnect. Now all states resolve to a concrete DBVMStatus.
+   *
+   * The `running` boolean override is retained: QMP's `running` field is
+   * authoritative for "is the VM executing", and some QEMU versions report
+   * `running: true` alongside a transitional status (e.g. during COLO).
+   *
+   * @param qmpStatus The QMP `status` field from query-status.
+   * @param running   The QMP `running` boolean from query-status.
+   * @returns The canonical DB status — always defined (never null).
    */
-  private mapQmpStatusToDB (qmpStatus: string, running: boolean): DBVMStatus | null {
+  private mapQmpStatusToDB (qmpStatus: string, running: boolean): DBVMStatus {
+    // QMP's `running` boolean is authoritative for "is the VM executing".
+    // Some QEMU versions report running=true with a non-'running' status (e.g.
+    // during colo or a brief state transition); honour it as 'running'.
     if (running || qmpStatus === 'running') {
       return 'running'
     }
-    if (qmpStatus === 'paused' || qmpStatus === 'suspended' || qmpStatus === 'prelaunch') {
-      return 'suspended'
-    }
-    if (qmpStatus === 'shutdown' || qmpStatus === 'guest-panicked') {
-      return 'off'
-    }
-    return null
+    // Delegate to the canonical, exhaustive mapper in StateSync. The cast is
+    // safe: mapQMPStatusToDBStatus validates the input via isValidQMPStatus()
+    // and falls back to 'error' for any unrecognised string.
+    return this.stateSync.mapQMPStatusToDBStatus(qmpStatus as QMPVMStatus)
   }
 
   /**
