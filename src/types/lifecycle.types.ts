@@ -443,6 +443,14 @@ export interface VMStartConfig {
    * 'drop'. The backend should thread the department policy here on every start.
    */
   firewallDefaultAction?: FirewallDefaultAction
+  /**
+   * Opt out of QEMU's seccomp sandbox on this start (default: sandbox ON). Mirrors
+   * VMCreateConfig.disableSandbox so the operator's choice is uniform across the
+   * lifecycle — otherwise a VM created with the sandbox disabled would re-enable it
+   * on the next stop/start. Only for environments where the sandbox is incompatible
+   * with the host (e.g. nested/rootless containers that SIGSYS a sandboxed syscall).
+   */
+  disableSandbox?: boolean
 }
 
 /**

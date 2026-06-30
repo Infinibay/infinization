@@ -706,7 +706,7 @@ export class VMLifecycle {
    * @param config - Optional start configuration
    * @returns VMOperationResult indicating success or failure
    */
-  async start (vmId: string, _config?: VMStartConfig): Promise<VMOperationResult> {
+  async start (vmId: string, config?: VMStartConfig): Promise<VMOperationResult> {
     this.debug.log(`Starting VM: ${vmId}`)
     const timestamp = new Date()
 
@@ -1058,7 +1058,7 @@ export class VMLifecycle {
       // still skips the kernel write when nothing changed (the hash includes the
       // terminal action), so this stays cheap on a no-op restart.
       const firewallRules = await this.fetchFirewallRules(vmId)
-      const startDefaultAction: FirewallDefaultAction = _config?.firewallDefaultAction ?? firewallRules.defaultAction
+      const startDefaultAction: FirewallDefaultAction = config?.firewallDefaultAction ?? firewallRules.defaultAction
       const { changed } = await this.nftables.applyRulesIfChanged(
         vmId,
         tapDevice,
@@ -1142,10 +1142,14 @@ export class VMLifecycle {
         // historically set neither runAsUser nor disableSandbox, so operator
         // stop/start, restartVM, and host-reboot recovery relaunched QEMU as
         // ROOT. Apply the same INFINIZATION_QEMU_USER fallback here so the drop is
-        // uniform across the lifecycle. (disableSandbox is intentionally NOT set:
-        // seccomp must stay on — buildQemuCommand enables it unless explicitly
-        // disabled.) Unset env => undefined => current (root) behavior preserved.
-        runAsUser: process.env.INFINIZATION_QEMU_USER
+        // uniform across the lifecycle. Unset env => undefined => current (root)
+        // behavior preserved.
+        runAsUser: process.env.INFINIZATION_QEMU_USER,
+        // Honor an explicit sandbox opt-out on start too, so a VM created with the
+        // sandbox disabled (VMCreateConfig.disableSandbox) does not silently
+        // re-enable it on the next stop/start. Default (undefined) keeps seccomp ON
+        // — buildQemuCommand enables it unless explicitly disabled here.
+        disableSandbox: config?.disableSandbox === true ? true : undefined
       }
 
       // 14. Create and start QEMU process. Serialize the port re-probe + spawn
