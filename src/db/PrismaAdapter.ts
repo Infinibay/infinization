@@ -290,9 +290,39 @@ export class PrismaAdapter implements DatabaseAdapter {
    *
    * @param prisma - PrismaClient instance from the backend application
    */
-  constructor (private readonly prisma: PrismaClientLike) {
+  constructor (
+    private readonly prisma: PrismaClientLike,
+    /**
+     * Optional node identity (the owning `Node.id` for this host). When set, the
+     * ENUMERATION / orphan-mapping reads — `findRunningVMs`,
+     * `findMachinesByStatuses` and `findMachineByInternalName` — are scoped to
+     * `Machine.nodeId === nodeId`, so this host's HealthMonitor crash-detect,
+     * startup reconcile and orphan reaper only ever see/act on VMs assigned to
+     * THIS node.
+     *
+     * This is the structural G0 fix: those three reads drive destructive actions
+     * (mark-off / promote / SIGKILL-orphan) keyed on the LOCAL `/proc`. Without
+     * node scoping, two backends/agents sharing one Postgres each enumerate the
+     * OTHER node's running VMs, find their PIDs absent locally, and cross-kill
+     * them (status corruption + orphan reaping). Omit `nodeId` (single-host) to
+     * preserve the original host-agnostic behaviour bit-for-bit.
+     *
+     * NOTE: id-targeted reads (`findMachine`, `findMachineWithConfig`) are NOT
+     * scoped — a caller that already holds a specific `vmId` owns that VM.
+     */
+    private readonly nodeId?: string
+  ) {
     this.debug = new Debugger('prisma-adapter')
-    this.debug.log('PrismaAdapter initialized')
+    this.debug.log(`PrismaAdapter initialized${this.nodeId ? ` (node-scoped: ${this.nodeId})` : ''}`)
+  }
+
+  /**
+   * Builds the node-scope fragment merged into enumeration `where` clauses.
+   * Returns `{ nodeId }` when this adapter is node-scoped, otherwise `{}` so the
+   * query is unchanged for single-host deployments.
+   */
+  private nodeScope (): Record<string, unknown> {
+    return this.nodeId ? { nodeId: this.nodeId } : {}
   }
 
   // ===========================================================================
@@ -347,7 +377,12 @@ export class PrismaAdapter implements DatabaseAdapter {
 
     try {
       const machine = await this.prisma.machine.findFirst({
-        where: { internalName },
+        // Node-scoped: a LOCAL pidfile maps to one of THIS node's VMs. A record
+        // owned by another node must read as "not mine" so the orphan scanner
+        // does not reap a process the local DB view cannot account for.
+        // (Migration-era caveat: Phase 4 must consult the migration marker
+        // before this null can authorize a kill on an incoming/outgoing VM.)
+        where: { internalName, ...this.nodeScope() },
         include: {
           configuration: {
             select: RUNNING_VM_CONFIG_SELECT
@@ -440,7 +475,10 @@ export class PrismaAdapter implements DatabaseAdapter {
 
     try {
       const machines = await this.prisma.machine.findMany({
-        where: { status: 'running' },
+        // Node-scoped (G0): crash-detection marks a DB-'running' VM 'off' when its
+        // PID is absent from the LOCAL /proc. Enumerating another node's running
+        // VMs here would mark them all crashed. See constructor doc.
+        where: { status: 'running', ...this.nodeScope() },
         include: {
           configuration: {
             select: RUNNING_VM_CONFIG_SELECT
@@ -483,7 +521,10 @@ export class PrismaAdapter implements DatabaseAdapter {
     this.debug.log(`findMachinesByStatuses: [${statuses.join(', ')}]`)
     try {
       const machines = await this.prisma.machine.findMany({
-        where: { status: { in: statuses } },
+        // Node-scoped (G0): startup reconcile promotes transient-state VMs to
+        // 'running' when their PID is alive in the LOCAL /proc; it must not
+        // reconcile another node's transient VMs against this host's processes.
+        where: { status: { in: statuses }, ...this.nodeScope() },
         include: {
           configuration: {
             select: RUNNING_VM_CONFIG_SELECT

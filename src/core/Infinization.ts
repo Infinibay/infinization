@@ -157,9 +157,11 @@ export class Infinization {
           'prismaClient is required in InfinizationConfig'
         )
       }
-      this.prisma = new PrismaAdapter(this.config.prismaClient)
+      this.prisma = new PrismaAdapter(this.config.prismaClient, this.config.nodeId)
       this.externalPrisma = true
-      this.debug.log('Using external Prisma client')
+      this.debug.log(
+        `Using external Prisma client${this.config.nodeId ? ` (node-scoped: ${this.config.nodeId})` : ''}`
+      )
 
       // Initialize EventHandler — share the facade vmLock so its destructive
       // guest-shutdown cleanup is serialized against locked lifecycle ops on the

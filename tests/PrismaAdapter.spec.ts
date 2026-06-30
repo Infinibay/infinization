@@ -499,3 +499,63 @@ describe('RunningVMRecord.internalName cross-unit contract', () => {
     expect(vms[0].internalName).toBe('vm-two')
   })
 })
+
+describe('PrismaAdapter node scoping (G0 — node-scoped enumeration reads)', () => {
+  // Captures the `where` each enumeration read sends to Prisma so we can PROVE
+  // the nodeId predicate is (or is not) applied. This is the structural G0
+  // guard: the three reads below drive destructive actions keyed on the LOCAL
+  // /proc (crash-detect mark-off, transient reconcile, orphan reap). Unscoped,
+  // a host enumerates another node's VMs and cross-kills them.
+  function makeWhereCapturingPrisma (rows: any[]) {
+    const captured: { findMany: any[], findFirst: any[] } = { findMany: [], findFirst: [] }
+    const prisma = makeFakePrisma({
+      machine: {
+        findMany: async (args: AnyArgs) => { captured.findMany.push(args.where); return rows },
+        findFirst: async (args: AnyArgs) => { captured.findFirst.push(args.where); return rows[0] ?? null }
+      }
+    })
+    return { prisma, captured }
+  }
+
+  const ROW = { id: 'm-1', status: 'running', internalName: 'vm-one', configuration: null }
+
+  it('node-scoped adapter filters findRunningVMs by nodeId', async () => {
+    const { prisma, captured } = makeWhereCapturingPrisma([ROW])
+    const adapter = new PrismaAdapter(prisma, 'node-A')
+    await adapter.findRunningVMs()
+    expect(captured.findMany[0]).toEqual({ status: 'running', nodeId: 'node-A' })
+  })
+
+  it('node-scoped adapter filters findMachinesByStatuses by nodeId', async () => {
+    const { prisma, captured } = makeWhereCapturingPrisma([ROW])
+    const adapter = new PrismaAdapter(prisma, 'node-A')
+    await adapter.findMachinesByStatuses(['starting', 'off'])
+    expect(captured.findMany[0]).toEqual({ status: { in: ['starting', 'off'] }, nodeId: 'node-A' })
+  })
+
+  it('node-scoped adapter filters findMachineByInternalName by nodeId (orphan map stays local)', async () => {
+    const { prisma, captured } = makeWhereCapturingPrisma([ROW])
+    const adapter = new PrismaAdapter(prisma, 'node-A')
+    await adapter.findMachineByInternalName('vm-one')
+    expect(captured.findFirst[0]).toEqual({ internalName: 'vm-one', nodeId: 'node-A' })
+  })
+
+  it("a node-scoped adapter's running-VM query carries nodeId so another node's rows are excluded (cross-kill prevented)", async () => {
+    const { prisma, captured } = makeWhereCapturingPrisma([])
+    const adapter = new PrismaAdapter(prisma, 'node-A')
+    const vms = await adapter.findRunningVMs()
+    expect(vms).toEqual([])
+    expect(captured.findMany[0]).toHaveProperty('nodeId', 'node-A')
+  })
+
+  it('an UN-scoped adapter (single-host) sends NO nodeId predicate — behaviour preserved bit-for-bit', async () => {
+    const { prisma, captured } = makeWhereCapturingPrisma([ROW])
+    const adapter = new PrismaAdapter(prisma) // no nodeId
+    await adapter.findRunningVMs()
+    await adapter.findMachinesByStatuses(['off'])
+    await adapter.findMachineByInternalName('vm-one')
+    expect(captured.findMany[0]).toEqual({ status: 'running' })
+    expect(captured.findMany[1]).toEqual({ status: { in: ['off'] } })
+    expect(captured.findFirst[0]).toEqual({ internalName: 'vm-one' })
+  })
+})

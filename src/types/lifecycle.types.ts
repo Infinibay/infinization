@@ -675,6 +675,20 @@ export interface InfinizationConfig {
    * Pass your application's singleton for shared connection pooling.
    */
   prismaClient: PrismaClientLike
+  /**
+   * Optional owning node identity (the `Node.id` for this host).
+   *
+   * When set, infinization scopes its enumeration / orphan-mapping DB reads
+   * (running-VM crash-detect, startup transient reconcile, orphan-from-pidfile
+   * lookup) to `Machine.nodeId === nodeId`, so this host only ever sees and
+   * acts on VMs assigned to it. This is the structural G0 fix that lets multiple
+   * hosts share one control-plane DB without cross-killing each other's VMs.
+   *
+   * Omit on a single-host deployment to preserve host-agnostic behaviour. The
+   * backend resolves this from the local `Node` record (see
+   * `LocalNodeRegistrationService` / `INFINIBAY_NODE_NAME`).
+   */
+  nodeId?: string
   /** Optional backend EventManager for event emission */
   eventManager?: EventManagerLike
   /** Health monitor check interval in milliseconds (default: 30000) */
