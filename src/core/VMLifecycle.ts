@@ -43,7 +43,7 @@ import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
 import { SPICE_MIN_PORT, SPICE_MAX_PORT, DEFAULT_SPICE_ADDR, DEFAULT_VNC_ADDR, VNC_BASE_PORT, isLoopbackAddr } from '../types/display.types'
 import { assertSafeOptionValue } from '../utils/qemuArgSafety'
-import { PrismaAdapter } from '../db/PrismaAdapter'
+import type { InfinizationDatabase } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { Debugger } from '../utils/debug'
 import { sleep } from '../utils/retry'
@@ -127,7 +127,7 @@ interface CleanupResources {
  */
 export class VMLifecycle {
   private readonly debug: Debugger
-  private readonly prisma: PrismaAdapter
+  private readonly prisma: InfinizationDatabase
   private readonly eventHandler: EventHandler
   private readonly eventManager?: EventManagerLike
   private readonly diskDir: string
@@ -149,7 +149,7 @@ export class VMLifecycle {
    * @param options - Optional configuration overrides
    */
   constructor (
-    prisma: PrismaAdapter,
+    prisma: InfinizationDatabase,
     eventHandler: EventHandler,
     eventManager?: EventManagerLike,
     options?: {

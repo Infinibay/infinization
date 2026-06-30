@@ -267,6 +267,35 @@ describe('Infinization facade — construction & lifecycle', () => {
     expect(inf.isInitialized()).toBe(false)
   })
 
+  // Multi-node Phase 1: a compute-node agent injects a remote database facade
+  // (RpcDatabaseAdapter) instead of a Prisma client, so the node holds no DB.
+  const makeFakeDbAdapter = (): any => {
+    const methods = [
+      'findMachine', 'findMachineByInternalName', 'findMachineWithConfig', 'findRunningVMs',
+      'findMachinesByStatuses', 'updateMachineStatus', 'updateMachineConfiguration', 'transitionVMStatus',
+      'clearMachineConfiguration', 'clearVolatileMachineConfiguration', 'getMachineInternalName',
+      'getMachineDiskPath', 'getFirewallRules', 'getFirewallRulesSplit', 'getDepartmentFirewallPolicy',
+      'getFirewallRuleSetId'
+    ]
+    return Object.fromEntries(methods.map(m => [m, jest.fn()]))
+  }
+
+  it('initialize() uses an injected databaseAdapter and builds NO PrismaAdapter (agent path)', async () => {
+    const dbAdapter = makeFakeDbAdapter()
+    const inf = new Infinization({ databaseAdapter: dbAdapter, autoStartHealthMonitor: false } as any)
+    await inf.initialize()
+
+    expect(inf.isInitialized()).toBe(true)
+    expect(MockedPrismaAdapter).not.toHaveBeenCalled()
+    expect(inf.getPrismaAdapter()).toBe(dbAdapter)
+  })
+
+  it('initialize() rejects when BOTH databaseAdapter and prismaClient are provided', async () => {
+    const inf = new Infinization({ prismaClient: fakePrismaClient, databaseAdapter: makeFakeDbAdapter() } as any)
+    await expect(inf.initialize()).rejects.toMatchObject({ code: LifecycleErrorCode.INVALID_CONFIG })
+    expect(inf.isInitialized()).toBe(false)
+  })
+
   it('initialize() rethrows a subsystem initialization failure', async () => {
     fakes.nftablesInstance.initialize.mockRejectedValueOnce(new Error('nftables down'))
     const inf = new Infinization(baseConfig)

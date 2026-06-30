@@ -1332,3 +1332,38 @@ export class PrismaAdapter implements DatabaseAdapter {
     }
   }
 }
+
+/**
+ * The full database facade that infinization's core (VMLifecycle + the sync
+ * subsystems) actually depends on — every method it invokes on `this.prisma`.
+ * Derived from PrismaAdapter via `Pick`, so these signatures can never drift
+ * from the implementation (add a method here only when the core starts calling
+ * it; remove the call and the Pick fails to compile).
+ *
+ * This is the injection seam (ADR-DB1 / multi-node Phase 1): a compute-node
+ * agent injects a REMOTE implementation of this surface (an `RpcDatabaseAdapter`
+ * proxying to the master over mTLS) so the node holds no Prisma connection,
+ * while the master backend keeps injecting a concrete `PrismaAdapter` (the
+ * single writer). `InfinizationDatabase` is a superset of the narrow
+ * `DatabaseAdapter` port (it includes all of its methods), so it remains
+ * assignable wherever the sync subsystems expect `DatabaseAdapter`.
+ */
+export type InfinizationDatabase = Pick<PrismaAdapter,
+  | 'findMachine'
+  | 'findMachineByInternalName'
+  | 'findMachineWithConfig'
+  | 'findRunningVMs'
+  | 'findMachinesByStatuses'
+  | 'updateMachineStatus'
+  | 'updateMachineConfiguration'
+  | 'transitionVMStatus'
+  | 'clearMachineConfiguration'
+  | 'clearVolatileMachineConfiguration'
+  | 'getMachineInternalName'
+  | 'getMachineDiskPath'
+  | 'getFirewallRules'
+  | 'getFirewallRulesSplit'
+  | 'getDepartmentFirewallPolicy'
+  | 'getFirewallRuleSetId'
+>
+

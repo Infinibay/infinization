@@ -50,7 +50,7 @@ import { VMLifecycle } from './VMLifecycle'
 import { QMPClient } from './QMPClient'
 import { KeyedMutex } from '../utils/KeyedMutex'
 import { GuestAgentClient } from './GuestAgentClient'
-import { PrismaAdapter } from '../db/PrismaAdapter'
+import { PrismaAdapter, type InfinizationDatabase } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
 import { HealthMonitor } from '../sync/HealthMonitor'
 import { NftablesService } from '../network/NftablesService'
@@ -88,7 +88,7 @@ import { QMPBlockInfo } from '../types/qmp.types'
 export class Infinization {
   private readonly debug: Debugger
   private readonly config: InfinizationConfig
-  private prisma!: PrismaAdapter
+  private prisma!: InfinizationDatabase
   private eventHandler!: EventHandler
   private healthMonitor!: HealthMonitor
   private nftables!: NftablesService
@@ -150,18 +150,32 @@ export class Infinization {
     this.debug.log('Initializing Infinization')
 
     try {
-      // Initialize Prisma adapter (prismaClient is required)
-      if (!this.config.prismaClient) {
+      // Database facade: inject either a ready-made `databaseAdapter` (e.g. a
+      // compute-node agent's RpcDatabaseAdapter proxying to the master — it holds
+      // no Prisma) OR a `prismaClient` we wrap in a node-scoped PrismaAdapter (the
+      // master backend, the single writer). Exactly one is required.
+      if (this.config.databaseAdapter && this.config.prismaClient) {
         throw new LifecycleError(
           LifecycleErrorCode.INVALID_CONFIG,
-          'prismaClient is required in InfinizationConfig'
+          'Provide either databaseAdapter or prismaClient in InfinizationConfig, not both'
         )
       }
-      this.prisma = new PrismaAdapter(this.config.prismaClient, this.config.nodeId)
-      this.externalPrisma = true
-      this.debug.log(
-        `Using external Prisma client${this.config.nodeId ? ` (node-scoped: ${this.config.nodeId})` : ''}`
-      )
+      if (this.config.databaseAdapter) {
+        this.prisma = this.config.databaseAdapter
+        this.externalPrisma = true
+        this.debug.log('Using injected database adapter (no local Prisma client)')
+      } else if (this.config.prismaClient) {
+        this.prisma = new PrismaAdapter(this.config.prismaClient, this.config.nodeId)
+        this.externalPrisma = true
+        this.debug.log(
+          `Using external Prisma client${this.config.nodeId ? ` (node-scoped: ${this.config.nodeId})` : ''}`
+        )
+      } else {
+        throw new LifecycleError(
+          LifecycleErrorCode.INVALID_CONFIG,
+          'Either databaseAdapter or prismaClient is required in InfinizationConfig'
+        )
+      }
 
       // Initialize EventHandler — share the facade vmLock so its destructive
       // guest-shutdown cleanup is serialized against locked lifecycle ops on the
@@ -559,9 +573,10 @@ export class Infinization {
   }
 
   /**
-   * Gets the PrismaAdapter instance.
+   * Gets the active database facade (a PrismaAdapter on the master, or an
+   * injected remote adapter on a compute-node agent).
    */
-  getPrismaAdapter (): PrismaAdapter {
+  getPrismaAdapter (): InfinizationDatabase {
     this.ensureInitialized()
     return this.prisma
   }

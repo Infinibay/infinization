@@ -35,7 +35,7 @@ export { EventHandler } from './sync/EventHandler'
 export { HealthMonitor } from './sync/HealthMonitor'
 
 // Database classes
-export { PrismaAdapter } from './db/PrismaAdapter'
+export { PrismaAdapter, type InfinizationDatabase } from './db/PrismaAdapter'
 
 // Types - QEMU
 export {

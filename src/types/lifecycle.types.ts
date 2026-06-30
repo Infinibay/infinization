@@ -7,7 +7,7 @@
 
 import { UnattendedInstallConfig } from './unattended.types'
 import { FirewallDefaultAction } from './firewall.types'
-import type { PrismaClientLike } from '../db/PrismaAdapter'
+import type { PrismaClientLike, InfinizationDatabase } from '../db/PrismaAdapter'
 
 // =============================================================================
 // Configuration Types
@@ -670,11 +670,19 @@ export const RUNTIME_DISK_SIZE_PLACEHOLDER_GB = 1
  */
 export interface InfinizationConfig {
   /**
-   * Pre-configured Prisma client instance.
-   * Required - infinization does not create its own Prisma client.
+   * Pre-configured Prisma client instance (the master backend, the single
+   * writer). Infinization wraps it in a node-scoped PrismaAdapter. Provide EITHER
+   * this OR `databaseAdapter` — exactly one is required.
    * Pass your application's singleton for shared connection pooling.
    */
-  prismaClient: PrismaClientLike
+  prismaClient?: PrismaClientLike
+  /**
+   * Alternative to `prismaClient`: inject a ready-made database facade. A
+   * compute-node agent passes an `RpcDatabaseAdapter` here that proxies every DB
+   * call to the master over mTLS, so the node holds NO Prisma connection
+   * (multi-node ADR-DB1 / Phase 1). Provide EITHER this OR `prismaClient`.
+   */
+  databaseAdapter?: InfinizationDatabase
   /**
    * Optional owning node identity (the `Node.id` for this host).
    *
