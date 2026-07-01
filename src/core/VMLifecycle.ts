@@ -472,6 +472,31 @@ export class VMLifecycle {
       await this.prisma.updateMachineStatus(vmId, 'starting')
       this.debug.log(`VM ${vmId} status set to 'starting' before QEMU spawn (H3 orphan-scan guard)`)
 
+      // Heal the SPICE/VNC bind address BEFORE building the QEMU command. The
+      // installer VM launches HERE in create() (not start()), so without this a
+      // routable-but-non-local displayAddr — e.g. the backend passing APP_HOST=<LAN
+      // IP>, or a value carried over from another host/container — is handed
+      // straight to QEMU, which dies with `binding socket to <ip>:<port> failed`
+      // because that IP is on no local interface in this netns. Mirror start()'s
+      // self-heal: a non-local concrete IP falls back to 0.0.0.0 (always bindable;
+      // the console stays authenticated via the QMP-delivered displayPassword and,
+      // in the proxied deployment, is only reached through the per-session SPICE
+      // proxy), while loopback/wildcard/still-local addresses pass through
+      // unchanged. The healed value is also what we persist as graphicHost (below),
+      // so a later start() reconstructs the same binding instead of re-healing.
+      const configuredDisplayAddr = config.displayAddr ?? DEFAULT_SPICE_ADDR
+      const localAddrs = new Set(
+        Object.values(os.networkInterfaces())
+          .flat()
+          .filter((ni): ni is os.NetworkInterfaceInfo => ni != null)
+          .map((ni) => ni.address)
+      )
+      const healedDisplayAddr = resolveBindAddress(configuredDisplayAddr, localAddrs, DEFAULT_SPICE_ADDR)
+      if (healedDisplayAddr !== configuredDisplayAddr) {
+        this.debug.log('warn', `VM ${vmId} display bind address '${configuredDisplayAddr}' is not bindable on this host; falling back to '${healedDisplayAddr}' (self-heal)`)
+      }
+      config.displayAddr = healedDisplayAddr
+
       // Serialize display-port allocation through QEMU spawn process-wide so two
       // concurrent creates cannot both probe the same free port and hand it to
       // QEMU. Only this brief region is locked (probe -> QEMU binds the port);

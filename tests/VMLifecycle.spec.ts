@@ -822,4 +822,58 @@ describe('VMLifecycle', () => {
       expect(lastRunAsUser()).toBeUndefined()
     })
   })
+
+  // ==========================================================================
+  // The SPICE/VNC BIND address must be healed at create() too, not only at
+  // start(). The INSTALLER VM is launched by create(); a routable-but-non-local
+  // displayAddr (the backend passing APP_HOST=<LAN IP>, or a value carried in
+  // from another host/container) makes QEMU die at spawn with
+  // `binding socket to <ip>:<port> failed` because that IP is on no local
+  // interface in this netns — the exact create-time install failure this guards.
+  // ==========================================================================
+  describe('display bind-address self-heal at create() (H-install)', () => {
+    let buildSpy: jest.SpyInstance
+
+    beforeEach(() => {
+      // Capture the config (first arg) handed to buildQemuCommand without
+      // disturbing the real fluent builder.
+      buildSpy = jest.spyOn(lifecycle as any, 'buildQemuCommand')
+    })
+    afterEach(() => { buildSpy.mockRestore() })
+
+    /** displayAddr actually handed to the QEMU command builder on the last build. */
+    function lastDisplayAddr (): unknown {
+      const calls = buildSpy.mock.calls
+      const cfg = calls[calls.length - 1][0]
+      return cfg?.displayAddr
+    }
+
+    // 203.0.113.9 is RFC5737 TEST-NET-3 — guaranteed never to be a real local
+    // interface, so os.networkInterfaces() (unmocked) cannot accidentally
+    // contain it and the heal stays deterministic on any host/CI runner.
+    const NON_LOCAL_IP = '203.0.113.9'
+
+    // Healing to 0.0.0.0 (non-loopback) is only legal WITH a display password —
+    // the backend always generates one at create() — so the fail-closed guard
+    // against an unauthenticated off-host console still holds. These configs
+    // include displayPassword to mirror that production invariant.
+    it('heals a non-local displayAddr to 0.0.0.0 BEFORE QEMU binds (install would otherwise fail)', async () => {
+      await lifecycle.create(makeCreateConfig({ displayAddr: NON_LOCAL_IP, displayPassword: 'test-console-secret' }))
+      expect(buildSpy).toHaveBeenCalled()
+      expect(lastDisplayAddr()).toBe('0.0.0.0')
+    })
+
+    it('persists the healed bind address as graphicHost so a later start() reconstructs it', async () => {
+      await lifecycle.create(makeCreateConfig({ displayAddr: NON_LOCAL_IP, displayPassword: 'test-console-secret' }))
+      expect(mockPrisma.updateMachineConfiguration).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ graphicHost: '0.0.0.0' })
+      )
+    })
+
+    it('leaves a loopback displayAddr unchanged (secure default passes through)', async () => {
+      await lifecycle.create(makeCreateConfig({ displayAddr: '127.0.0.1' }))
+      expect(lastDisplayAddr()).toBe('127.0.0.1')
+    })
+  })
 })
