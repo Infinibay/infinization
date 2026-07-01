@@ -41,7 +41,8 @@ import { MacAddressGenerator } from '../network/MacAddressGenerator'
 import { QemuImgService } from '../storage/QemuImgService'
 import { SpiceConfig } from '../display/SpiceConfig'
 import { VncConfig } from '../display/VncConfig'
-import { SPICE_MIN_PORT, SPICE_MAX_PORT, DEFAULT_SPICE_ADDR, DEFAULT_VNC_ADDR, VNC_BASE_PORT, isLoopbackAddr } from '../types/display.types'
+import { SPICE_MIN_PORT, SPICE_MAX_PORT, DEFAULT_SPICE_ADDR, DEFAULT_VNC_ADDR, VNC_BASE_PORT, isLoopbackAddr, resolveBindAddress } from '../types/display.types'
+import * as os from 'os'
 import { assertSafeOptionValue } from '../utils/qemuArgSafety'
 import type { InfinizationDatabase } from '../db/PrismaAdapter'
 import { EventHandler } from '../sync/EventHandler'
@@ -983,8 +984,24 @@ export class VMLifecycle {
       // 8. Get display configuration
       const displayProtocol = (vmConfig.configuration?.graphicProtocol as 'spice' | 'vnc') ?? 'spice'
       const displayPassword = vmConfig.configuration?.graphicPassword ?? undefined
-      // Default to loopback (secure) when no bind address was persisted.
-      const displayAddr = vmConfig.configuration?.graphicHost ?? DEFAULT_SPICE_ADDR
+      // Resolve the bind address defensively. A concrete routable IP that was
+      // persisted at create time (or frozen in by a backend cron) is UNBINDABLE
+      // once that IP changes — container restart, DHCP renewal, host reboot, or
+      // migration to another node. QEMU then dies with `failed to initialize
+      // spice server` and the VM is stuck. resolveBindAddress() heals a stale
+      // non-local IP to 0.0.0.0 (always bindable); loopback/wildcard/still-local
+      // addresses pass through unchanged. Default to loopback (secure) when unset.
+      const localAddrs = new Set(
+        Object.values(os.networkInterfaces())
+          .flat()
+          .filter((ni): ni is os.NetworkInterfaceInfo => ni != null)
+          .map((ni) => ni.address)
+      )
+      const configuredAddr = vmConfig.configuration?.graphicHost ?? DEFAULT_SPICE_ADDR
+      const displayAddr = resolveBindAddress(configuredAddr, localAddrs, DEFAULT_SPICE_ADDR)
+      if (displayAddr !== configuredAddr) {
+        this.debug.log('warn', `VM ${vmId} display bind address '${configuredAddr}' is not bindable on this host; falling back to '${displayAddr}' (self-heal)`)
+      }
 
       // 8a. Find an available display port (always start from SPICE_MIN_PORT).
       // This is an initial pick; the actual spawn re-probes the port UNDER the
@@ -993,9 +1010,16 @@ export class VMLifecycle {
       // when many VMs in a pool started at once.
       let displayPort = await this.findAvailableDisplayPort(SPICE_MIN_PORT)
 
-      // 8b. Update database with allocated port (for UI display)
+      // 8b. Update database with allocated port (for UI display). Also persist the
+      // healed bind address so the DB stops carrying a stale, unbindable IP (keeps
+      // future starts and any consumer of graphicHost consistent).
       this.debug.log('info', `Allocated display port: ${displayPort}`)
-      await this.prisma.updateMachineConfiguration(vmId, { graphicPort: displayPort })
+      await this.prisma.updateMachineConfiguration(
+        vmId,
+        displayAddr !== configuredAddr
+          ? { graphicPort: displayPort, graphicHost: displayAddr }
+          : { graphicPort: displayPort }
+      )
 
       // 9. Generate MAC address deterministically from vmId
       const macAddress = MacAddressGenerator.generateFromVmId(vmId)

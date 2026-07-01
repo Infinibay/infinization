@@ -46,6 +46,48 @@ export function isLoopbackAddr (addr: string): boolean {
   return LOOPBACK_ADDRS.has(addr.trim().toLowerCase())
 }
 
+/** Wildcard bind addresses — always bindable regardless of host IP. */
+export const WILDCARD_ADDRS = new Set(['0.0.0.0', '::', '*'])
+
+/**
+ * Resolve the address QEMU should actually bind the display server to,
+ * self-healing a persisted address that can no longer be bound.
+ *
+ * A concrete routable IP that was frozen into the DB (e.g. the host/container
+ * address at create time) becomes UNBINDABLE the moment that IP changes —
+ * container restart, DHCP renewal, host reboot, or the VM migrating to another
+ * node. QEMU then dies at startup with `reds_init_socket: binding socket ...
+ * failed` / `failed to initialize spice server`, leaving the VM permanently
+ * unstartable. Guarding here makes start() robust to all of those.
+ *
+ * Rules (order matters):
+ *  - empty/unset            -> `fallback` (secure loopback default)
+ *  - loopback or wildcard   -> unchanged (both are always bindable)
+ *  - concrete IP that is a  -> unchanged (still valid on this host)
+ *    current local interface
+ *  - concrete IP that is NOT -> `0.0.0.0` (bind-all: always bindable AND keeps
+ *    a local interface          the console reachable on whatever the current
+ *                               address is; a password still gates access)
+ *
+ * @param configured   the persisted bind address (graphicHost), possibly stale
+ * @param localAddrs   the set of IPv4/IPv6 addresses currently bound to local
+ *                     interfaces (injected for testability)
+ * @param fallback     address to use when nothing is configured
+ */
+export function resolveBindAddress (
+  configured: string | null | undefined,
+  localAddrs: Set<string>,
+  fallback: string = DEFAULT_SPICE_ADDR
+): string {
+  const addr = (configured ?? '').trim()
+  if (addr === '') return fallback
+  const lower = addr.toLowerCase()
+  if (LOOPBACK_ADDRS.has(lower) || WILDCARD_ADDRS.has(lower)) return addr
+  // A concrete IP: keep it only if the host can still bind it.
+  if (localAddrs.has(addr)) return addr
+  return '0.0.0.0'
+}
+
 // ============================================================================
 // Enums
 // ============================================================================
