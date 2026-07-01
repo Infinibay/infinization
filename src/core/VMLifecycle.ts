@@ -1563,7 +1563,13 @@ export class VMLifecycle {
       // 2. clearMachineConfiguration() removes qemuPid, so even if status update
       //    is delayed, HealthMonitor won't find a PID to check
       // EventHandler is detached above, so no QMP events will trigger status changes.
-      await this.prisma.updateMachineStatus(vmId, 'off')
+      //
+      // onlyIfNotIn:['error'] closes the InstallResetTracker race: that detector
+      // force-stops a boot/install-looping VM (calling into this stop()) and then
+      // marks the row 'error'. This stop()'s own 'off' write can otherwise land
+      // AFTER that 'error' and silently downgrade it back to 'off', hiding the
+      // failure. A VM already parked in terminal 'error' stays 'error'.
+      await this.prisma.updateMachineStatus(vmId, 'off', { onlyIfNotIn: ['error'] })
 
       // Clear volatile machine configuration (qmpSocketPath, qemuPid)
       // Note: tapDeviceName is preserved for persistent TAP device reuse on restart
@@ -2837,7 +2843,10 @@ export class VMLifecycle {
     // ISO if provided
     if (config.isoPath) {
       builder.addCdrom(config.isoPath)
-      builder.setBootOrder(['d', 'c']) // CD-ROM first, then disk
+      // Boot the CD ONCE, then the disk on every subsequent (guest-initiated)
+      // reboot. A plain order=dc re-enters the installer after it finishes and
+      // reboots — a boot/install loop. See setBootOrder / mountInstallationMedia.
+      builder.setBootOrder(['c'], { once: 'd' })
     } else {
       builder.setBootOrder(['c']) // Disk only
     }

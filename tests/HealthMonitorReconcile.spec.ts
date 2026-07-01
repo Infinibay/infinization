@@ -82,7 +82,8 @@ describe('HealthMonitor.reconcileTransientStates', () => {
 
     const s = await m.reconcileTransientStates()
     expect(db.clearVolatileMachineConfiguration).toHaveBeenCalledWith('vm1')
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off')
+    // The demotion is guarded so it can never clobber a terminal 'error'.
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off', { onlyIfNotIn: ['error'] })
     expect(db.clearMachineConfiguration).not.toHaveBeenCalled() // never clears tapDeviceName
     expect(s.resetToOff).toEqual(['vm1'])
   })
@@ -140,7 +141,7 @@ describe('HealthMonitor.reconcileTransientStates', () => {
 
     expect(s.promotedToRunning).toEqual([])
     expect(db.updateMachineStatus).not.toHaveBeenCalledWith('vm1', 'running')
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off')
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off', { onlyIfNotIn: ['error'] })
     expect(db.clearVolatileMachineConfiguration).toHaveBeenCalledWith('vm1')
     expect(s.resetToOff).toEqual(['vm1'])
     expect(mockedPidIdentityState).toHaveBeenCalledWith(4242, 'int-vm1')
@@ -202,7 +203,7 @@ describe('HealthMonitor.checkAllVMs crash detection (H8 PID-reuse)', () => {
     expect(summary.crashed).toBe(1)
     expect(summary.results[0].isAlive).toBe(false)
     // handleCrashedVM resets the stuck-'running' row to 'off'
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off')
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off', { onlyIfNotIn: ['error'] })
     expect(mockedPidIdentityState).toHaveBeenCalledWith(4242, 'int-vm1')
   })
 
@@ -255,6 +256,6 @@ describe('HealthMonitor.checkAllVMs crash detection (H8 PID-reuse)', () => {
 
     expect(summary.crashed).toBe(1)
     expect(mockedPidIdentityState).not.toHaveBeenCalled() // short-circuit on dead liveness
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off')
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm1', 'off', { onlyIfNotIn: ['error'] })
   })
 })

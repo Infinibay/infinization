@@ -584,9 +584,14 @@ export class HealthMonitor extends EventEmitter {
           `(internalName: ${internalName}, DB status: "${vmRecord.status}") — killing`
         )
 
-        // Update DB status to 'off' in case it was stale
+        // Update DB status to 'off' in case it was stale — but NEVER clobber a
+        // deliberately-set terminal 'error' (e.g. InstallResetTracker force-kills
+        // a boot/install-looping VM and marks it 'error'). That kill races this
+        // orphan scan: the just-killed QEMU is still momentarily alive here, so an
+        // unconditional 'off' would erase the 'error' the tracker just wrote and
+        // hide the failure from the UI. The onlyIfNotIn guard makes it atomic.
         try {
-          await this.db.updateMachineStatus(vmRecord.id, 'off')
+          await this.db.updateMachineStatus(vmRecord.id, 'off', { onlyIfNotIn: ['error'] })
         } catch {
           // Best effort — the important thing is killing the process
         }
@@ -720,7 +725,9 @@ export class HealthMonitor extends EventEmitter {
           }
 
           await this.db.clearVolatileMachineConfiguration(vm.id)
-          await this.db.updateMachineStatus(vm.id, 'off')
+          // Safety net: reconcile only fetches transient statuses, but guard the
+          // demotion anyway so a terminal 'error' can never be reset to 'off'.
+          await this.db.updateMachineStatus(vm.id, 'off', { onlyIfNotIn: ['error'] })
           resetToOff.push(vm.id)
           results.push({ vmId: vm.id, previousStatus, pid, pidAlive, action: 'reset_off' })
           this.debug.log('info', `Reconcile: VM ${vm.id} (${previousStatus}) no live PID -> 'off' (TAP preserved)`)
@@ -891,8 +898,13 @@ export class HealthMonitor extends EventEmitter {
     let cleanupResult: CleanupResult | null = null
 
     try {
-      // Update database status to 'off'
-      await this.db.updateMachineStatus(vmId, 'off')
+      // Update database status to 'off' — but NEVER downgrade a deliberate
+      // terminal 'error'. During an install the VM is 'running' and this monitor
+      // is attached; when InstallResetTracker force-kills a boot/install-looping
+      // VM it marks the row 'error', and this crash handler fires on the same
+      // process death. Without the guard, the two race and 'off' can land last,
+      // hiding the failure. onlyIfNotIn makes the demotion atomic + conditional.
+      await this.db.updateMachineStatus(vmId, 'off', { onlyIfNotIn: ['error'] })
       this.debug.log(`VM ${vmId} status updated to 'off'`)
 
       // Cleanup resources if enabled

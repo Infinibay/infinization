@@ -173,6 +173,78 @@ describe('transitionVMStatus optimistic locking', () => {
 })
 
 // ---------------------------------------------------------------------------
+// updateMachineStatus onlyIfNotIn guard: never clobber a terminal 'error'
+// ---------------------------------------------------------------------------
+
+describe('updateMachineStatus onlyIfNotIn guard', () => {
+  it('folds the guard into the WHERE clause as an atomic conditional update', async () => {
+    let capturedWhere: any
+    const prisma = makeFakePrisma({
+      machine: {
+        updateMany: async (args: AnyArgs) => {
+          capturedWhere = (args as any).where
+          return { count: 1 }
+        }
+      }
+    })
+    const adapter = new PrismaAdapter(prisma)
+
+    await adapter.updateMachineStatus('m-1', 'off', { onlyIfNotIn: ['error'] })
+
+    // The status check must live in WHERE (one statement), NOT a read-then-write.
+    expect(capturedWhere).toEqual({ id: 'm-1', status: { notIn: ['error'] } })
+  })
+
+  it('does not throw when the guard matches 0 rows (row was in a guarded state)', async () => {
+    const prisma = makeFakePrisma({
+      machine: {
+        // Simulate the row already being 'error': the guarded update matches nothing.
+        updateMany: async () => ({ count: 0 })
+      }
+    })
+    const adapter = new PrismaAdapter(prisma)
+
+    await expect(
+      adapter.updateMachineStatus('m-1', 'off', { onlyIfNotIn: ['error'] })
+    ).resolves.toBeUndefined()
+  })
+
+  it('uses a bare id WHERE when no guard is given (backward compatible)', async () => {
+    let capturedWhere: any
+    const prisma = makeFakePrisma({
+      machine: {
+        updateMany: async (args: AnyArgs) => {
+          capturedWhere = (args as any).where
+          return { count: 1 }
+        }
+      }
+    })
+    const adapter = new PrismaAdapter(prisma)
+
+    await adapter.updateMachineStatus('m-1', 'off')
+
+    expect(capturedWhere).toEqual({ id: 'm-1' })
+  })
+
+  it('treats an empty onlyIfNotIn array as no guard', async () => {
+    let capturedWhere: any
+    const prisma = makeFakePrisma({
+      machine: {
+        updateMany: async (args: AnyArgs) => {
+          capturedWhere = (args as any).where
+          return { count: 1 }
+        }
+      }
+    })
+    const adapter = new PrismaAdapter(prisma)
+
+    await adapter.updateMachineStatus('m-1', 'off', { onlyIfNotIn: [] })
+
+    expect(capturedWhere).toEqual({ id: 'm-1' })
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 2. Fail-CLOSED read contract: re-throw, never collapse to null/[]
 // ---------------------------------------------------------------------------
 

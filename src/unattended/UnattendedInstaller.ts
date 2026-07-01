@@ -43,6 +43,7 @@ import {
   UnattendedErrorCode,
   CDROM_DEVICE_NAME,
   ISO_BOOT_ORDER,
+  INSTALLED_DISK_BOOT,
   DEFAULT_MAX_RESETS,
   DEFAULT_CHECK_INTERVAL,
   getInstallationTimeout,
@@ -172,8 +173,12 @@ export class UnattendedInstaller {
       // Add CD-ROM with the installation ISO
       builder.addCdrom(isoPath)
 
-      // Set boot order to boot from CD-ROM first, then disk
-      builder.setBootOrder(ISO_BOOT_ORDER)
+      // Boot the installer CD ONCE, then fall back to the disk on every
+      // subsequent (guest-initiated) reboot. ISO_BOOT_ORDER[0] is the CD.
+      // A plain order=dc would re-enter the installer after it finishes and
+      // reboots — a boot/install loop. once= makes the post-install reboot land
+      // on the freshly-installed disk instead.
+      builder.setBootOrder([INSTALLED_DISK_BOOT], { once: ISO_BOOT_ORDER[0] })
 
       this.debug.log('Installation media mounted successfully')
     } catch (error) {

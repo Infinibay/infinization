@@ -716,11 +716,21 @@ export class QemuCommandBuilder {
   }
 
   /**
-   * Set boot order
-   * @param devices - Array of boot devices (c=disk, d=cdrom, n=network)
+   * Set boot order.
+   *
+   * @param devices - Persistent boot order (c=disk, d=cdrom, n=network). Applied
+   *   on every boot EXCEPT the first when `opts.once` is given.
+   * @param opts.once - One-time boot device for the FIRST boot only; QEMU reverts
+   *   to `devices` on the next (guest-initiated) reboot. This is the correct way to
+   *   boot an installer ISO: boot the CD ONCE, then the freshly-installed disk on
+   *   the post-install reboot. Without it, `order=dc` boots the CD on EVERY reboot,
+   *   so a finished install re-enters the installer forever — a boot/install loop
+   *   that the reset detector eventually kills (InstallResetTracker).
    */
-  setBootOrder (devices: BootDevice[]): this {
-    this.args.push('-boot', `order=${devices.join('')}`)
+  setBootOrder (devices: BootDevice[], opts?: { once?: BootDevice }): this {
+    const parts = [`order=${devices.join('')}`]
+    if (opts?.once) parts.push(`once=${opts.once}`)
+    this.args.push('-boot', parts.join(','))
     return this
   }
 

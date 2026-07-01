@@ -57,6 +57,22 @@ describe('QemuCommandBuilder — argument-injection hardening', () => {
     })
   })
 
+  describe('setBootOrder', () => {
+    it('emits a bare order= when no once device is given (unchanged behavior)', () => {
+      b.setBootOrder(['c'])
+      expect(b.buildCommand().args.join(' ')).toContain('-boot order=c')
+    })
+
+    it('emits order=<persistent>,once=<device> for an installer boot', () => {
+      // The install idiom: boot the CD once, then the disk on every reboot.
+      b.setBootOrder(['c'], { once: 'd' })
+      const args = b.buildCommand().args.join(' ')
+      expect(args).toContain('-boot order=c,once=d')
+      // Must NOT emit a plain order=dc, which would re-enter the installer forever.
+      expect(args).not.toContain('order=dc')
+    })
+  })
+
   describe('path setters', () => {
     it('rejects an ISO/firmware path that would flip a drive sub-option', () => {
       expect(() => b.setFirmware('/OVMF_CODE.fd,readonly=off')).toThrow(QemuArgValidationError)

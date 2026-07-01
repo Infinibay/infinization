@@ -461,7 +461,8 @@ describe('VMLifecycle', () => {
 
       expect(mockQmpClient.powerdown).toHaveBeenCalled()
       expect((lifecycle as any).forceKillProcess).not.toHaveBeenCalled()
-      expect(mockPrisma.updateMachineStatus).toHaveBeenCalledWith(testVmId, 'off')
+      // stop() demotes to 'off' but guards against clobbering a terminal 'error'.
+      expect(mockPrisma.updateMachineStatus).toHaveBeenCalledWith(testVmId, 'off', { onlyIfNotIn: ['error'] })
       // TAP detached from bridge (persistent) — NOT destroyed.
       expect(tapManager.detachFromBridge).toHaveBeenCalledWith(testTapDevice)
       expect(tapManager.destroy).not.toHaveBeenCalled()

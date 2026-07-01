@@ -73,7 +73,7 @@ describe('HealthMonitor cgroup scope reclaim on cleanup', () => {
     const summary = await m.checkAllVMs()
 
     expect(summary.crashed).toBe(1)
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm-pinned', 'off')
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm-pinned', 'off', { onlyIfNotIn: ['error'] })
     // The scope reclaim ran as part of cleanupVMResources.
     expect(cleanupEmptyScopesMock).toHaveBeenCalledTimes(1)
   })
@@ -90,7 +90,7 @@ describe('HealthMonitor cgroup scope reclaim on cleanup', () => {
 
     // Crash still handled; DB still reset despite the scope-reclaim failure.
     expect(summary.crashed).toBe(1)
-    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm-pinned', 'off')
+    expect(db.updateMachineStatus).toHaveBeenCalledWith('vm-pinned', 'off', { onlyIfNotIn: ['error'] })
     expect(cleanupEmptyScopesMock).toHaveBeenCalledTimes(1)
   })
 })

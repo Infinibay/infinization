@@ -439,16 +439,26 @@ export class PrismaAdapter implements DatabaseAdapter {
    * @param status - New status value
    * @throws PrismaAdapterError if update fails (not for missing records)
    */
-  async updateMachineStatus (id: string, status: string): Promise<void> {
+  async updateMachineStatus (id: string, status: string, opts?: { onlyIfNotIn?: string[] }): Promise<void> {
     this.debug.log(`updateMachineStatus: ${id} -> ${status}`)
 
     try {
+      // onlyIfNotIn folds the status guard INTO the WHERE clause so the check and
+      // the write are one atomic statement — no read-then-write TOCTOU. A count of
+      // 0 then means the row was in a guarded state (or gone), not a hard error.
+      const where = (opts?.onlyIfNotIn && opts.onlyIfNotIn.length > 0)
+        ? { id, status: { notIn: opts.onlyIfNotIn } }
+        : { id }
       const result = await this.prisma.machine.updateMany({
-        where: { id },
+        where,
         data: { status }
       })
 
       if (result.count === 0) {
+        if (opts?.onlyIfNotIn && opts.onlyIfNotIn.length > 0) {
+          this.debug.log('info', `Skipped status update ${id} -> ${status}: row is missing or in a guarded state (${opts.onlyIfNotIn.join(', ')})`)
+          return
+        }
         this.debug.log('warn', `Machine not found for status update: ${id} (may have been deleted)`)
         return
       }

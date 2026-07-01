@@ -72,8 +72,18 @@ export interface DatabaseAdapter {
   /** Find a machine by ID */
   findMachine (id: string): Promise<MachineRecord | null>
 
-  /** Update machine status */
-  updateMachineStatus (id: string, status: string): Promise<void>
+  /**
+   * Update machine status.
+   *
+   * @param opts.onlyIfNotIn - Atomic guard: only apply the write if the row's
+   *   CURRENT status is NOT one of these. Used by liveness reconciliation to
+   *   demote a dead VM to 'off' WITHOUT clobbering a deliberately-set terminal
+   *   state such as 'error' (e.g. a boot/install-loop kill). Prevents the
+   *   error→off race where a crash/orphan reaper overwrites the 'error' a
+   *   detector just wrote. Implemented as a single conditional UPDATE, so there
+   *   is no read-then-write TOCTOU window.
+   */
+  updateMachineStatus (id: string, status: string, opts?: { onlyIfNotIn?: string[] }): Promise<void>
 
   /** Find all VMs with 'running' status including their configuration */
   findRunningVMs (): Promise<RunningVMRecord[]>

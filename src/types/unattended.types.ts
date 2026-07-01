@@ -324,6 +324,14 @@ export const CDROM_DEVICE_NAME = 'ide1-cd0'
 /** Boot order for CD-ROM installation: CD-ROM first, then disk */
 export const ISO_BOOT_ORDER: BootDevice[] = ['d', 'c']
 
+/**
+ * Persistent boot device once the OS is installed (the hard disk). Used as the
+ * standing boot order for an unattended install so the CD only boots ONCE
+ * (via `once=`) and the post-install reboot lands on the installed disk instead
+ * of re-entering the installer (boot/install loop).
+ */
+export const INSTALLED_DISK_BOOT: BootDevice = 'c'
+
 /** Maximum number of reset events before failing installation */
 export const DEFAULT_MAX_RESETS = 5
 
